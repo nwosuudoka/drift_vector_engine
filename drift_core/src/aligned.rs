@@ -1,64 +1,107 @@
-use std::alloc::{Layout, alloc, dealloc};
-use std::ops::Deref;
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::ptr::NonNull;
+use std::slice;
 
-/// A Byte Buffer guaranteed to be aligned to 64 bytes.
-/// Essential for AVX-512 / SIMD operations.
+/// A contiguous byte buffer guaranteed to be 64-byte aligned.
+/// Critical for SIMD (AVX-512) operations which segfault on unaligned access.
 pub struct AlignedBytes {
     ptr: NonNull<u8>,
-    layout: Layout,
+    capacity: usize,
     len: usize,
-    cap: usize,
 }
 
 impl AlignedBytes {
+    const ALIGNMENT: usize = 64;
+
     pub fn new(capacity: usize) -> Self {
-        // Ensure alignment is 64 bytes for AVX-512
-        let layout = Layout::from_size_align(capacity, 64).unwrap();
+        // Ensure strictly positive capacity to avoid edge cases with alloc
+        let capacity = capacity.max(64);
+        let layout = Layout::from_size_align(capacity, Self::ALIGNMENT).unwrap();
+
         let ptr = unsafe {
             let p = alloc(layout);
             if p.is_null() {
-                std::alloc::handle_alloc_error(layout);
+                handle_alloc_error(layout);
             }
             NonNull::new_unchecked(p)
         };
 
         Self {
             ptr,
-            layout,
+            capacity,
             len: 0,
-            cap: capacity,
         }
     }
 
     pub fn push(&mut self, byte: u8) {
-        if self.len == self.cap {
-            panic!("Resizing AlignedVec not implemented for safety in V1");
+        if self.len == self.capacity {
+            self.grow();
         }
+
         unsafe {
+            // Write to offset
             *self.ptr.as_ptr().add(self.len) = byte;
-            self.len += 1;
         }
+        self.len += 1;
     }
 
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    // --- The System Engineering Core: Safe Reallocation ---
+    fn grow(&mut self) {
+        let new_capacity = self.capacity * 2;
+        let new_layout = Layout::from_size_align(new_capacity, Self::ALIGNMENT).unwrap();
+
+        // We cannot use standard `realloc` safely because it doesn't guarantee
+        // the *new* pointer maintains the specific 64-byte alignment we need
+        // (standard realloc only guarantees alignment to max_align_t or similar).
+        // To be safe and portable for SIMD, we alloc-copy-dealloc.
+
+        unsafe {
+            let new_ptr = alloc(new_layout);
+            if new_ptr.is_null() {
+                handle_alloc_error(new_layout);
+            }
+
+            // Copy old data
+            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr, self.len);
+
+            // Dealloc old
+            let old_layout = Layout::from_size_align(self.capacity, Self::ALIGNMENT).unwrap();
+            dealloc(self.ptr.as_ptr(), old_layout);
+
+            self.ptr = NonNull::new_unchecked(new_ptr);
+            self.capacity = new_capacity;
+        }
     }
 }
 
 impl Drop for AlignedBytes {
     fn drop(&mut self) {
+        let layout = Layout::from_size_align(self.capacity, Self::ALIGNMENT).unwrap();
         unsafe {
-            dealloc(self.ptr.as_ptr(), self.layout);
+            dealloc(self.ptr.as_ptr(), layout);
         }
-    }
-}
-
-// Allow it to act like a slice
-impl Deref for AlignedBytes {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
     }
 }
 
