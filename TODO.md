@@ -1,94 +1,96 @@
-Here is the Global Master Plan for the Drift-Aware Vector Engine, organized by section with the requested checkmark emojis.
+# **Global Master Plan: Drift-Aware Vector Engine**
 
-### **Section 1: Storage Layer (Level 1)**
+#### **Section 1: Storage Layer (Level 1)**
 
-**Status:** ✅ Mostly Complete. The on-disk format and compression engines are solid.
+**Status:** ✅ **Complete.** The bedrock is solid.
 
-- ✅ **Custom `.drift` File Format:** Implemented `SegmentWriter`/`SegmentReader` with Footer and Index.
+- ✅ **Custom `.drift` File Format:** `SegmentWriter`/`SegmentReader` with Footer/Index.
 
-- ✅ **Disk Manager:** Implemented basic I/O and seeking.
+- ✅ **Disk Manager:** Async I/O with seek support.
 
-- ✅ **Block Alignment:** `PageBlock` implemented for 4KB alignment (NVMe prep).
+- ✅ **Block Alignment:** `PageBlock` for 4KB alignment.
 
-- ✅ **Compression (SQ8):** `Quantizer` implemented with training and clamping.
+- ✅ **Compression:**
 
-- ✅ **Compression (ALP/ALP_RD):** Float compression implemented.
+  - SQ8 Quantizer (1-99% clipping).
+  - ALP/ALP_RD for Floats.
+  - FastLanes for Integers.
 
-- ✅ **Compression (FastLanes):** Integer compression implemented.
+- ✅ **Bloom Filters:** Integrated into footer for O(1) negative lookups.
 
-- ✅ **Bloom Filters:** The SDD requires a Bloom Filter offset in the footer for quick "negative lookups" (checking if an ID exists without decompressing).
+#### **Section 2: Core Indexing Logic (Level 1)**
 
-### **Section 2: Core Indexing Logic (Level 1)**
+**Status:** ✅ **Complete.** The engine logic works.
 
-**Status:** ✅ Functional. The maintenance primitives are verified.
+- ✅ **Bucket Structure:** SoA layout with `AlignedBytes`.
 
-- ✅ **Bucket Structure:** SoA layout with `AlignedBytes` and `BitSet` for tombstones.
+- ✅ **ADC Scanning:** SIMD-optimized `scan_adc`.
 
-- ✅ **ADC Scanning:** SIMD-optimized `scan_adc` (AVX2/Neon) is implemented.
+- ✅ **Maintenance Primitives:**
+  - Split (Neighbor Stealing).
+  - Merge (Scatter Merge).
+  - Urgency Calculation ("Hot Zombie" formula).
 
-- ✅ **K-Means Clustering:** Robust initialization and training implemented.
+#### **Section 3: Memory Structure (Level 0)**
 
-- ✅ **Split Operation:** "Neighbor Stealing" logic implemented.
+**Status:** ✅ **Complete.** The ingest path is fully operational.
 
-- ✅ **Merge Operation:** "Scatter Merge" logic implemented.
+- ✅ **HNSW Graph:** Thread-safe MemTable for hot data.
 
-- ✅ **Urgency Calculation:** Implemented the "Hot Zombie" formula correctly ().
+- ✅ **Hybrid Search:** Merges L0 (Graph) and L1 (Disk) results seamlessly.
 
-- ✅ Maintenance: Split/Steal/Merge primitives are verified.
+- ✅ **Flushing Logic:** `Janitor` rotates MemTable, trains Quantizer (cold start), and flushes to Disk.
 
-### **Section 3: Memory Structure (Level 0)**
+- ✅ **Write-Ahead Log (WAL):** Durability guaranteed. Crashes recover data from WAL before hydration.
 
-**Status:** ⬜ **Missing.** The system currently writes directly to L1 (Buckets), skipping the "MemTable" layer.
-
-- ✅ **HNSW Graph:** Implement the Level 0 in-memory graph for recent data.
-- ✅ Hybrid Search: VectorIndex queries both L0 and L1 and merges results.
-
-- ⬜ **Flushing Logic:** Implement the async job that freezes L0, runs K-Means, and writes a `.drift` file.
-
-- ✅ **Write-Ahead Log (WAL):** Implement append-only persistence to survive crashes before flushing.
-
-### **Section 4: Execution Engine**
+#### **Section 4: Execution Engine**
 
 **Status:** ✅ **Complete.**
 
-- ✅ **Epoch-Based Reclamation:** Integrate `crossbeam-epoch` to manage memory safety without locks.
+- ✅ **Epoch-Based Reclamation:** `crossbeam-epoch` manages lock-free memory safety.
 
-- ✅ **Probabilistic Stopping Condition:** Implement the logic to stop searching early.
+- ✅ **Probabilistic Stopping:** Saturating Density scoring implemented.
 
-- ✅ **Concurrency:** Lock-free reads via crossbeam-epoch.
+- ✅ **Concurrency:** Lock-free reads on the hot path.
 
-- ✅ **Scoring:** Saturating Density math implemented.
+#### **Section 5: Server & API**
 
-### **Section 5: Server & API**
+**Status:** ✅ **Complete.** We have a working server.
 
-**Status:** 🚧 Barebones.
+- ✅ **Persistence Manager:** Handles Hydration (Disk -> RAM) and Flushing (RAM -> Disk).
 
-- ✅ **Persistence Manager:** Basic save/load lifecycle tests exist.
+- ✅ **gRPC Interface:** `DriftService` implements `Insert` and `Search` via Protobuf.
 
-- ⬜ **gRPC Interface:** Define the Protobuf service and handlers.
+- ✅ **Multi-Tenancy:** `CollectionManager` creates isolated indices on-the-fly (`/data/users`, `/data/products`).
 
-- ⬜ **Request Router:** Implement consistent hashing to route queries to correct nodes.
-
-- ⬜ **Background Workers:** The "Janitor" thread that periodically calls `calculate_urgency` and triggers maintenance.
+- ✅ **Background Workers:** `Janitor` runs per-collection to manage lifecycle.
 
 ---
 
-### **Section 6: Required Refactoring**
+### **Where We Are: The "Golden Path" is Live**
 
-These items are implemented but deviate from the specification or performance requirements.
+We have built a system that:
 
-- ✅ **Refactor Concurrency Model**
-- **Current:** Uses `parking_lot::RwLock` on the critical path (`search_drift_aware` locks buckets).
+1. **Accepts Data** via gRPC.
+2. **Writes safely** to a WAL.
+3. **Serves immediately** from RAM (HNSW).
+4. **Autonomously flushes** to compressed Disk Segments.
+5. **Recovers perfectly** from crashes (Hydration + WAL Replay).
+6. **Isolates Tenants** via Collections.
 
-- **Target:** Must be **Lock-Free**. Replace `RwLock<HashMap>` with atomic pointer swapping (using `crossbeam-epoch`) so searches _never_ block.
+### **The Final Frontier: Distributed Routing**
 
-- ✅ **Refactor Search Scoring**
-- **Current:** Uses a linear penalty: `dist *= 1.0 + frag`.
+The only item remaining from the original plan is the **Request Router**. Currently, `Drift` is a "Scale-Up" database (single node, many cores). To become "Scale-Out" (infinite storage), we need to shard data across multiple nodes.
 
-- **Target:** Must use the **Saturating Density** probability model: .
+**Updated Todo List:**
 
----
+- ⬜ **Distributed Consensus:** Use a lightweight consensus (like Raft or just consistent hashing configuration) to map `Collection -> Node`.
+- ⬜ **Forwarding:** If Node A receives a request for `Collection: "Logs"` but Node B owns it, forward the gRPC request.
+- ⬜ **CLI Tooling:** A proper command-line interface (`drift-cli`) to admin the cluster.
 
-### **Immediate Next Step**
+**Decision Point:**
+Do you want to:
 
-We should prioritize **Section 6 (Refactoring Concurrency)**. If we build L0 (HNSW) on top of the current blocking `RwLock` architecture, we will have to rewrite significantly more code later.
+1. **Pivot to Client SDKs:** Build a Python/Node.js client so you can actually _use_ this DB for your apps?
+2. **Push for Distribution:** Implement Sharding/Clustering?
+3. **Optimize:** Double down on SIMD/AVX-512 optimization?

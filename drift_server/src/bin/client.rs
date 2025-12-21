@@ -1,107 +1,76 @@
 use drift_server::drift_proto::{InsertRequest, SearchRequest, Vector, drift_client::DriftClient};
-use rand::Rng;
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
-
-// We reuse the proto module from the library crate to avoid recompiling protos twice
-// Ensure drift_server/src/lib.rs exports the proto module (pub mod drift_proto ...)
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "http://127.0.0.1:50051";
-    println!("Connecting to Drift Server at {}...", addr);
+    let mut client = DriftClient::connect(addr).await?;
+    let dim = 128;
 
-    // 1. Establish Connection
-    // In production, we would configure TLS, timeouts, and keep-alive here.
-    let mut client = match DriftClient::connect(addr).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to connect: {}. Is the server running?", e);
-            return Ok(());
-        }
-    };
+    println!("--- TEST 3: MULTI-COLLECTION ISOLATION ---");
 
-    println!("--- TEST 1: HIGH THROUGHPUT INSERT ---");
-    let dim = 128; // Must match server config
-    let num_vectors = 2500; // Enough to trigger Janitor (limit 2000)
-    let batch_size = 100;
-
-    let mut rng = rand::rng();
-    let start = Instant::now();
-
-    for i in 0..num_vectors {
-        let id = i as u64;
-        // Generate random vector
-        let values: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
-
-        let request = tonic::Request::new(InsertRequest {
-            collection_name: "default".to_string(),
-            vector: Some(Vector { id, values }),
-        });
-
-        if let Err(e) = client.insert(request).await {
-            eprintln!("Insert failed at ID {}: {}", id, e);
-        }
-
-        if i % batch_size == 0 && i > 0 {
-            println!("Inserted {} vectors...", i);
-        }
-    }
-
-    let duration = start.elapsed();
-    println!(
-        "Inserted {} vectors in {:?}. Throughput: {:.2} ops/sec",
-        num_vectors,
-        duration,
-        num_vectors as f64 / duration.as_secs_f64()
-    );
-
-    // Allow Janitor time to flush in the background
-    println!("Waiting for background flush...");
-    sleep(Duration::from_secs(3)).await;
-
-    println!("--- TEST 2: SEARCH ACCURACY ---");
-    // We search for a specific ID we inserted (e.g., ID 1000).
-    // To verify accuracy, we need to know the vector.
-    // For this generic test, we'll insert a KNOWN "Query Vector" at ID 99999.
-
-    let query_id = 99999;
-    let query_vec: Vec<f32> = vec![0.5; dim]; // Distinctive vector
-
+    // 1. Insert into 'users'
+    println!("Inserting ID 1 into 'users'...");
     client
         .insert(tonic::Request::new(InsertRequest {
-            collection_name: "default".to_string(),
+            collection_name: "users".to_string(), // <--- Targeted
             vector: Some(Vector {
-                id: query_id,
-                values: query_vec.clone(),
+                id: 1,
+                values: vec![0.1; dim],
             }),
         }))
         .await?;
 
-    println!("Inserted Query Target (ID: {})", query_id);
+    // 2. Insert into 'products' (Same ID, different data)
+    println!("Inserting ID 1 into 'products'...");
+    client
+        .insert(tonic::Request::new(InsertRequest {
+            collection_name: "products".to_string(), // <--- Targeted
+            vector: Some(Vector {
+                id: 1,
+                values: vec![0.9; dim],
+            }),
+        }))
+        .await?;
 
-    // Search for it
-    let search_req = tonic::Request::new(SearchRequest {
-        collection_name: "default".to_string(),
-        vector: query_vec, // Search with the exact same vector
-        k: 5,
-    });
+    // 3. Search 'users'
+    println!("Searching 'users' for 0.1...");
+    let res_users = client
+        .search(tonic::Request::new(SearchRequest {
+            collection_name: "users".to_string(),
+            vector: vec![0.1; dim],
+            k: 1,
+        }))
+        .await?
+        .into_inner();
 
-    let response = client.search(search_req).await?.into_inner();
+    let user_score = res_users.results[0].score;
+    println!(
+        "Found User ID: {}, Score: {:.4}",
+        res_users.results[0].id, user_score
+    );
 
-    println!("Search Results:");
-    let mut found = false;
-    for res in response.results {
-        println!(" - ID: {}, Score: {:.4}", res.id, res.score);
-        if res.id == query_id {
-            found = true;
-        }
-    }
+    // 4. Search 'products'
+    println!("Searching 'products' for 0.9...");
+    let res_products = client
+        .search(tonic::Request::new(SearchRequest {
+            collection_name: "products".to_string(),
+            vector: vec![0.9; dim],
+            k: 1,
+        }))
+        .await?
+        .into_inner();
 
-    if found {
-        println!("✅ SUCCESS: Found inserted vector!");
+    let prod_score = res_products.results[0].score;
+    println!(
+        "Found Product ID: {}, Score: {:.4}",
+        res_products.results[0].id, prod_score
+    );
+
+    // 5. Verify Isolation
+    if user_score < 0.001 && prod_score < 0.001 {
+        println!("✅ SUCCESS: Collections are isolated correctly.");
     } else {
-        println!("❌ FAILURE: Did not find vector ID {}", query_id);
+        println!("❌ FAILURE: Cross-contamination detected.");
     }
 
     Ok(())

@@ -876,6 +876,12 @@ impl VectorIndex {
             new
         });
     }
+
+    /// Reserves a new unique Bucket ID.
+    /// Essential for hydration to prevent collisions when loading multiple L0 segments.
+    pub fn allocate_next_bucket_id(&self) -> u32 {
+        self.next_bucket_id.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 fn distance_sq(a: &[f32], b: &[f32]) -> f32 {
