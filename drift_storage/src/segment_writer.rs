@@ -5,7 +5,7 @@ use crc32fast::Hasher;
 use fastbloom::BloomFilter;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io;
 
 // --- Structs ---
 

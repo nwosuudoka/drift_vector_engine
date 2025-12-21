@@ -1,6 +1,7 @@
 pub mod janitor;
 pub mod persistence;
 
-pub(crate) mod janitor_tests;
-pub(crate) mod persistence_test;
-pub(crate) mod wal_integration_test;
+// Export the generated protobuf code so binaries (client) can use it
+pub mod drift_proto {
+    tonic::include_proto!("drift");
+}

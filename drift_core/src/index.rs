@@ -69,7 +69,7 @@ pub(crate) struct CentroidEntry {
 }
 
 pub struct VectorIndex {
-    pub(crate) config: IndexOptions,
+    pub config: IndexOptions,
     // Quantizer is now Arc so buckets can share it cheaply
     pub(crate) quantizer: RwLock<Option<Arc<Quantizer>>>,
 
