@@ -191,36 +191,6 @@ impl Bucket {
         results
     }
 
-    /// Calculate Urgency based on Equation (5)
-    /// Urgency = (Emptiness / (T + epsilon)) + (Beta * ZombieRatio)
-    // pub fn calculate_urgency(&self, target_capacity: usize) -> f32 {
-    //     let count = self.count.load(Ordering::Relaxed) as f32;
-    //     let dead = self.tombstone_count.load(Ordering::Relaxed) as f32;
-    //     let temp = self.temperature.load(Ordering::Relaxed);
-
-    //     let live = count - dead;
-
-    //     // 1. Calculate Emptiness
-    //     // "How much space is unused relative to target?"
-    //     // If we have 10 live items and target is 100, Emptiness is 0.9.
-    //     let emptiness = if live < target_capacity as f32 {
-    //         (target_capacity as f32 - live) / target_capacity as f32
-    //     } else {
-    //         0.0
-    //     };
-
-    //     // 2. Calculate Zombie Ratio (Tombstones / Total)
-    //     let zombie_ratio = if count > 0.0 { dead / count } else { 0.0 };
-
-    //     // 3. Constants from Spec
-    //     const EPSILON: f32 = 0.001; // Avoid div by zero if temp is 0
-    //     const BETA: f32 = 3.0;
-
-    //     // 4. The Formula
-    //     // High Temp -> Large Denominator -> Low Urgency (Protected)
-    //     (emptiness / (temp + EPSILON)) + (BETA * zombie_ratio)
-    // }
-
     /// Helper: Removes specific VIDs for Neighbor Stealing.
     /// Returns the reconstructed vectors for the removed IDs.
     pub fn steal_vectors(&self, target_ids: &[u64]) -> Vec<Vec<f32>> {
@@ -249,6 +219,26 @@ impl Bucket {
             }
         }
         stolen_vecs
+    }
+
+    /// NEW: Marks a vector ID as deleted (Tombstone).
+    /// Returns true if the ID was found and marked.
+    pub fn delete(&self, vid: u64) -> bool {
+        let mut data = self.data.write();
+
+        // Linear scan is acceptable here because:
+        // 1. Buckets are small (~1000 items).
+        // 2. This happens in parallel across buckets in the Index.
+        // 3. It's much cheaper than maintaining a Hashmap per bucket.
+        if let Some(pos) = data.vids.iter().position(|&x| x == vid) {
+            // Only count if not already deleted
+            if !data.tombstones.contains(pos) {
+                data.tombstones.insert(pos);
+                self.tombstone_count.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
     }
 }
 

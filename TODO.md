@@ -84,13 +84,11 @@ The only item remaining from the original plan is the **Request Router**. Curren
 
 **Updated Todo List:**
 
-- ⬜ **Distributed Consensus:** Use a lightweight consensus (like Raft or just consistent hashing configuration) to map `Collection -> Node`.
-- ⬜ **Forwarding:** If Node A receives a request for `Collection: "Logs"` but Node B owns it, forward the gRPC request.
-- ⬜ **CLI Tooling:** A proper command-line interface (`drift-cli`) to admin the cluster.
+Section 6: Scaling & Optimization (New)
 
-**Decision Point:**
-Do you want to:
+Status: 🚧 In Progress.
 
-1. **Pivot to Client SDKs:** Build a Python/Node.js client so you can actually _use_ this DB for your apps?
-2. **Push for Distribution:** Implement Sharding/Clustering?
-3. **Optimize:** Double down on SIMD/AVX-512 optimization?
+- ⬜ **Global ID Index**: Integrate BitStore (Disk Hash Table) to map VectorID -> BucketID for O(1) deletes/updates.
+- ⬜ **Distributed Consensus**: Use a lightweight consensus (or consistent hashing) to map Collection -> Node.
+- ⬜ **Request Router**: Forward gRPC requests to the correct node/shard.
+- ⬜ **CLI Tooling**: A proper command-line interface (drift-cli) to admin the cluster.

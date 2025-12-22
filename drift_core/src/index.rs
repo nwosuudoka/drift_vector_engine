@@ -108,6 +108,9 @@ impl VectorIndex {
                     match entry {
                         WalEntry::Insert { id, vector } => {
                             memtable.insert(id, &vector);
+                        } // TODO: implement delete
+                        WalEntry::Delete { id } => {
+                            memtable.delete(id);
                         }
                     }
                 }
@@ -881,6 +884,33 @@ impl VectorIndex {
     /// Essential for hydration to prevent collisions when loading multiple L0 segments.
     pub fn allocate_next_bucket_id(&self) -> u32 {
         self.next_bucket_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn delete(&self, id: u64) -> io::Result<()> {
+        // 1. Durable: Write to WAL
+        {
+            let mut wal = self.wal.lock().unwrap();
+            wal.write_delete(id)?;
+            // We don't necessarily flush to disk for every delete (perf trade-off)
+        }
+
+        // 2. L0: MemTable
+        let guard = epoch::pin();
+        let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+        memtable.delete(id);
+
+        // 3. L1: Scan Buckets (Parallel)
+        // Since we don't know which bucket has the ID, we check them all.
+        // This is fast in RAM.
+        let buckets_map = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+        buckets_map.values().par_bridge().for_each(|bucket| {
+            // Bucket::delete checks if ID exists and sets the bitset if so.
+            // We need to implement bucket.delete(id)
+            bucket.delete(id);
+        });
+
+        Ok(())
     }
 }
 

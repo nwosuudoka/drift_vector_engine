@@ -3,6 +3,7 @@ pub mod manager;
 pub mod persistence;
 
 #[cfg(test)]
+mod janitor_tests;
 mod manager_tests; // Add this line
 
 // Export the generated protobuf code so binaries (client) can use it

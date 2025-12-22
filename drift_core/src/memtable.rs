@@ -1,7 +1,10 @@
 // drift_core/src/memtable.rs
 
 use hnsw_rs::prelude::*;
-use std::{collections::HashMap, sync::RwLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::RwLock,
+};
 
 /// Level 0: The In-Memory Graph (MemTable).
 /// Stores uncompressed f32 vectors for high recall on recent data.
@@ -13,6 +16,7 @@ pub struct MemTable {
 
     // Stores raw data for flushing. Wrapped in RwLock for concurrent access.
     data: RwLock<HashMap<u64, Vec<f32>>>,
+    tombstones: RwLock<HashSet<u64>>,
 }
 
 impl MemTable {
@@ -30,6 +34,7 @@ impl MemTable {
             capacity,
             dim,
             data: RwLock::new(HashMap::new()),
+            tombstones: RwLock::new(HashSet::new()),
         }
     }
 
@@ -43,13 +48,34 @@ impl MemTable {
         map.insert(id, vector.to_vec());
     }
 
+    pub fn delete(&self, id: u64) {
+        let mut set = self.tombstones.write().unwrap();
+        set.insert(id);
+
+        // Also remove from data map so it doesn't get flushed to disk
+        let mut data = self.data.write().unwrap();
+        data.remove(&id);
+    }
+
+    // Update search to filter results
     pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
+        let tombstones = self.tombstones.read().unwrap();
         self.hnsw
-            .search(query, k, ef_search)
+            .search(query, k + tombstones.len(), ef_search) // Ask for more to account for filtering
             .into_iter()
-            .map(|n| (n.d_id as u64, n.distance)) // hnsw_rs returns distance, not squared
+            .map(|n| (n.d_id as u64, n.distance))
+            .filter(|(id, _)| !tombstones.contains(id)) // Filter
+            .take(k)
             .collect()
     }
+
+    // pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
+    //     self.hnsw
+    //         .search(query, k, ef_search)
+    //         .into_iter()
+    //         .map(|n| (n.d_id as u64, n.distance)) // hnsw_rs returns distance, not squared
+    //         .collect()
+    // }
 
     pub fn len(&self) -> usize {
         self.hnsw.get_nb_point()

@@ -9,11 +9,12 @@ use std::path::Path;
 
 // OpCodes
 const OP_INSERT: u8 = 0x01;
-// const OP_DELETE: u8 = 0x02; // Future
+const OP_DELETE: u8 = 0x02; // Future
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum WalEntry {
     Insert { id: u64, vector: Vec<f32> },
+    Delete { id: u64 },
 }
 
 pub struct WalWriter {
@@ -90,6 +91,24 @@ impl WalWriter {
 
         Ok(())
     }
+
+    pub fn write_delete(&mut self, id: u64) -> io::Result<()> {
+        let payload_len = 1 + 8; // OpCode (1) + ID (8)
+        let mut payload = Vec::with_capacity(payload_len);
+
+        payload.write_u8(OP_DELETE)?;
+        payload.write_u64::<LittleEndian>(id)?;
+
+        let mut hasher = Hasher::new();
+        hasher.update(&payload);
+        let checksum = hasher.finalize();
+
+        self.writer.write_u32::<LittleEndian>(checksum)?;
+        self.writer.write_u32::<LittleEndian>(payload_len as u32)?;
+        self.writer.write_all(&payload)?;
+
+        Ok(())
+    }
 }
 
 pub struct WalReader {
@@ -157,6 +176,10 @@ impl WalReader {
                     vector.push(cursor.read_f32::<LittleEndian>()?);
                 }
                 Ok(WalEntry::Insert { id, vector })
+            }
+            OP_DELETE => {
+                let id = cursor.read_u64::<LittleEndian>()?;
+            Ok(WalEntry::Delete { id })
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown OpCode")),
         }
