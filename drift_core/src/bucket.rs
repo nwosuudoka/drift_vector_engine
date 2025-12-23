@@ -21,6 +21,7 @@ pub struct Bucket {
 
     // Stats
     pub centroid: RwLock<Vec<f32>>,
+    pub running_sum: RwLock<Vec<f32>>,
     pub count: AtomicU32,
     pub tombstone_count: AtomicU32,
     pub temperature: AtomicF32,
@@ -38,6 +39,7 @@ impl Bucket {
                 tombstones: BitSet::with_capacity(capacity),
             }),
             centroid: RwLock::new(vec![0.0; dim]),
+            running_sum: RwLock::new(vec![0.0; dim]),
             count: AtomicU32::new(0),
             tombstone_count: AtomicU32::new(0),
             temperature: AtomicF32::new(1.0),
@@ -59,6 +61,46 @@ impl Bucket {
         }
 
         self.count.fetch_add(1, Ordering::Relaxed);
+
+        let vec = self.quantizer.reconstruct(code);
+        let mut sum = self.running_sum.write();
+        for (i, val) in vec.iter().enumerate() {
+            sum[i] += val;
+        }
+    }
+
+    pub fn should_split(&self, target_capacity: usize) -> bool {
+        let count = self.count.load(Ordering::Relaxed) as usize;
+        // 1. Capacity Check (> 80% full)
+        let threshold = (target_capacity as f32 * 0.8) as usize;
+        if count < threshold {
+            return false;
+        }
+
+        // 2. Drift Calculation (> 0.15)
+        let stored_centroid = self.centroid.read();
+        let sum = self.running_sum.read();
+
+        // Current Mean = Sum / Count
+        let mut current_centroid = vec![0.0; stored_centroid.len()];
+        if count > 0 {
+            for i in 0..stored_centroid.len() {
+                current_centroid[i] = sum[i] / count as f32;
+            }
+        }
+
+        // Euclidean Distance
+        let drift_sq: f32 = stored_centroid
+            .iter()
+            .zip(current_centroid.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum();
+
+        let drift = drift_sq.sqrt();
+        const TARGET_DRIFT: f32 = 0.15;
+
+        // SDD Threshold: 0.15
+        drift > TARGET_DRIFT
     }
 
     /// The Heating Operation (Hot Path)

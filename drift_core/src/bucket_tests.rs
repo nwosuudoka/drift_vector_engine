@@ -1,8 +1,10 @@
 #[cfg(test)]
 
 mod tests {
-    use crate::{bucket::Bucket, quantizer::Quantizer};
+    use crate::bucket::Bucket;
+    use crate::quantizer::Quantizer;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     fn get_test_bucket() -> Bucket {
         let data = vec![vec![0.0], vec![100.0]];
@@ -204,14 +206,36 @@ mod tests {
         assert!(ids.contains(&2));
         assert!(!ids.contains(&1), "Tombstoned ID 1 was leaked!");
     }
-}
 
-#[cfg(test)]
-mod urgency_tests {
-    use crate::bucket::Bucket;
-    use crate::quantizer::Quantizer;
-    use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    #[test]
+    fn test_drift_calculation_trigger() {
+        // Create bucket with Capacity 10
+        let bucket = get_test_bucket(); // capacity=10, dim=1, centroid=[0.0]
+        let q = &bucket.quantizer;
+
+        // 1. Insert 5 items (50% capacity) at 0.0 (No Drift)
+        // should_split = False (Capacity < 80%)
+        for i in 0..5 {
+            bucket.insert(i, &q.encode(&vec![0.0]));
+        }
+        assert!(!bucket.should_split(10));
+
+        // 2. Fill to 9 items (90% capacity) at 0.0 (No Drift)
+        // should_split = False (Capacity OK, but Drift = 0.0 < 0.15)
+        for i in 5..9 {
+            bucket.insert(i, &q.encode(&vec![0.0]));
+        }
+        assert!(!bucket.should_split(10));
+
+        // 3. Induce Drift
+        // Insert a vector far away (e.g., 100.0).
+        // This pulls the mean away from 0.0.
+        // Mean becomes ~10.0. Distance(0, 10) = 10.0 > 0.15.
+        bucket.insert(9, &q.encode(&vec![100.0]));
+
+        // Now: Count=10 (100% > 80%) AND Drift is high.
+        assert!(bucket.should_split(10), "Bucket failed to detect drift!");
+    }
 
     fn make_bucket(dim: usize) -> Bucket {
         let data = vec![vec![0.0; dim]];

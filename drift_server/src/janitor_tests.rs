@@ -395,3 +395,143 @@ mod tests {
         println!("✅ test_deletion_and_self_healing Passed!");
     }
 }
+
+#[cfg(test)]
+mod mod_self_healing_test {
+    use crate::janitor::Janitor;
+    use crate::persistence::PersistenceManager;
+    use drift_core::index::{IndexOptions, VectorIndex};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use tokio::time::sleep;
+
+    // --- Helper to create a standard test index ---
+    fn create_index(dir: &std::path::Path, wal_name: &str, capacity: usize) -> Arc<VectorIndex> {
+        let wal_path = dir.join(wal_name);
+        let options = IndexOptions {
+            dim: 2,
+            num_centroids: 1, // Start with 1 bucket to force splits
+            training_sample_size: 20,
+            max_bucket_capacity: capacity,
+            ef_construction: 50,
+            ef_search: 50,
+        };
+        let index = Arc::new(VectorIndex::new(options, &wal_path).unwrap());
+        // Train to ensure Quantizer is ready
+        index.train(&vec![vec![0.0, 0.0], vec![100.0, 100.0]]);
+        index
+    }
+
+    #[tokio::test]
+    async fn test_deletion_and_self_healing() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("healing.wal");
+        let persistence = PersistenceManager::new(dir.path());
+
+        // 1. Create Index with small capacity
+        let options = IndexOptions {
+            dim: 2,
+            num_centroids: 2,
+            training_sample_size: 20,
+            max_bucket_capacity: 50,
+            ef_construction: 50,
+            ef_search: 50,
+        };
+        let index = Arc::new(VectorIndex::new(options, &wal_path).unwrap());
+        index.train(&vec![vec![0.0, 0.0], vec![100.0, 100.0]]);
+
+        // 2. Fill Buckets (Insert 100 items)
+        for i in 0..100 {
+            let val = if i < 50 { 0.0 } else { 100.0 };
+            index.force_insert_l1(i, &vec![val, val]);
+        }
+
+        // 3. MASS DELETE (Create Zombies)
+        println!("--- SIMULATING MASS DELETE ---");
+        for i in 0..45 {
+            index.delete(i).unwrap();
+        }
+
+        // 4. Run Janitor
+        let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(1));
+
+        println!("--- WAITING FOR HEAL ---");
+        let j_handle = tokio::spawn(async move {
+            janitor.run().await;
+        });
+
+        sleep(Duration::from_millis(100)).await;
+        j_handle.abort();
+
+        // 5. Verify Healing
+        // Bucket 0 (IDs 0-49) was 90% dead. It should be merged.
+        let results = index.search_drift_aware(&vec![0.0, 0.0], 5, 0.9, 1.0, 100.0);
+        assert!(!results.is_empty(), "Valid data (45-49) shouldn't be lost!");
+        assert!(results[0].id >= 45, "Should find the survivors (IDs 45+)");
+
+        println!("✅ test_deletion_and_self_healing Passed!");
+    }
+
+    /// TEST 2: AUTO-SPLITTING (The Growth Mechanism)
+    /// We force a bucket to overflow AND drift, verifying the Janitor splits it.
+    #[tokio::test]
+    async fn test_auto_splitting_under_pressure() {
+        let dir = tempdir().unwrap();
+        let persistence = PersistenceManager::new(dir.path());
+
+        // Capacity = 20. We will insert ~50 items to force overflow.
+        let index = create_index(dir.path(), "split.wal", 20);
+
+        // 1. Initial State: 1 Bucket (ID 0) centered at [0,0]
+        // We force insert to L1 to bypass flush delay
+        for i in 0..15 {
+            index.force_insert_l1(i, &vec![0.0, 0.0]);
+        }
+
+        let initial_buckets = index.get_all_buckets();
+        assert_eq!(initial_buckets.len(), 1, "Should start with 1 bucket");
+        assert_eq!(initial_buckets[0].id, 0);
+
+        // 2. Induce Drift & Overflow
+        // We insert 35 items far away at [100, 100].
+        // Total = 50 items. Capacity = 20. (250% Full)
+        // Mean will shift significantly -> Drift > 0.15.
+        println!("--- INDUCING DRIFT ---");
+        for i in 15..50 {
+            index.force_insert_l1(i, &vec![100.0, 100.0]);
+        }
+
+        // 3. Run Janitor
+        let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(1));
+        let j_handle = tokio::spawn(async move {
+            janitor.run().await;
+        });
+
+        // Wait for maintenance cycle (needs ~10 ticks = 10ms+)
+        sleep(Duration::from_millis(100)).await;
+        j_handle.abort();
+
+        // 4. Verify Split
+        let final_buckets = index.get_all_buckets();
+        println!("Final Bucket Count: {}", final_buckets.len());
+
+        // We expect the original bucket (ID 0) to be gone/replaced,
+        // or for there to be at least 2 buckets now.
+        // Since `split_and_steal` creates 2 new buckets and removes the old one,
+        // we should have at least 2 active buckets.
+        assert!(
+            final_buckets.len() >= 2,
+            "Janitor failed to split the drifting bucket!"
+        );
+
+        // Verify Data Integrity
+        let res_near = index.search_drift_aware(&vec![0.0, 0.0], 1, 0.9, 1.0, 100.0);
+        let res_far = index.search_drift_aware(&vec![100.0, 100.0], 1, 0.9, 1.0, 100.0);
+
+        assert!(!res_near.is_empty(), "Lost original data [0,0]");
+        assert!(!res_far.is_empty(), "Lost new data [100,100]");
+
+        println!("✅ test_auto_splitting_under_pressure Passed!");
+    }
+}

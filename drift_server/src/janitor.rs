@@ -56,67 +56,49 @@ impl Janitor {
         }
     }
 
-    /// Scans L1 buckets, decays temperature, and triggers Split or Merge if urgency is high.
     fn perform_maintenance(&self) {
-        // We only want ONE heavy operation per cycle to avoid thrashing.
-        // We scan all buckets to find the "best" candidate for maintenance.
-
         let buckets = self.index.get_all_buckets();
-        if buckets.is_empty() {
-            return;
-        }
+        let target_cap = self.index.config.max_bucket_capacity;
 
-        let max_capacity = self.index.config.max_bucket_capacity;
-        let mut best_bucket_id = None;
+        let mut best_merge_candidate = None;
         let mut max_urgency = 0.0;
-        let mut is_zombie_candidate = false;
+        let mut best_split_candidate = None;
 
         for bucket in &buckets {
-            // 1. Thermodynamics: Cool down the bucket
-            // If it hasn't been searched recently, its temperature drops.
             bucket.decay_temperature();
 
-            // 2. Calculate Urgency (The "Hot Zombie" Formula)
-            let urgency = bucket.calculate_urgency(max_capacity);
-
-            // 3. Track the worst offender
+            // 1. Check Merge Urgency (Healing)
+            let urgency = bucket.calculate_urgency(target_cap);
             if urgency > max_urgency {
                 max_urgency = urgency;
-                best_bucket_id = Some(bucket.id);
+                best_merge_candidate = Some(bucket.id);
+            }
 
-                // Classify the problem: Is it dead (Zombie) or just full?
-                let count = bucket.count.load(Ordering::Relaxed) as f32;
-                let dead = bucket.tombstone_count.load(Ordering::Relaxed) as f32;
-
-                // If > 30% of data is dead, it's a Zombie.
-                // Even if it's hot, we want to merge it to reclaim space/efficiency.
-                is_zombie_candidate = count > 0.0 && (dead / count) > 0.3;
+            // 2. Check Split Criteria (Growth) - SDD Section 3.C
+            // We prioritize the *first* valid split candidate we find to avoid scanning everything strictly
+            if best_split_candidate.is_none() && bucket.should_split(target_cap) {
+                best_split_candidate = Some(bucket.id);
             }
         }
 
-        // 4. Execute Maintenance (If Threshold Met)
-        // Threshold 1.0 is the baseline for "Needs Attention"
+        // DECISION LOGIC: Heal first, then Grow.
         if max_urgency > 1.0
-            && let Some(id) = best_bucket_id
+            && let Some(id) = best_merge_candidate
         {
             println!(
-                "Janitor: Maintenance triggered for Bucket {} (Urgency: {:.2})",
+                "Janitor: 🚑 Scatter Merging Bucket {} (Urgency {:.2})",
                 id, max_urgency
             );
+            let _ = self.index.scatter_merge(id);
+            return; // One op per tick
+        }
 
-            if is_zombie_candidate {
-                println!(
-                    "Janitor: 🚑 Scatter Merging Bucket {} (Zombie Detected)",
-                    id
-                );
-                if let Err(e) = self.index.scatter_merge(id) {
-                    eprintln!("Janitor Error during Merge: {}", e);
-                }
-            } else {
-                println!("Janitor: ✂️ Splitting Bucket {} (Capacity Pressure)", id);
-                // Split is CPU bound. In a real system, we might spawn_blocking.
-                self.index.split_and_steal(id);
-            }
+        if let Some(id) = best_split_candidate {
+            println!(
+                "Janitor: ✂️ Splitting Bucket {} (Drift/Capacity detected)",
+                id
+            );
+            self.index.split_and_steal(id);
         }
     }
 
