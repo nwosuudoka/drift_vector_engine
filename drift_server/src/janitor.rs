@@ -90,36 +90,32 @@ impl Janitor {
 
                 // If > 30% of data is dead, it's a Zombie.
                 // Even if it's hot, we want to merge it to reclaim space/efficiency.
-                if count > 0.0 && (dead / count) > 0.3 {
-                    is_zombie_candidate = true;
-                } else {
-                    is_zombie_candidate = false;
-                }
+                is_zombie_candidate = count > 0.0 && (dead / count) > 0.3;
             }
         }
 
         // 4. Execute Maintenance (If Threshold Met)
         // Threshold 1.0 is the baseline for "Needs Attention"
-        if max_urgency > 1.0 {
-            if let Some(id) = best_bucket_id {
-                println!(
-                    "Janitor: Maintenance triggered for Bucket {} (Urgency: {:.2})",
-                    id, max_urgency
-                );
+        if max_urgency > 1.0
+            && let Some(id) = best_bucket_id
+        {
+            println!(
+                "Janitor: Maintenance triggered for Bucket {} (Urgency: {:.2})",
+                id, max_urgency
+            );
 
-                if is_zombie_candidate {
-                    println!(
-                        "Janitor: 🚑 Scatter Merging Bucket {} (Zombie Detected)",
-                        id
-                    );
-                    if let Err(e) = self.index.scatter_merge(id) {
-                        eprintln!("Janitor Error during Merge: {}", e);
-                    }
-                } else {
-                    println!("Janitor: ✂️ Splitting Bucket {} (Capacity Pressure)", id);
-                    // Split is CPU bound. In a real system, we might spawn_blocking.
-                    self.index.split_and_steal(id);
+            if is_zombie_candidate {
+                println!(
+                    "Janitor: 🚑 Scatter Merging Bucket {} (Zombie Detected)",
+                    id
+                );
+                if let Err(e) = self.index.scatter_merge(id) {
+                    eprintln!("Janitor Error during Merge: {}", e);
                 }
+            } else {
+                println!("Janitor: ✂️ Splitting Bucket {} (Capacity Pressure)", id);
+                // Split is CPU bound. In a real system, we might spawn_blocking.
+                self.index.split_and_steal(id);
             }
         }
     }
