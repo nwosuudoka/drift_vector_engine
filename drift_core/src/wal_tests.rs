@@ -30,6 +30,7 @@ mod tests {
                 assert_eq!(*id, 1);
                 assert_eq!(vector, &vec![1.0, 2.0, 3.0]);
             }
+            _ => panic!("Unexpected entry type"),
         }
     }
 
@@ -66,6 +67,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         match &entries[0] {
             WalEntry::Insert { id, .. } => assert_eq!(*id, 1),
+            _ => panic!("Unexpected entry type"),
         }
     }
 }

@@ -26,4 +26,5 @@ thiserror = "2.0.17"
 rayon = "1.8"
 byteorder = "1.4"
 tempfile = "3.23.0"
-crc32fast = "1.3"   # Checksums for blocks
+crc32fast = "1.3"                   # Checksums for blocks
+drift_kv = { path = "../drift_kv" }

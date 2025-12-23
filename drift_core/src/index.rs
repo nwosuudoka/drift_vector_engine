@@ -4,6 +4,7 @@ use crate::memtable::MemTable;
 use crate::quantizer::Quantizer;
 use crate::wal::{WalEntry, WalReader, WalWriter};
 use crossbeam_epoch::{self as epoch, Atomic, Owned};
+use drift_kv::bitstore::BitStore;
 use rayon::prelude::*;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap};
@@ -85,6 +86,8 @@ pub struct VectorIndex {
     pub(crate) wal: Mutex<WalWriter>,
     // L0: MemTable
     pub(crate) memtable: Atomic<Arc<MemTable>>,
+
+    pub(crate) kv: Arc<BitStore>,
 }
 
 impl VectorIndex {
@@ -120,6 +123,10 @@ impl VectorIndex {
         // 3. Open WAL for writing (Append mode)
         let writer = WalWriter::new(wal_path)?;
 
+        let base_dir = wal_path.parent().unwrap_or(Path::new("."));
+        let kv_path = base_dir.join("id_map");
+        let kv = Arc::new(BitStore::new(&kv_path).map_err(|e| io::Error::other(e.to_string()))?);
+
         Ok(Self {
             config,
             wal: Mutex::new(writer),
@@ -128,6 +135,7 @@ impl VectorIndex {
             centroids: Atomic::new(Vec::new()),
             buckets: Atomic::new(HashMap::new()),
             next_bucket_id: AtomicU32::new(0),
+            kv,
         })
     }
 
@@ -328,6 +336,15 @@ impl VectorIndex {
         let buckets = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
         if let Some(bucket) = buckets.get(&best_id) {
             bucket.insert(id, &code);
+
+            // Log error but don't crash (Eventual consistency?)
+            // Ideally, we want this to succeed.
+            if let Err(e) = self.kv.put(
+                id.to_le_bytes().as_slice(),
+                best_id.to_le_bytes().as_slice(),
+            ) {
+                eprintln!("KV Put Error for ID {}: {}", id, e);
+            }
         }
     }
 
@@ -496,7 +513,10 @@ impl VectorIndex {
         if let Some(bucket) = removed_bucket {
             let (vecs, ids) = bucket.extract_reconstructed();
             for (i, vec) in vecs.iter().enumerate() {
-                self.insert(ids[i], vec)?;
+                let vid = ids[i];
+                self.insert(vid, vec)?;
+
+                let _ = self.kv.remove(vid.to_le_bytes().as_slice());
             }
         }
 
@@ -579,7 +599,14 @@ impl VectorIndex {
         for (i, &cluster_idx) in result.assignments.iter().enumerate() {
             let target = if cluster_idx == 0 { &ba } else { &bb };
             let code = q_arc.encode(&vecs[i]);
+            let vid = ids[i]; // The vector ID
+
             target.insert(ids[i], &code);
+
+            let _ = self.kv.put(
+                vid.to_le_bytes().as_slice(),
+                target.id.to_le_bytes().as_slice(),
+            );
         }
 
         // --- PHASE 2: NEIGHBOR STEALING (Budgeted Maintenance) ---
@@ -899,16 +926,44 @@ impl VectorIndex {
         let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
         memtable.delete(id);
 
-        // 3. L1: Scan Buckets (Parallel)
+        // 3: L1: Fast Lookup via KV
+        let k_bytes = id.to_le_bytes();
+        match self.kv.get(&k_bytes) {
+            Ok(Some(v_buf)) => {
+                if v_buf.len() == 4 {
+                    let bucket_id = u32::from_le_bytes(v_buf.try_into().unwrap());
+                    let buckets =
+                        unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+                    if let Some(bucket) = buckets.get(&bucket_id) {
+                        bucket.delete(id);
+                        // Optional: We keep the KV entry pointing to the bucket so subsequent deletes are fast,
+                        // OR we remove it.
+                        // If we remove it from KV, we lose track of the tombstone location.
+                        // Better to KEEP it in KV so we know where the tombstone lives (to prevent resurrection).
+                        // Actually, if we delete from KV, `get` returns None, and we assume it's gone.
+                        // But physically, the vector remains in the bucket (marked as tombstone).
+                        // Let's REMOVE from KV to signify "Not Searchable".
+                        let _ = self.kv.remove(&k_bytes);
+                    }
+                }
+            }
+            Ok(None) => {} // Not in L1
+            Err(e) => {
+                eprintln!("KV Error: {}", e);
+            }
+        }
+
+        // Might want to keep this as a backup??
+        // 3.1. L1: Scan Buckets (Parallel)
         // Since we don't know which bucket has the ID, we check them all.
         // This is fast in RAM.
-        let buckets_map = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+        // let buckets_map = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
 
-        buckets_map.values().par_bridge().for_each(|bucket| {
-            // Bucket::delete checks if ID exists and sets the bitset if so.
-            // We need to implement bucket.delete(id)
-            bucket.delete(id);
-        });
+        // buckets_map.values().par_bridge().for_each(|bucket| {
+        //     // Bucket::delete checks if ID exists and sets the bitset if so.
+        //     // We need to implement bucket.delete(id)
+        //     bucket.delete(id);
+        // });
 
         Ok(())
     }
