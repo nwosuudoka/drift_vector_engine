@@ -271,7 +271,7 @@ impl VectorIndex {
         }
 
         // 2. Run Local K-Means
-        let trainer = KMeansTrainer::new(2, self.config.dim, 10);
+        let trainer: KMeansTrainer = KMeansTrainer::new(2, self.config.dim, 10);
         let result = trainer.train(&vecs);
 
         // 3. Create New Buckets

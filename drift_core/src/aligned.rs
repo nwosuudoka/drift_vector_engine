@@ -1,4 +1,5 @@
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
 use std::slice;
 
@@ -67,6 +68,10 @@ impl AlignedBytes {
         self.capacity
     }
 
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
     // --- The System Engineering Core: Safe Reallocation ---
     fn grow(&mut self) {
         let new_capacity = self.capacity * 2;
@@ -94,6 +99,17 @@ impl AlignedBytes {
             self.capacity = new_capacity;
         }
     }
+
+    /// SAFETY: Caller must ensure `new_len <= self.capacity` and that
+    /// the memory up to `new_len` is initialized (or will be immediately).
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        assert!(new_len <= self.capacity);
+        self.len = new_len;
+    }
+
+    pub fn as_mut_slice_full(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity) }
+    }
 }
 
 impl Drop for AlignedBytes {
@@ -107,3 +123,48 @@ impl Drop for AlignedBytes {
 
 unsafe impl Send for AlignedBytes {}
 unsafe impl Sync for AlignedBytes {}
+
+impl Clone for AlignedBytes {
+    fn clone(&self) -> Self {
+        // 1. Allocate new aligned memory (Deep Copy)
+        // We use Self::new to handle the complex layout/alloc logic safety
+        let mut new_buffer = Self::new(self.capacity);
+
+        // 2. Memcpy the data
+        // Safety: Both pointers are valid, aligned, and we copy exactly 'len' bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_buffer.ptr.as_ptr(), self.len);
+        }
+
+        // 3. Sync metadata
+        new_buffer.len = self.len;
+        new_buffer
+    }
+}
+
+// Optional: Debug is helpful for tests too
+impl std::fmt::Debug for AlignedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlignedBytes")
+            .field("len", &self.len)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
+impl Index<usize> for AlignedBytes {
+    type Output = u8;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        // Panics if out of bounds, just like Vec
+        &self.as_slice()[index]
+    }
+}
+
+impl IndexMut<usize> for AlignedBytes {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.as_mut_slice()[index]
+    }
+}

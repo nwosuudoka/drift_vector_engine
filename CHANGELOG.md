@@ -4,6 +4,21 @@
 
 ### Added
 
+- **`BucketData` Serialization:** Implemented `Cacheable` trait for `BucketData`.
+- **Bitpacking:** Integrated scalar bit-packing for Tombstone blocks, reducing metadata overhead by ~30x for sparse deletes.
+- **Safety:** Added `0xBD47001` Magic Bytes validation and enforced 64-byte alignment during deserialization.
+
+### Verified
+
+- **Round-Trip:** Validated that `BucketData` -> `Bytes` -> `BucketData` is lossless and memory-safe.
+
+### Added
+
+- **`drift_cache` Crate:** Created new library to handle memory management and disk I/O.
+- **S3-FIFO Eviction:** Implemented a state-of-the-art, thread-safe, sharded eviction policy to manage the Block Cache.
+
+### Added
+
 - **`drift_kv` Crate:** A persistent, disk-based Hash Table using Linear Hashing for O(1) key-value lookups.
 - **Global Identity Map:** `VectorIndex` now maintains a persistent mapping of `VectorID -> BucketID`.
 - **Drift Calculation:** Added `running_sum` to `Bucket` to track geometric centroid shifts in real-time.

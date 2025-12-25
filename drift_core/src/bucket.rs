@@ -1,10 +1,14 @@
 use crate::aligned::AlignedBytes;
+use crate::bitpack::{pack_u32_dynamic, unpack_u32_dynamic};
 use crate::index::SearchResult;
 use crate::quantizer::Quantizer;
 use atomic_float::AtomicF32;
 use bit_set::BitSet;
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use drift_cache::store::Cacheable;
 use parking_lot::RwLock;
 use std::collections::BinaryHeap;
+use std::io::{Cursor, Error, ErrorKind, Read, Result, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -12,6 +16,122 @@ pub struct BucketData {
     pub codes: AlignedBytes,
     pub vids: Vec<u64>,
     pub tombstones: BitSet,
+}
+
+impl Cacheable for BucketData {
+    fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut cursor = Cursor::new(data);
+
+        // 1. Read Header
+        // Fixed: Valid Hex Literal (BDAT001 approx)
+        let magic = cursor.read_u32::<LittleEndian>()?;
+        if magic != 0xBD47001 {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid Bucket Magic"));
+        }
+        let count = cursor.read_u32::<LittleEndian>()? as usize;
+        let dim = cursor.read_u32::<LittleEndian>()? as usize;
+
+        // 2. Read Codes
+        let codes_len = count * dim;
+        let mut codes = AlignedBytes::new(codes_len);
+
+        unsafe {
+            codes.set_len(codes_len);
+        }
+
+        cursor.read_exact(codes.as_mut_slice())?;
+
+        // 3. Read VIDs
+        let mut vids = Vec::with_capacity(count);
+        for _ in 0..count {
+            vids.push(cursor.read_u64::<LittleEndian>()?);
+        }
+
+        // 4. Read Tombstones (BitPacked)
+        // [Num_Blocks(u32)] [Bit_Width(u8)] [Packed_Len(u32)] [Packed_Data...]
+        let num_blocks = cursor.read_u32::<LittleEndian>()? as usize;
+        let bit_width = cursor.read_u8()? as usize;
+        let packed_len = cursor.read_u32::<LittleEndian>()? as usize;
+
+        let mut packed_data = vec![0u32; packed_len];
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..packed_len {
+            packed_data[i] = cursor.read_u32::<LittleEndian>()?;
+        }
+
+        // Unpack
+        let mut blocks = vec![0u32; num_blocks];
+        if num_blocks > 0 {
+            unpack_u32_dynamic(&packed_data, num_blocks, bit_width, &mut blocks);
+        }
+
+        // Reconstruct BitSet from blocks
+        // BitSet uses BitVec, which can be constructed from bytes.
+        // We cast &[u32] -> &[u8] safely.
+        let mut tombstones = BitSet::with_capacity(count);
+        for (i, block) in blocks.iter().enumerate() {
+            if *block == 0 {
+                continue;
+            }
+            for bit in 0..32 {
+                if (block & (1 << bit)) != 0 {
+                    tombstones.insert(i * 32 + bit);
+                }
+            }
+        }
+
+        Ok(BucketData {
+            codes,
+            vids,
+            tombstones,
+        })
+    }
+}
+
+impl BucketData {
+    pub fn to_bytes(&self, dim: usize) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+
+        // Header
+        buf.write_u32::<LittleEndian>(0xBD47001)?; // Magic Fixed
+        buf.write_u32::<LittleEndian>(self.vids.len() as u32)?;
+        buf.write_u32::<LittleEndian>(dim as u32)?;
+
+        // Codes
+        buf.write_all(self.codes.as_slice())?;
+
+        // VIDs
+        for vid in &self.vids {
+            buf.write_u64::<LittleEndian>(*vid)?;
+        }
+
+        // Tombstones (BitPacked)
+        // Access inner storage: BitVec storage is usually Vec<u32>
+        let blocks = self.tombstones.get_ref().storage();
+
+        // Prepare output buffer for packing
+        // Max size is same as input (width=32)
+        let mut packed_buf = vec![0u32; blocks.len()];
+
+        let (width, packed_count) = if blocks.is_empty() {
+            (1, 0)
+        } else {
+            pack_u32_dynamic(blocks, &mut packed_buf)
+        };
+
+        // Write Metadata
+        buf.write_u32::<LittleEndian>(blocks.len() as u32)?; // Num Blocks
+        buf.write_u8(width as u8)?; // Bit Width
+        buf.write_u32::<LittleEndian>(packed_count as u32)?; // Packed Word Count
+
+        // Write Packed Data
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..packed_count {
+            buf.write_u32::<LittleEndian>(packed_buf[i])?;
+        }
+
+        Ok(buf)
+    }
 }
 
 pub struct Bucket {

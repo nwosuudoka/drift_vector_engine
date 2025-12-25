@@ -1,4 +1,5 @@
 pub mod aligned;
+pub mod bitpack;
 pub mod bucket;
 pub mod index;
 pub mod kmeans;
@@ -6,8 +7,9 @@ pub mod memtable;
 pub mod quantizer;
 pub mod wal;
 
-pub(crate) mod bucket_tests;
-pub(crate) mod index_tests;
-pub(crate) mod memtable_tests;
-pub(crate) mod quantizer_tests;
-pub(crate) mod wal_tests;
+mod bucket_serialization_tests;
+mod bucket_tests;
+mod index_tests;
+mod memtable_tests;
+mod quantizer_tests;
+mod wal_tests;

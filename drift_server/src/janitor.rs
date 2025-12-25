@@ -1,7 +1,6 @@
 use crate::persistence::PersistenceManager;
 use drift_core::index::VectorIndex;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::time;
 

@@ -309,6 +309,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "drift_cache"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "rand",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "twox-hash",
+]
+
+[[package]]
 name = "drift_core"
 version = "0.1.0"
 dependencies = [
@@ -319,6 +332,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-epoch",
  "crossbeam-utils",
+ "drift_cache",
  "drift_kv",
  "hnsw_rs",
  "parking_lot",
@@ -327,6 +341,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.17",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1591,6 +1606,15 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "twox-hash"
+version = "2.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
+dependencies = [
+ "rand",
+]
 
 [[package]]
 name = "unicase"

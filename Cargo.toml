@@ -1,5 +1,5 @@
 [workspace]
-members = ["drift_core", "drift_storage", "drift_server", "drift_kv"]
+members = ["drift_core", "drift_storage", "drift_server", "drift_kv", "drift_cache"]
 resolver = "2"
 
 [workspace.package]
