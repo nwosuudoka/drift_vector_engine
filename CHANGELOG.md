@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] - Single-Node Stable Release
+
+**Tag:** `v0.4.0-single-node-stable`
+
+### Added
+
+- **`drift-cli`:** A command-line tool to Train, Insert, and Search without writing code.
+- **Dynamic Dimension Sizing:** Server automatically configures index dimensions based on input data.
+- **End-to-End Verification:** Validated the full stack from CLI -> gRPC -> Async Core -> Disk -> WAL.
+
+### Fixed
+
+- **Bloom Filter Integration:** `drift_storage` now correctly uses `fastbloom` for O(1) negative lookups.
+- **Panic on Dimension Mismatch:** Server now validates or adapts to vector dimensions instead of crashing.
+
+---
+
 ## [0.3.3] - Server API Completion
 
 ### Added
