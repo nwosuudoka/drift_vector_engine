@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.3] - Train API Implementation
+
+### Added
+
+- **gRPC Train Handler:** Implemented the `train` RPC endpoint. It accepts a batch of vectors, converts them from Protobuf format to internal `Vec<f32>`, and awaits the async `index.train()` method.
+- **Server Tests:** Added `server_tests.rs` to verify the full API lifecycle (Train -> Insert -> Search) via the `DriftService` abstraction.
+
+## [0.3.2] - Protobuf Schema Definition
+
+### Added
+
+- **`drift.proto`:** Defined the gRPC service contract, including `Vector`, `InsertRequest`, `SearchRequest` (with tunable parameters), and `TrainRequest`.
+- **`build.rs`:** Added Tonic build script to compile the Protobuf schema during the build process.
+
+## [0.3.1] - Async Train Endpoint
+
+### Added
+
+- **gRPC Train:** Implemented `DriftService::train` to accept a batch of vectors, convert them to the internal format, and invoke the async `index.train()` method. This allows non-blocking index construction.
+
 ## [0.3.0] - Server Async Migration
 
 ### Added

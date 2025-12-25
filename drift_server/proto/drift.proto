@@ -9,6 +9,9 @@ service Drift {
 
   // Searches for the nearest neighbors.
   rpc Search (SearchRequest) returns (SearchResponse);
+
+  // Batch train a collection (runs K-Means and initializes quantization)
+  rpc Train (TrainRequest) returns (TrainResponse);
 }
 
 // --- Messages ---
@@ -48,4 +51,14 @@ message SearchResult {
 
 message SearchResponse {
   repeated SearchResult results = 1;
+}
+
+
+message TrainRequest {
+  string collection_name = 1;
+  repeated Vector vectors = 2;
+}
+
+message TrainResponse {
+  bool success = 1;
 }
