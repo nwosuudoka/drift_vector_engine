@@ -14,12 +14,44 @@ pub struct DriftService {
     pub manager: Arc<CollectionManager>,
 }
 
-const TARGET_CONFIDENCE: f32 = 0.9;
-const LAMBDA: f32 = 1.0;
-const TAU: f32 = 100.0;
+// const TARGET_CONFIDENCE: f32 = 0.9;
+// const LAMBDA: f32 = 1.0;
+// const TAU: f32 = 100.0;
 
 #[tonic::async_trait]
 impl Drift for DriftService {
+    // async fn insert(
+    //     &self,
+    //     request: Request<InsertRequest>,
+    // ) -> Result<Response<InsertResponse>, Status> {
+    //     let req = request.into_inner();
+    //     let vec_data = req
+    //         .vector
+    //         .ok_or_else(|| Status::invalid_argument("Vector missing"))?;
+
+    //     // 2. Resolve Collection
+    //     let collection_name = if req.collection_name.is_empty() {
+    //         "default".to_string()
+    //     } else {
+    //         req.collection_name
+    //     };
+
+    //     let collection = self
+    //         .manager
+    //         .get_or_create(&collection_name)
+    //         .await
+    //         .map_err(|e| Status::internal(format!("Failed to load collection: {}", e)))?;
+
+    //     // 3. Insert into specific index
+    //     match collection.index.insert(vec_data.id, &vec_data.values) {
+    //         Ok(_) => Ok(Response::new(InsertResponse { success: true })),
+    //         Err(e) => {
+    //             eprintln!("Insert error: {}", e);
+    //             Err(Status::internal("Failed to insert vector"))
+    //         }
+    //     }
+    // }
+
     async fn insert(
         &self,
         request: Request<InsertRequest>,
@@ -28,26 +60,26 @@ impl Drift for DriftService {
         let vec_data = req
             .vector
             .ok_or_else(|| Status::invalid_argument("Vector missing"))?;
-
-        // 2. Resolve Collection
         let collection_name = if req.collection_name.is_empty() {
             "default".to_string()
         } else {
             req.collection_name
         };
 
+        // Pass dimension hint from the vector itself
+        let dim = vec_data.values.len();
+
         let collection = self
             .manager
-            .get_or_create(&collection_name)
+            .get_or_create(&collection_name, Some(dim))
             .await
             .map_err(|e| Status::internal(format!("Failed to load collection: {}", e)))?;
 
-        // 3. Insert into specific index
         match collection.index.insert(vec_data.id, &vec_data.values) {
             Ok(_) => Ok(Response::new(InsertResponse { success: true })),
             Err(e) => {
                 eprintln!("Insert error: {}", e);
-                Err(Status::internal("Failed to insert vector"))
+                Err(Status::internal(format!("Failed to insert: {}", e)))
             }
         }
     }
@@ -57,22 +89,23 @@ impl Drift for DriftService {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
-
         let collection_name = if req.collection_name.is_empty() {
             "default".to_string()
         } else {
             req.collection_name
         };
 
+        // Pass dimension hint
+        let dim = req.vector.len();
+
         let collection = self
             .manager
-            .get_or_create(&collection_name)
+            .get_or_create(&collection_name, Some(dim))
             .await
             .map_err(|e| Status::internal(format!("Failed to load collection: {}", e)))?;
 
+        // ... rest of search logic ...
         let k = if req.k == 0 { 10 } else { req.k as usize };
-
-        // Parse Parameters with Defaults
         let target_confidence = if req.target_confidence == 0.0 {
             0.90
         } else {
@@ -81,7 +114,6 @@ impl Drift for DriftService {
         let lambda = if req.lambda == 0.0 { 25.0 } else { req.lambda };
         let tau = if req.tau == 0.0 { 100.0 } else { req.tau };
 
-        // Call the new Async Search
         let results = collection
             .index
             .search_async(&req.vector, k, target_confidence, lambda, tau)
@@ -101,37 +133,33 @@ impl Drift for DriftService {
         }))
     }
 
-    // --- NEW: Async Train Handler ---
     async fn train(
         &self,
         request: Request<TrainRequest>,
     ) -> Result<Response<TrainResponse>, Status> {
         let req = request.into_inner();
-
         let collection_name = if req.collection_name.is_empty() {
             "default".to_string()
         } else {
             req.collection_name
         };
 
-        // 1. Convert Proto Vectors to Internal Vec<f32>
-        // Depending on your proto definition, this might be `req.dataset` or similar.
-        // Assuming TrainRequest has a repeated field `vectors` of type Vector.
         if req.vectors.is_empty() {
             return Err(Status::invalid_argument("Training dataset cannot be empty"));
         }
 
-        let training_data: Vec<Vec<f32>> = req.vectors.into_iter().map(|v| v.values).collect();
+        // Get dimension from first vector
+        let dim = req.vectors[0].values.len();
 
-        // 2. Get Collection
+        // Pass hint
         let collection = self
             .manager
-            .get_or_create(&collection_name)
+            .get_or_create(&collection_name, Some(dim))
             .await
             .map_err(|e| Status::internal(format!("Failed to load collection: {}", e)))?;
 
-        // 3. Execute Async Train
-        // This performs K-Means and writes the initial Quantizer to disk.
+        let training_data: Vec<Vec<f32>> = req.vectors.into_iter().map(|v| v.values).collect();
+
         match collection.index.train(&training_data).await {
             Ok(_) => Ok(Response::new(TrainResponse { success: true })),
             Err(e) => Err(Status::internal(format!("Training failed: {}", e))),

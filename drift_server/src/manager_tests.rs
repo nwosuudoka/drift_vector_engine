@@ -18,7 +18,7 @@ mod tests {
             let manager = CollectionManager::new(dir.path());
 
             // Collection A: "users"
-            let users = manager.get_or_create("users").await.unwrap();
+            let users = manager.get_or_create("users", Some(dim)).await.unwrap();
             users
                 .index
                 .train(&vec![gen_vec(0.0, dim), gen_vec(1.0, dim)])
@@ -38,7 +38,7 @@ mod tests {
                 .unwrap();
 
             // Collection B: "products"
-            let products = manager.get_or_create("products").await.unwrap();
+            let products = manager.get_or_create("products", Some(dim)).await.unwrap();
             products
                 .index
                 .train(&vec![gen_vec(10.0, dim)])
@@ -53,7 +53,7 @@ mod tests {
         let manager_2 = CollectionManager::new(dir.path());
 
         // Load "users"
-        let users_2 = manager_2.get_or_create("users").await.unwrap();
+        let users_2 = manager_2.get_or_create("users", Some(dim)).await.unwrap();
         let res_u = users_2
             .index
             .search_async(&gen_vec(0.1, dim), 1, 0.1, 1.0, 100.0)
@@ -64,7 +64,10 @@ mod tests {
         assert!(res_u[0].distance < 0.05, "Failed to recover user data");
 
         // Load "products"
-        let products_2 = manager_2.get_or_create("products").await.unwrap();
+        let products_2 = manager_2
+            .get_or_create("products", Some(dim))
+            .await
+            .unwrap();
         let res_p = products_2
             .index
             .search_async(&gen_vec(10.0, dim), 1, 0.1, 1.0, 100.0)
