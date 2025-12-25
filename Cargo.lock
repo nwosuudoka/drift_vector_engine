@@ -364,6 +364,7 @@ name = "drift_server"
 version = "0.1.0"
 dependencies = [
  "bincode 2.0.1",
+ "drift_cache",
  "drift_core",
  "drift_storage",
  "prost",
