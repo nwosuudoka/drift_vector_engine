@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.3] - Server API Completion
+
+### Added
+
+- **Full gRPC Suite:** Implemented `Train`, `Insert`, and `Search` endpoints in `DriftService`.
+- **Async Training:** Exposed the heavy K-Means index construction as a non-blocking async RPC.
+- **Server Verification:** Validated the full lifecycle (Train -> Insert -> Search) via `server_tests.rs`.
+
 ## [0.3.3] - Train API Implementation
 
 ### Added
