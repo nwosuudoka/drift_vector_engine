@@ -73,11 +73,10 @@ impl Quantizer {
     /// Values outside the p1-p99 range are clamped.
     pub fn encode(&self, vec: &[f32]) -> Vec<u8> {
         let mut codes = Vec::with_capacity(vec.len());
-        #[allow(clippy::needless_range_loop)]
         for i in 0..vec.len() {
             let val = (vec[i] - self.min[i]) / self.scale[i];
-            // Critical: Clamp handles the outliers we ignored during training
-            let byte = val.clamp(0.0, 255.0) as u8;
+            // FIX: Use round() to minimize quantization error (vs floor)
+            let byte = val.round().clamp(0.0, 255.0) as u8;
             codes.push(byte);
         }
         codes
@@ -115,5 +114,34 @@ impl Quantizer {
             vec.push(val);
         }
         vec
+    }
+
+    // in drift_core/src/quantizer.rs
+
+    /// Asymmetric Distance Calculation (ADC)
+    /// Computes distance between a precise Query (f32) and a quantized Code (u8).
+    ///
+    /// Formula: Sum( (q[i] - reconstruct(code[i]))^2 )
+    #[inline]
+    pub fn distance_adc(&self, query: &[f32], code: &[u8]) -> f32 {
+        let mut sum_sq = 0.0;
+
+        for (i, &c) in code.iter().enumerate() {
+            // Reconstruct the coordinate from the byte 'c'
+            // val = min + (c / 255.0) * (max - min)
+            // or using precomputed tables if available.
+            let reconstructed = self.reconstruct_coord(i, c);
+            let diff = query[i] - reconstructed;
+            sum_sq += diff * diff;
+        }
+
+        sum_sq
+    }
+
+    #[inline]
+    fn reconstruct_coord(&self, dim_idx: usize, code: u8) -> f32 {
+        // Assuming we store min/step per dimension
+        // val = min[d] + code * step[d]
+        self.min[dim_idx] + (code as f32 * self.scale[dim_idx])
     }
 }

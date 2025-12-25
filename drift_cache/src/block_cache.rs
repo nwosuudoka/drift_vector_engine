@@ -16,6 +16,11 @@ impl<V: Cacheable> BlockCache<V> {
         }
     }
 
+    // NEW: Allow access to storage for writing new pages
+    pub fn storage(&self) -> &Arc<dyn PageManager> {
+        &self.storage
+    }
+
     /// The Magic Method: Transparently loads data from disk if missing from RAM.
     pub async fn get(&self, page_id: &PageId) -> Result<Arc<V>> {
         // 1. Fast Path: Check RAM (Zero-Copy)

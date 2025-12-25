@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::local_store::LocalDiskManager;
-    use crate::store::{PageId, PageManager};
+    use crate::store::{PageId, PageManager}; // Adjust path if testing from outside crate
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::task;
@@ -10,20 +10,19 @@ mod tests {
     #[tokio::test]
     async fn test_persistence_across_restarts() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("data.bin");
         let file_id = 1;
 
-        // Phase 1: Write
+        // Phase 1: Write (Auto-registering via base_path)
         {
             let manager = LocalDiskManager::new(dir.path());
-            manager.register_file(file_id, file_path.clone());
+            // No register_file needed!
             manager.write_page(file_id, 0, b"PersistMe").await.unwrap();
         } // Manager dropped here, file handles closed.
 
         // Phase 2: Reopen
         {
             let manager = LocalDiskManager::new(dir.path());
-            manager.register_file(file_id, file_path.clone());
+            // No register_file needed!
 
             let page = PageId {
                 file_id,
@@ -35,20 +34,16 @@ mod tests {
         }
     }
 
-    /// Test 2: Concurrency Hammer (The "Stress Test")
+    /// Test 2: Concurrency Hammer
     /// 50 threads reading/writing to different offsets of the SAME file.
-    /// This proves `pread` / `pwrite` are working without global locks blocking everything.
     #[tokio::test]
     async fn test_concurrent_io_same_file() {
         let dir = tempdir().unwrap();
         let manager = Arc::new(LocalDiskManager::new(dir.path()));
 
         let file_id = 1;
-        let file_path = dir.path().join("concurrent.bin");
-        manager.register_file(file_id, file_path);
 
-        // Pre-allocate file size (avoid OS-level file growth lock contention for this specific test)
-        // 50 threads * 100 bytes = 5000 bytes.
+        // Pre-allocate file size to avoid OS allocation contention during the race
         manager.write_page(file_id, 5000, b"EOF").await.unwrap();
 
         let mut handles = vec![];
@@ -62,7 +57,7 @@ mod tests {
                 // Write
                 m.write_page(file_id, offset, &payload).await.unwrap();
 
-                // Read Back immediately
+                // Read Back
                 let page = PageId {
                     file_id,
                     offset,
@@ -78,16 +73,14 @@ mod tests {
         }
     }
 
-    /// Test 3: Multi-File Management
-    /// Ensures ID mapping works correctly for different files.
+    /// Test 3: Multi-File Isolation
+    /// Ensures writing to File 1 doesn't corrupt File 2.
     #[tokio::test]
     async fn test_multi_file_isolation() {
         let dir = tempdir().unwrap();
         let manager = LocalDiskManager::new(dir.path());
 
-        manager.register_file(1, dir.path().join("file_1.bin"));
-        manager.register_file(2, dir.path().join("file_2.bin"));
-
+        // Write to two different IDs (Auto-created as 1.drift and 2.drift)
         manager.write_page(1, 0, b"Data1").await.unwrap();
         manager.write_page(2, 0, b"Data2").await.unwrap();
 
@@ -106,31 +99,57 @@ mod tests {
         assert_eq!(manager.read_page(p2).await.unwrap(), b"Data2");
     }
 
-    /// Test 4: Error Handling (EOF / Missing File)
+    /// Test 4: Error Handling
     #[tokio::test]
     async fn test_error_handling() {
         let dir = tempdir().unwrap();
         let manager = LocalDiskManager::new(dir.path());
 
-        // A. Read Unregistered File
+        // A. Read Unknown File
+        // With auto-registration, this creates an empty file "999.drift".
+        // Attempting to read 10 bytes from an empty file returns UnexpectedEof.
         let bad_page = PageId {
             file_id: 999,
             offset: 0,
             length: 10,
         };
-        assert!(manager.read_page(bad_page).await.is_err());
+        let res = manager.read_page(bad_page).await;
+        assert!(res.is_err(), "Should fail reading empty new file");
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
 
-        // B. Read Past EOF
-        manager.register_file(1, dir.path().join("short.bin"));
+        // B. Read Past EOF (Valid file)
         manager.write_page(1, 0, b"Tiny").await.unwrap();
 
         let eof_page = PageId {
             file_id: 1,
-            offset: 100,
+            offset: 100, // Way past end
             length: 10,
         };
-        // std::fs::read_at usually returns 0 bytes at EOF, or an error if we enforce exact length.
-        // Our impl uses `read_exact_at`, so it MUST error on EOF.
         assert!(manager.read_page(eof_page).await.is_err());
+    }
+
+    /// Test 5: NEW - Explicit Auto-Registration Verification
+    /// Confirms we don't need `register_file` for write operations.
+    #[tokio::test]
+    async fn test_auto_registration_on_write() {
+        let dir = tempdir().unwrap();
+        let manager = LocalDiskManager::new(dir.path());
+
+        // 1. Write to a new ID (33)
+        // Should automatically create `[temp_dir]/33.drift`
+        manager.write_page(33, 0, b"Magic").await.unwrap();
+
+        // 2. Verify file exists on disk
+        let expected_path = dir.path().join("33.drift");
+        assert!(expected_path.exists(), "File 33.drift was not auto-created");
+
+        // 3. Read back
+        let page = PageId {
+            file_id: 33,
+            offset: 0,
+            length: 5,
+        };
+        let data = manager.read_page(page).await.unwrap();
+        assert_eq!(data, b"Magic");
     }
 }

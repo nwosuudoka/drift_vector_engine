@@ -5,10 +5,12 @@ use crate::quantizer::Quantizer;
 use atomic_float::AtomicF32;
 use bit_set::BitSet;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use drift_cache::PageId;
 use drift_cache::store::Cacheable;
 use parking_lot::RwLock;
 use std::collections::BinaryHeap;
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Write};
+use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -131,6 +133,53 @@ impl BucketData {
         }
 
         Ok(buf)
+    }
+
+    /// Reconstructs all valid vectors (skipping tombstones) from this data block.
+    /// Used during Splitting/Merging to recover the training data.
+    pub fn reconstruct(&self, quantizer: &Quantizer) -> (Vec<Vec<f32>>, Vec<u64>) {
+        let dim = quantizer.min.len();
+        let count = self.vids.len();
+
+        let mut vecs = Vec::with_capacity(count);
+        let mut ids = Vec::with_capacity(count);
+
+        for i in 0..count {
+            if self.tombstones.contains(i) {
+                continue;
+            }
+
+            let start = i * dim;
+            let end = start + dim;
+            // Safe slicing with new AlignedBytes index trait
+            let code = &self.codes[start..end];
+
+            let vec = quantizer.reconstruct(code);
+            vecs.push(vec);
+            ids.push(self.vids[i]);
+        }
+        (vecs, ids)
+    }
+}
+
+/// The RAM-resident metadata for a bucket.
+/// This allows us to find the "Right Bucket" without loading the "Heavy Data".
+#[derive(Debug, Clone)]
+pub struct BucketHeader {
+    pub id: u32,
+    pub centroid: Vec<f32>, // For routing (ADC/L2 distance)
+    pub count: u32,         // For density weighting
+    pub page_id: PageId,    // Pointer to Disk/Cache
+}
+
+impl BucketHeader {
+    pub fn new(id: u32, centroid: Vec<f32>, count: u32, page_id: PageId) -> Self {
+        Self {
+            id,
+            centroid,
+            count,
+            page_id,
+        }
     }
 }
 
@@ -402,6 +451,39 @@ impl Bucket {
         }
         false
     }
+
+    /// Stateless Scan: Performs search on detached BucketData.
+    pub fn scan_static(
+        data: &BucketData,
+        quantizer: &Quantizer,
+        query: &[f32],
+    ) -> Vec<SearchResult> {
+        let mut results = Vec::with_capacity(data.vids.len());
+        let dim = query.len();
+
+        // Use the precomputed LUT from the Quantizer if available,
+        // OR compute it here if Quantizer doesn't expose it yet.
+        // For V1 correctness, let's use the verified loop you provided in the prompt:
+
+        for i in 0..data.vids.len() {
+            let vid = data.vids[i];
+            if data.tombstones.contains(i) {
+                continue;
+            }
+
+            let start = i * dim;
+            let end = start + dim;
+            let code = &data.codes[start..end];
+
+            let dist = quantizer.distance_adc(query, code);
+
+            results.push(SearchResult {
+                id: vid,
+                distance: dist,
+            });
+        }
+        results
+    }
 }
 
 // =================================================================================
@@ -543,4 +625,20 @@ unsafe fn compute_distance_scalar_unrolled(
     }
 
     sum
+}
+
+impl Index<Range<usize>> for AlignedBytes {
+    type Output = [u8];
+
+    #[inline]
+    fn index(&self, range: Range<usize>) -> &Self::Output {
+        &self.as_slice()[range]
+    }
+}
+
+impl IndexMut<Range<usize>> for AlignedBytes {
+    #[inline]
+    fn index_mut(&mut self, range: Range<usize>) -> &mut Self::Output {
+        &mut self.as_mut_slice()[range]
+    }
 }

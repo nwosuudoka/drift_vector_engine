@@ -4,22 +4,22 @@
 
 **Status:** ✅ **Complete.**
 
-- ✅ **Custom `.drift` File Format:** `SegmentWriter`/`SegmentReader` with Footer/Index.
-- ✅ **Disk Manager:** Async I/O with seek support.
+- ✅ **Custom `.drift` File Format:** `SegmentWriter`/`SegmentReader`.
+- ✅ **Disk Manager:** Async I/O with `pread`/`pwrite` support.
 - ✅ **Block Alignment:** `PageBlock` for 4KB alignment.
-- ✅ **Compression:** SQ8, ALP (Float), FastLanes (Int).
-- ✅ **Bloom Filters:** Integrated into footer for O(1) negative lookups.
+- ✅ **Compression:** SQ8 Quantization with rounding.
+- ✅ **Cache Layer:** `drift_cache` with S3-FIFO eviction policy.
 
 #### **Section 2: Core Indexing Logic (Level 1)**
 
 **Status:** ✅ **Complete.**
 
-- ✅ **Bucket Structure:** SoA layout with `AlignedBytes`.
+- ✅ **Bucket Structure:** RAM-resident `BucketHeader` + Disk-resident `BucketData`.
 - ✅ **ADC Scanning:** SIMD-optimized `scan_adc`.
 - ✅ **Maintenance Primitives:**
-  - Split (Neighbor Stealing) - _Verified with Drift Criterion_.
-  - Merge (Scatter Merge) - _Verified with Urgency Formula_.
-  - Drift Calculation - _Implemented `running_sum` for O(1) tracking_.
+  - ✅ Split (Neighbor Stealing) - Verified with Drift Criterion.
+  - ✅ Merge (Scatter Merge) - Verified with Urgency Formula.
+  - ✅ Strong Consistency - Atomic KV updates during migration.
 
 #### **Section 3: Memory Structure (Level 0)**
 
@@ -27,40 +27,38 @@
 
 - ✅ **HNSW Graph:** Thread-safe MemTable for hot data.
 - ✅ **Hybrid Search:** Merges L0 (Graph) and L1 (Disk) results.
-- ✅ **Flushing Logic:** `Janitor` handles atomic rotation and persistence.
+- ✅ **Flushing Logic:** `Janitor` handles atomic rotation.
 - ✅ **Write-Ahead Log (WAL):** Durability guaranteed.
-- ✅ **Deletions:** Full support via `OP_DELETE` in WAL and Tombstones in L0/L1.
 
 #### **Section 4: Execution Engine**
 
 **Status:** ✅ **Complete.**
 
-- ✅ **Epoch-Based Reclamation:** `crossbeam-epoch` for lock-free reads.
-- ✅ **Probabilistic Stopping:** Saturating Density scoring implemented.
-- ✅ **Concurrency:** Lock-free reads on the hot path.
+- ✅ **Async Architecture:** Fully migrated Core to `async`/`await`.
+- ✅ **Drift-Aware Routing:** "Saturating Density" scoring model verified.
+- ✅ **Concurrency:** Epoch-based reclamation for lock-free reads.
 
 #### **Section 5: Server & API**
 
+**Status:** 🚧 **Migration Required.**
+
+- ✅ **gRPC Interface:** `DriftService` definition.
+- 🚧 **Async Migration:** Update gRPC handlers to use new Async Core API.
+  - ⬜ Update `Search` to call `search_async`.
+  - ⬜ Update `Train` to call async `train`.
+  - ⬜ Expose Drift Parameters (Lambda, Tau) via API.
+- ✅ **Persistence Manager:** Handles Hydration.
+
+#### **Section 6: Scaling & Optimization (Metadata)**
+
 **Status:** ✅ **Complete.**
 
-- ✅ **Persistence Manager:** Handles Hydration and Flushing.
-- ✅ **gRPC Interface:** `DriftService` implements Protobuf API.
-- ✅ **Multi-Tenancy:** Isolated `CollectionManager`.
-- ✅ **Background Workers:** `Janitor` runs per-collection lifecycle (Healing & Growth).
+- ✅ **Global ID Index:** Integrated `drift_kv` (BitStore) to map `VectorID -> BucketID`.
+- ✅ **Drift Correction:** Implemented geometric drift tracking (`running_sum`).
 
----
+#### **Section 7: Future Work (Distribution)**
 
-#### **Section 6: Scaling & Optimization**
+**Status:** ⏸️ **Paused.**
 
-**Status:** 🚧 **In Progress.**
-
-- ✅ **Global ID Index:** Integrated `drift_kv` (BitStore) to map `VectorID -> BucketID` for O(1) deletes/updates.
-- ⬜ **Distributed Consensus:** Implement `drift_cluster` using Consistent Hashing to map `Collection/ID -> Node`.
-- ⬜ **Request Router:** Forward gRPC requests to the correct node/shard.
-- ⬜ **CLI Tooling:** A proper command-line interface (`drift-cli`) to admin the cluster.
-
----
-
-### **Immediate Next Step**
-
-We are now ready to begin **Section 6: Distributed Consensus**. We need to create the `drift_cluster` crate to manage node topology and routing.
+- ⬜ **Distributed Consensus:** Implement `drift_cluster`.
+- ⬜ **Request Router:** Forward gRPC requests.

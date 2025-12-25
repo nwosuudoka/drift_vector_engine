@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Result};
+use std::io::Result;
 use std::os::unix::fs::FileExt; // Linux/Mac specific optimization
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use tokio::task;
 /// A Disk Manager optimized for NVMe Random Reads.
 /// Uses `pread` to allow true parallel reads on shared file handles.
 pub struct LocalDiskManager {
+    base_path: PathBuf,
     // Map ID -> Path
     paths: RwLock<HashMap<u32, PathBuf>>,
     // Map ID -> Open File Handle
@@ -24,14 +25,15 @@ impl LocalDiskManager {
         let path = base_path.into();
         std::fs::create_dir_all(&path).ok(); // Ensure dir exists
         Self {
+            base_path: path,
             paths: RwLock::new(HashMap::new()),
             files: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Helper to get or open a file handle thread-safely
+    /// Helper to get or open a file handle. Auto-registers if missing.
     fn get_file(&self, file_id: u32) -> Result<Arc<File>> {
-        // 1. Fast Path: Read Lock
+        // 1. Check if already open (Fast Read Lock)
         {
             let handles = self.files.read();
             if let Some(f) = handles.get(&file_id) {
@@ -39,27 +41,31 @@ impl LocalDiskManager {
             }
         }
 
-        // 2. Slow Path: Write Lock (Open File)
-        let paths = self.paths.read();
-        let path = paths
-            .get(&file_id)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File ID not registered"))?;
+        // 2. Check if path registered, if not, AUTO-REGISTER (Write Lock)
+        let mut paths_guard = self.paths.write();
+        let mut files_guard = self.files.write();
 
-        let mut handles = self.files.write();
-        // Double check
-        if let Some(f) = handles.get(&file_id) {
+        // Double check after lock
+        if let Some(f) = files_guard.get(&file_id) {
             return Ok(f.clone());
         }
 
+        // Resolve Path
+        let path = paths_guard
+            .entry(file_id)
+            .or_insert_with(|| self.base_path.join(format!("{}.drift", file_id)))
+            .clone();
+
+        // Open File
         let file = OpenOptions::new()
             .read(true)
-            .write(true) // We might write too
-            .create(true) // Create if missing (for writes)
-            .truncate(false)
-            .open(path)?;
+            .write(true)
+            .create(true)
+            .open(&path)?;
 
         let arc_file = Arc::new(file);
-        handles.insert(file_id, arc_file.clone());
+        files_guard.insert(file_id, arc_file.clone());
+
         Ok(arc_file)
     }
 }

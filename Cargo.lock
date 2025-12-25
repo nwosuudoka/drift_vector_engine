@@ -325,6 +325,7 @@ dependencies = [
 name = "drift_core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "atomic_float",
  "bincode 2.0.1",
  "bit-set",
@@ -341,6 +342,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.17",
+ "tokio",
  "zerocopy",
 ]
 
