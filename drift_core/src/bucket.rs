@@ -25,7 +25,7 @@ impl Cacheable for BucketData {
         let mut cursor = Cursor::new(data);
 
         // 1. Read Header
-        // Fixed: Valid Hex Literal (BDAT001 approx)
+        // Valid Hex Literal (BDAT001 approx)
         let magic = cursor.read_u32::<LittleEndian>()?;
         if magic != 0xBD47001 {
             return Err(Error::new(ErrorKind::InvalidData, "Invalid Bucket Magic"));

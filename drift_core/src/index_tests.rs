@@ -126,7 +126,7 @@ mod tests {
         let bucket_id_before = u32::from_le_bytes(v_buf.try_into().unwrap());
         assert_eq!(bucket_id_before, right_id, "Precondition failed");
 
-        // FIX: Inject High Variance Data into Left Bucket
+        // Inject High Variance Data into Left Bucket
         // Use values INSIDE the training range (-10.0 to -7.5) to avoid clipping.
         // -10.0 vs -8.0 is distinct.
         // (-14.0 would be clipped to -10.0, creating a singularity).
@@ -190,7 +190,7 @@ mod tests {
             (left, right)
         };
 
-        // FIX: Inject High Variance Data (In-Bounds)
+        // Inject High Variance Data (In-Bounds)
         let mut left_ids = Vec::new();
         let mut left_vecs = Vec::new();
         for i in 0..30u64 {

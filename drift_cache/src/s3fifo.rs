@@ -127,7 +127,7 @@ where
         self.doorkeeper.fill(0);
     }
 
-    // FIX: Accept Arc<V> directly to allow caller to retain ownership on rejection
+    // Accept Arc<V> directly to allow caller to retain ownership on rejection
     pub fn put(&mut self, key: K, value: Arc<V>) {
         self.metrics.write_ops.fetch_add(1, Ordering::Relaxed);
         let shared_value = value; // Already Arc

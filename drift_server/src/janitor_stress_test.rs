@@ -27,7 +27,7 @@ mod stress_tests {
 
     fn rnd_vec(rng: &mut StdRng, dim: usize, cluster: usize) -> Vec<f32> {
         let base = cluster as f32 * 10.0;
-        // FIX: Independent random values for each dimension
+        // Independent random values for each dimension
         (0..dim)
             .map(|_| rng.random::<f32>() * 2.0 - 1.0 + base)
             .collect()
@@ -155,7 +155,7 @@ mod stress_tests {
         let mut rng = StdRng::seed_from_u64(0xAAAA);
         for i in 0..2_000u64 {
             let base = (i as usize % 100) as f32;
-            // FIX: High Variance Jitter
+            // High Variance Jitter
             let jitter = rng.random::<f32>() * 2.0;
             // Add dimension variance
             let vec: Vec<f32> = (0..8)

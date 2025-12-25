@@ -75,7 +75,7 @@ impl Quantizer {
         let mut codes = Vec::with_capacity(vec.len());
         for i in 0..vec.len() {
             let val = (vec[i] - self.min[i]) / self.scale[i];
-            // FIX: Use round() to minimize quantization error (vs floor)
+            // Use round() to minimize quantization error (vs floor)
             let byte = val.round().clamp(0.0, 255.0) as u8;
             codes.push(byte);
         }

@@ -510,7 +510,7 @@ impl BitStore {
 
         let k_len = u32::from_le_bytes(head[0..4].try_into().unwrap()) as usize;
 
-        // FIXED: Only check for length mismatch. k_len == 0 is valid!
+        // Only check for length mismatch. k_len == 0 is valid!
         if k_len != key.len() {
             return Ok(false);
         }

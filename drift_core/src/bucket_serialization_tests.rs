@@ -12,7 +12,7 @@ mod tests {
         let target_size = count * dim; // 8000 bytes
 
         // 1. Setup Data
-        // FIX: Use target_size for the loop, not codes.len() (which starts at 0)
+        // Use target_size for the loop, not codes.len() (which starts at 0)
         let mut codes = AlignedBytes::new(target_size);
         for i in 0..target_size {
             codes.push((i % 255) as u8);

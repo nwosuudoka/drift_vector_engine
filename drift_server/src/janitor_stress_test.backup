@@ -147,7 +147,7 @@ mod stress_tests {
         let janitor = Janitor::new(index.clone(), persistence, 50, Duration::from_millis(10));
         let jh = tokio::spawn(async move { janitor.run().await });
 
-        // FIX: RNG outside loop
+        // RNG outside loop
         let mut rng = StdRng::seed_from_u64(0xAAAA);
         for i in 0..2_000u64 {
             let base = (i as usize % 100) as f32;

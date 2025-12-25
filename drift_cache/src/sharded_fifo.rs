@@ -47,7 +47,7 @@ where
         (s.finish() as usize) & self.shard_mask
     }
 
-    // FIX: Accept Arc<V>
+    // Accept Arc<V>
     pub fn put(&self, key: K, value: Arc<V>) {
         let idx = self.get_shard_index(&key);
         let mut shard = self.shards[idx].lock().unwrap();

@@ -31,7 +31,7 @@ impl<V: Cacheable> BlockCache<V> {
         let raw_bytes = self.storage.read_page(page_id.clone()).await?;
         let obj = V::from_bytes(&raw_bytes)?;
 
-        // FIX: Wrap in Arc immediately to allow sharing regardless of caching status
+        // Wrap in Arc immediately to allow sharing regardless of caching status
         let arc_obj = Arc::new(obj);
 
         // 3. Try to Cache (S3FIFO may reject it)

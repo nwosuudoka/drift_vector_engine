@@ -170,7 +170,7 @@ mod tests {
         let mut left_vecs = Vec::new();
         for i in 100..130 {
             left_ids.push(i);
-            // FIX: Add Variance so Singularity Guard doesn't abort split
+            // Add Variance so Singularity Guard doesn't abort split
             // Training range is 0 to 1000.
             // 0.0 vs 2.0 is distinct.
             let val = if i % 2 == 0 { 0.0 } else { 2.0 };
@@ -240,7 +240,7 @@ mod tests {
         let mut left_vecs = Vec::new();
         for i in 100..130 {
             left_ids.push(i);
-            // FIX: Add Variance
+            // Add Variance
             let val = if i % 2 == 0 { 0.0 } else { 2.0 };
             left_vecs.push(vec![val, 0.0]);
         }
@@ -302,7 +302,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 3. FIX: Manually Trigger Merge
+        // 3. Manually Trigger Merge
         // The Janitor only merges empty buckets (count=0).
         // This test bucket has 1 item, so Janitor would ignore it.
         // We call the core function directly to verify the Logic (KV updates), not the Policy (Janitor).
