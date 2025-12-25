@@ -61,12 +61,51 @@ impl Drift for DriftService {
         }
     }
 
+    // async fn search(
+    //     &self,
+    //     request: Request<SearchRequest>,
+    // ) -> Result<Response<SearchResponse>, Status> {
+    //     println!("Got a request: {:?}", request);
+
+    //     let req = request.into_inner();
+
+    //     let collection_name = if req.collection_name.is_empty() {
+    //         "default".to_string()
+    //     } else {
+    //         req.collection_name
+    //     };
+
+    //     // Resolve Collection
+    //     let collection = self
+    //         .manager
+    //         .get_or_create(&collection_name)
+    //         .await
+    //         .map_err(|e| Status::internal(format!("Failed to load collection: {}", e)))?;
+
+    //     let k = if req.k == 0 { 10 } else { req.k as usize };
+    //     let results = collection
+    //         .index
+    //         .search_async(&req.vector, k, TARGET_CONFIDENCE, LAMBDA, TAU)
+    //         .await
+    //         .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
+
+    //     let proto_results = results
+    //         .into_iter()
+    //         .map(|r| SearchResult {
+    //             id: r.id,
+    //             score: r.distance,
+    //         })
+    //         .collect();
+
+    //     Ok(Response::new(SearchResponse {
+    //         results: proto_results,
+    //     }))
+    // }
+
     async fn search(
         &self,
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
-        println!("Got a request: {:?}", request);
-
         let req = request.into_inner();
 
         let collection_name = if req.collection_name.is_empty() {
@@ -75,7 +114,6 @@ impl Drift for DriftService {
             req.collection_name
         };
 
-        // Resolve Collection
         let collection = self
             .manager
             .get_or_create(&collection_name)
@@ -83,10 +121,22 @@ impl Drift for DriftService {
             .map_err(|e| Status::internal(format!("Failed to load collection: {}", e)))?;
 
         let k = if req.k == 0 { 10 } else { req.k as usize };
-        let results =
-            collection
-                .index
-                .search_drift_aware(&req.vector, k, TARGET_CONFIDENCE, LAMBDA, TAU);
+
+        // Parse Parameters with Defaults
+        let target_confidence = if req.target_confidence == 0.0 {
+            0.90
+        } else {
+            req.target_confidence
+        };
+        let lambda = if req.lambda == 0.0 { 25.0 } else { req.lambda };
+        let tau = if req.tau == 0.0 { 100.0 } else { req.tau };
+
+        // Call the new Async Search
+        let results = collection
+            .index
+            .search_async(&req.vector, k, target_confidence, lambda, tau)
+            .await
+            .map_err(|e| Status::internal(format!("Search failed: {}", e)))?;
 
         let proto_results = results
             .into_iter()

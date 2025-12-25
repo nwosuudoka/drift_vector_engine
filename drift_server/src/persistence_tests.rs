@@ -1,14 +1,17 @@
 #[cfg(test)]
 mod tests {
     use crate::persistence::PersistenceManager;
+    use drift_cache::local_store::LocalDiskManager;
     use drift_core::index::{IndexOptions, VectorIndex};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
-    #[tokio::test]
-    async fn test_end_to_end_persistence_lifecycle() {
-        let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
-        let wal_path = dir.path().join("current.wal");
+    // Helper to create an index with storage
+    fn create_index_with_storage(dir: &std::path::Path, wal_name: &str) -> Arc<VectorIndex> {
+        let wal_path = dir.join(wal_name);
+        let storage_path = dir.join("storage");
+        std::fs::create_dir_all(&storage_path).unwrap();
+        let storage = Arc::new(LocalDiskManager::new(storage_path));
 
         let options = IndexOptions {
             dim: 2,
@@ -18,12 +21,19 @@ mod tests {
             ef_construction: 100,
             ef_search: 100,
         };
+        Arc::new(VectorIndex::new(options, &wal_path, storage).unwrap())
+    }
 
-        let index_original = VectorIndex::new(options, &wal_path).unwrap();
+    #[tokio::test]
+    async fn test_end_to_end_persistence_lifecycle() {
+        let dir = tempdir().unwrap();
+        let persistence = PersistenceManager::new(dir.path());
+
+        let index_original = create_index_with_storage(dir.path(), "current.wal");
 
         // Train
         let train_data = vec![vec![10.0, 10.0], vec![-10.0, -10.0]];
-        index_original.train(&train_data);
+        index_original.train(&train_data).await.unwrap();
 
         // Insert Data to L0 (MemTable) -> Persisted via WAL
         for i in 0..50 {
@@ -34,11 +44,15 @@ mod tests {
         }
 
         // Verify state before "Crash"
-        let pre_crash = index_original.search_drift_aware(&vec![10.0, 10.0], 1, 0.9, 1.0, 10.0);
+        let pre_crash = index_original
+            .search_async(&vec![10.0, 10.0], 1, 0.9, 1.0, 10.0)
+            .await
+            .unwrap();
         assert!(!pre_crash.is_empty());
 
         // Snapshot L1 (buckets) to disk
-        // Note: This does NOT flush L0 to L1. L0 remains in WAL.
+        // Note: This takes existing L1 buckets (from train) and writes them.
+        // L0 remains in WAL.
         let segment_path = persistence
             .flush_to_segment(&index_original, "run_1")
             .await
@@ -54,14 +68,22 @@ mod tests {
             .expect("Load failed");
 
         // Verify L0 Recovery (from WAL)
-        let results_a = index_recovered.search_drift_aware(&vec![10.0, 10.0], 5, 0.9, 1.0, 10.0);
+        let results_a = index_recovered
+            .search_async(&vec![10.0, 10.0], 5, 0.9, 1.0, 10.0)
+            .await
+            .unwrap();
+
         assert_eq!(
             results_a.len(),
             5,
             "Failed to recover L0 data for Cluster A"
         );
 
-        let results_b = index_recovered.search_drift_aware(&vec![-10.0, -10.0], 5, 0.9, 1.0, 10.0);
+        let results_b = index_recovered
+            .search_async(&vec![-10.0, -10.0], 5, 0.9, 1.0, 10.0)
+            .await
+            .unwrap();
+
         assert_eq!(
             results_b.len(),
             5,
@@ -69,7 +91,6 @@ mod tests {
         );
 
         // Verify Data Fidelity
-        // We relax tolerance slightly for ANN behavior after rebuild
         let top_dist = results_a[0].distance;
         assert!(
             top_dist < 0.02,

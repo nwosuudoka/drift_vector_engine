@@ -1,35 +1,45 @@
 # Changelog
 
+## [0.3.0] - Server Async Migration
+
+### Added
+
+- **gRPC Search:** The `Search` RPC endpoint now utilizes the async core engine (`search_async`), enabling non-blocking concurrent searches over disk-resident data.
+- **Tunable Parameters:** The `SearchRequest` protobuf message now supports optional `target_confidence`, `lambda`, and `tau` parameters for runtime tuning of the Saturating Density model.
+
+## [0.2.1] - Stability & Correctness Hardening
+
+### Added
+
+- **Singularity Guard:** `split_and_steal` now calculates vector variance. If data is too clustered (variance < 0.01) or geometrically inseparable, the split is aborted to prevent CPU busy-loops.
+- **MaintenanceStatus Enum:** Core operations now return `Completed`, `SkippedSingularity`, `SkippedTooSmall`, or `SkippedLocked` instead of opaque booleans.
+- **Janitor Blacklist:** The Janitor maintains an ephemeral `ignore_set` for buckets identified as unsplittable singularities.
+- **Operation Budgeting:** The Janitor now limits maintenance to 1 major operation per tick to ensure `perform_flush` is never starved during high-churn events ("Split Storms").
+
+### Changed
+
+- **Split Logic:** Switched from blind splitting to Drift-Aware splitting using the variance check.
+- **Merge Logic:** Enforced "Strict Hysteresis"—only completely empty buckets (`count == 0`) are candidates for scatter-merge.
+- **Stress Tests:** Updated `split_storm` and `scatter_split_race` to use high-variance random data, ensuring valid geometric separability during tests.
+
 ## [0.2.0] - Async Disk-Native Architecture
 
 ### Added
 
 - **Async Core:** `VectorIndex` operations (`train`, `search`, `split`) are now async to support non-blocking disk I/O.
-- **Drift-Aware Routing:** `search_async` implements the "Saturating Density" model (Lambda/Tau parameters) to filter low-confidence buckets.
-- **Disk-Native L1:** Level 1 buckets are now backed by `BlockCache` and `PageManager`, loading data on-demand instead of holding everything in RAM.
-- **Auto-Registration:** `LocalDiskManager` now automatically manages file creation for new buckets.
-- **`drift_cache` Crate:** Created library to handle memory management and disk I/O with S3-FIFO eviction.
-- **`drift_kv` Crate:** Integrated persistent `BitStore` for O(1) `VectorID -> BucketID` lookups.
+- **Drift-Aware Routing:** `search_async` implements the "Saturating Density" model (Lambda/Tau parameters).
+- **Disk-Native L1:** Level 1 buckets are now backed by `BlockCache` and `PageManager`.
+- **Auto-Registration:** `LocalDiskManager` manages file creation.
+- **`drift_cache` Crate:** S3-FIFO eviction policy.
+- **`drift_kv` Crate:** Persistent `BitStore` for O(1) `VectorID -> BucketID` lookups.
 
 ### Changed
 
-- **Strong Consistency:** `split_and_steal` and `scatter_merge` now guarantee atomic KV Store updates, preventing vector data loss during maintenance.
-- **Storage Format:** Buckets are serialized as `BucketData` pages (Header + Codes + VIDs + Tombstones) with Magic Bytes validation (`0xBD47001`).
-- **Quantization:** Improved SQ8 quantization with rounding for higher precision.
-- **Maintenance Logic:** `Janitor` now strictly separates "Healing" and "Growth" logic.
+- **Strong Consistency:** Atomic KV Store updates prevents data loss during maintenance.
+- **Storage Format:** Serialized as `BucketData` pages with Magic Bytes (`0xBD47001`).
 - **Deletion Logic:** Upgraded `delete(id)` to O(1) using the KV store.
 
 ### Removed
 
-- Synchronous `Bucket` access in the public API.
-- In-memory `Vec<Bucket>` storage (replaced by `Atomic<HashMap<u32, BucketHeader>>`).
-
-## [0.1.0] - Initial Prototype
-
-### Added
-
-- **HNSW Graph:** Thread-safe MemTable for hot data (Level 0).
-- **Hybrid Search:** Merges L0 (Graph) and L1 (Disk) results.
-- **Write-Ahead Log (WAL):** Durability for L0 inserts.
-- **gRPC Interface:** Basic `DriftService` implementation.
-- **Bitpacking:** Scalar bit-packing for Tombstone blocks.
+- Synchronous `Bucket` access.
+- In-memory `Vec<Bucket>` storage.

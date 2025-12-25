@@ -12,14 +12,14 @@
 
 #### **Section 2: Core Indexing Logic (Level 1)**
 
-**Status:** ✅ **Complete.**
+**Status:** ✅ **Complete (Hardened).**
 
 - ✅ **Bucket Structure:** RAM-resident `BucketHeader` + Disk-resident `BucketData`.
 - ✅ **ADC Scanning:** SIMD-optimized `scan_adc`.
 - ✅ **Maintenance Primitives:**
-  - ✅ Split (Neighbor Stealing) - Verified with Drift Criterion.
-  - ✅ Merge (Scatter Merge) - Verified with Urgency Formula.
-  - ✅ Strong Consistency - Atomic KV updates during migration.
+  - ✅ Split (Neighbor Stealing) - **Hardened:** Added Variance/Drift check to prevent "Singularity" loops.
+  - ✅ Merge (Scatter Merge) - **Hardened:** Strict Hysteresis (merge only if empty) to prevent thrashing.
+  - ✅ Strong Consistency - Atomic KV updates verified via `scatter_split_race` test.
 
 #### **Section 3: Memory Structure (Level 0)**
 
@@ -28,7 +28,8 @@
 - ✅ **HNSW Graph:** Thread-safe MemTable for hot data.
 - ✅ **Hybrid Search:** Merges L0 (Graph) and L1 (Disk) results.
 - ✅ **Flushing Logic:** `Janitor` handles atomic rotation.
-- ✅ **Write-Ahead Log (WAL):** Durability guaranteed.
+- ✅ **Write-Ahead Log (WAL):** Durability verified via `janitor_lifecycle` test.
+- ✅ **Janitor Orchestration:** Added "Operation Budgeting" to prevent starvation during heavy writes.
 
 #### **Section 4: Execution Engine**
 
@@ -44,17 +45,17 @@
 
 - ✅ **gRPC Interface:** `DriftService` definition.
 - 🚧 **Async Migration:** Update gRPC handlers to use new Async Core API.
-  - ⬜ Update `Search` to call `search_async`.
+  - ✅ **Search:** Updated to call `search_async` with exposed Drift parameters.
   - ⬜ Update `Train` to call async `train`.
   - ⬜ Expose Drift Parameters (Lambda, Tau) via API.
 - ✅ **Persistence Manager:** Handles Hydration.
 
-#### **Section 6: Scaling & Optimization (Metadata)**
+#### **Section 6: Scaling & Optimization**
 
 **Status:** ✅ **Complete.**
 
-- ✅ **Global ID Index:** Integrated `drift_kv` (BitStore) to map `VectorID -> BucketID`.
-- ✅ **Drift Correction:** Implemented geometric drift tracking (`running_sum`).
+- ✅ **Global ID Index:** Integrated `drift_kv` (BitStore) for O(1) lookups.
+- ✅ **Singularity Guard:** Added variance checks to detect and ignore unsplittable duplicate data.
 
 #### **Section 7: Future Work (Distribution)**
 

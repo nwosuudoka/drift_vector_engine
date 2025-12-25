@@ -1,3 +1,4 @@
+use drift_cache::LocalDiskManager;
 use drift_core::index::{IndexOptions, VectorIndex};
 use drift_core::quantizer::Quantizer;
 use drift_storage::disk_manager::DiskManager;
@@ -26,30 +27,33 @@ impl PersistenceManager {
         let file_name = format!("segment_{}.drift", run_id);
         let file_path = self.base_path.join(&file_name);
 
-        // 1. Get Quantizer Snapshot
         let quantizer_arc = index.get_quantizer().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Cannot flush untrained index",
-            )
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Untrained index")
         })?;
 
-        // Serialize Quantizer for Metadata
         let q_bytes = bincode::encode_to_vec(&*quantizer_arc, bincode::config::standard())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // 2. Init Writer
         let manager = DiskManager::open(&file_path).await?;
         let mut writer = SegmentWriter::new(manager, q_bytes);
 
-        // 3. Iterate Buckets (L1 Data)
-        let buckets = index.get_all_buckets();
+        // Iterate Headers
+        let headers = index.get_all_bucket_headers();
 
-        for bucket in buckets {
-            let (vecs, ids) = bucket.extract_reconstructed();
-
-            if !vecs.is_empty() {
-                writer.write_bucket(bucket.id, &ids, &vecs).await?;
+        for header in headers {
+            // LOAD DATA from Cache (Async)
+            // If it's not in cache, this fetches from disk.
+            match index.cache.get(&header.page_id).await {
+                Ok(data_arc) => {
+                    let (vecs, ids) = data_arc.reconstruct(&quantizer_arc);
+                    if !vecs.is_empty() {
+                        writer.write_bucket(header.id, &ids, &vecs).await?;
+                    }
+                }
+                Err(e) => eprintln!(
+                    "Persistence Warning: Failed to load bucket {}: {}",
+                    header.id, e
+                ),
             }
         }
 
@@ -58,8 +62,6 @@ impl PersistenceManager {
         Ok(file_path)
     }
 
-    /// NEW: FLUSH L0 (MemTable) -> Disk (Segment)
-    /// This takes raw (ID, Vector) pairs extracted from MemTable and writes them to a new Segment.
     pub async fn flush_memtable_to_segment(
         &self,
         data: &[(u64, Vec<f32>)],
@@ -69,54 +71,37 @@ impl PersistenceManager {
         let file_name = format!("segment_l0_{}.drift", run_id);
         let file_path = self.base_path.join(&file_name);
 
-        // 1. Get Quantizer (Must be trained to write L1 format)
         let quantizer_arc = index.get_quantizer().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Cannot flush L0 without trained Quantizer",
-            )
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Untrained index")
         })?;
 
         let q_bytes = bincode::encode_to_vec(&*quantizer_arc, bincode::config::standard())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        // 2. Init Writer
         let manager = DiskManager::open(&file_path).await?;
         let mut writer = SegmentWriter::new(manager, q_bytes);
 
-        // 3. Prepare Data
-        // We write the entire MemTable snapshot as a single bucket (ID 0 for now).
-        // The VectorIndex re-assigns/splits this upon loading/compaction later.
-        let bucket_id = 0;
-
+        // Write as single bucket ID 0 (will be remapped on load)
         let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
         let vecs: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
 
         if !vecs.is_empty() {
-            writer.write_bucket(bucket_id, &ids, &vecs).await?;
+            writer.write_bucket(0, &ids, &vecs).await?;
         }
 
         writer.finalize().await?;
-        println!("Flushed L0 MemTable to {:?}", file_path);
         Ok(file_path)
     }
 
-    /// LOAD: Disk (Segment + WAL) -> Memory (Hybrid L0+L1)
     pub async fn load_from_segment(&self, path: &Path) -> std::io::Result<VectorIndex> {
-        // 1. Open Segment Reader
         let mut reader = SegmentReader::open(path).await?;
 
-        // 2. Restore Quantizer
         let q_bytes = reader.read_metadata();
         let (quantizer, _): (Quantizer, usize) =
             bincode::decode_from_slice(q_bytes, bincode::config::standard()).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Corrupt Quantizer Metadata",
-                )
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Corrupt Quantizer")
             })?;
 
-        // 3. Initialize Index (Restores L0 from WAL)
         let dim = quantizer.min.len();
         let options = IndexOptions {
             dim,
@@ -126,31 +111,28 @@ impl PersistenceManager {
             ..Default::default()
         };
 
-        // Standard WAL location
+        // We need a storage backend for the new index
+        // Assume sibling directory 'storage' relative to segment or CWD
+        let storage_path = self.base_path.join("storage");
+        let storage = std::sync::Arc::new(LocalDiskManager::new(storage_path));
+
         let wal_path = self.base_path.join("current.wal");
-
-        let index = VectorIndex::new(options, &wal_path)?;
-
-        // Set Quantizer
+        let index = VectorIndex::new(options, &wal_path, storage)?;
         index.set_quantizer(quantizer);
 
-        // 4. Hydrate Buckets (Restores L1 from Segment)
         let bucket_ids: Vec<u32> = reader.index.buckets.keys().cloned().collect();
-
         for id in bucket_ids {
             let (ids, vectors) = reader.read_bucket(id).await?;
-            index.force_register_bucket_with_ids(id, &ids, &vectors);
+            index
+                .force_register_bucket_with_ids(id, &ids, &vectors)
+                .await?;
         }
 
         Ok(index)
     }
 
-    /// HYDRATION: Scans the directory for .drift files and restores them into the Index.
     pub async fn hydrate_index(&self, index: &VectorIndex) -> std::io::Result<()> {
         let mut read_dir = tokio::fs::read_dir(&self.base_path).await?;
-        let mut segments_found = 0;
-
-        // Collect paths to sort them for deterministic loading order
         let mut paths = Vec::new();
         while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
@@ -158,21 +140,17 @@ impl PersistenceManager {
                 paths.push(path);
             }
         }
-        paths.sort(); // Sort by filename (e.g. timestamp or UUID)
+        paths.sort();
 
         for path in paths {
             println!(
                 "Persistence: Hydrating segment {:?}",
                 path.file_name().unwrap()
             );
-
             let mut reader = SegmentReader::open(&path).await?;
 
-            // 1. Restore Quantizer (Cold Start)
-            let needs_quantizer = index.get_quantizer().is_none();
-            if needs_quantizer {
+            if index.get_quantizer().is_none() {
                 let q_bytes = reader.read_metadata();
-                // ... (keep existing deserialization logic) ...
                 let (quantizer, _): (Quantizer, usize) = bincode::decode_from_slice(
                     q_bytes,
                     bincode::config::standard(),
@@ -180,37 +158,19 @@ impl PersistenceManager {
                 .map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "Corrupt Quantizer")
                 })?;
-
-                println!("Persistence: Restored Quantizer from segment.");
                 index.set_quantizer(quantizer);
             }
 
-            // 2. Load Buckets with NEW IDs
-            // L0 segments (from MemTable flushes) often have ID=0.
-            // We MUST allocate a new ID for them in the current index to avoid overwrites.
-            let bucket_ids_in_file: Vec<u32> = reader.index.buckets.keys().cloned().collect();
-
-            for _old_id in bucket_ids_in_file {
-                // Read the data associated with the old ID
+            let bucket_ids: Vec<u32> = reader.index.buckets.keys().cloned().collect();
+            for _old_id in bucket_ids {
                 let (ids, vectors) = reader.read_bucket(_old_id).await?;
-
-                // ALLOCATE FRESH ID
+                // Always allocate new ID to prevent collision
                 let new_id = index.allocate_next_bucket_id();
-
-                // Register with the new ID
-                index.force_register_bucket_with_ids(new_id, &ids, &vectors);
+                index
+                    .force_register_bucket_with_ids(new_id, &ids, &vectors)
+                    .await?;
             }
-
-            segments_found += 1;
         }
-
-        if segments_found > 0 {
-            println!(
-                "Persistence: Hydration complete. Loaded {} segments.",
-                segments_found
-            );
-        }
-
         Ok(())
     }
 }

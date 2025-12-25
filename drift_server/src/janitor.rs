@@ -1,5 +1,6 @@
 use crate::persistence::PersistenceManager;
-use drift_core::index::VectorIndex;
+use drift_core::index::{MaintenanceStatus, VectorIndex};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
@@ -9,6 +10,8 @@ pub struct Janitor {
     persistence: PersistenceManager,
     flush_threshold: usize,
     check_interval: Duration,
+    // Track buckets that are "Unsplittable" to prevent infinite loops
+    ignore_set: std::sync::Mutex<HashSet<u32>>,
 }
 
 impl Janitor {
@@ -23,21 +26,17 @@ impl Janitor {
             persistence,
             flush_threshold,
             check_interval,
+            ignore_set: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
-    /// Runs the background loop. Call this via `tokio::spawn`.
     pub async fn run(&self) {
         let mut interval = time::interval(self.check_interval);
 
-        // Run maintenance less frequently than flush checks (e.g. every 10 ticks)
-        let mut ticks = 0;
-
         loop {
             interval.tick().await;
-            ticks += 1;
 
-            // 1. Flush Logic (L0 -> L1)
+            // 1. Flush (Priority High)
             let size = self.index.memtable_len();
             if size >= self.flush_threshold {
                 match self.perform_flush().await {
@@ -47,97 +46,100 @@ impl Janitor {
                 }
             }
 
-            // 2. Maintenance Logic (L1 -> L1) - Run every 10th tick
-            // This is the "Self-Healing" heartbeat.
-            if ticks % 10 == 0 {
-                self.perform_maintenance();
+            // 2. Maintenance (Priority Low)
+            self.perform_maintenance().await;
+        }
+    }
+
+    async fn perform_maintenance(&self) {
+        let buckets = self.index.get_all_bucket_headers();
+        let target_cap = self.index.config.max_bucket_capacity as u32;
+
+        // BUDGET: Only do 1 heavy op per tick to prevent starvation
+        let mut ops_budget = 1;
+
+        for header in buckets {
+            if ops_budget == 0 {
+                break;
+            }
+
+            // Check Ignore List (Scoped)
+            {
+                let guard = self.ignore_set.lock().unwrap();
+                if guard.contains(&header.id) {
+                    continue;
+                }
+            }
+
+            // 1. SPLIT
+            if header.count > (target_cap as f32 * 1.5) as u32 {
+                println!(
+                    "Janitor: ✂️ Splitting Bucket {} (Count {})",
+                    header.id, header.count
+                );
+
+                match self.index.split_and_steal(header.id).await {
+                    Ok(MaintenanceStatus::Completed) => {
+                        ops_budget -= 1;
+                    }
+                    Ok(MaintenanceStatus::SkippedSingularity) => {
+                        println!("Janitor: Bucket {} is a Singularity. Ignoring.", header.id);
+                        self.ignore_set.lock().unwrap().insert(header.id);
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Split failed: {}", e),
+                }
+            }
+            // 2. MERGE
+            else if header.count == 0 {
+                println!(
+                    "Janitor: 🚑 Scatter Merging Bucket {} (Count {})",
+                    header.id, header.count
+                );
+                self.ignore_set.lock().unwrap().remove(&header.id); // Cleanup
+
+                match self.index.scatter_merge(header.id).await {
+                    Ok(MaintenanceStatus::Completed) => {
+                        ops_budget -= 1;
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("Merge failed: {}", e),
+                }
             }
         }
     }
 
-    fn perform_maintenance(&self) {
-        let buckets = self.index.get_all_buckets();
-        let target_cap = self.index.config.max_bucket_capacity;
-
-        let mut best_merge_candidate = None;
-        let mut max_urgency = 0.0;
-        let mut best_split_candidate = None;
-
-        for bucket in &buckets {
-            bucket.decay_temperature();
-
-            // 1. Check Merge Urgency (Healing)
-            let urgency = bucket.calculate_urgency(target_cap);
-            if urgency > max_urgency {
-                max_urgency = urgency;
-                best_merge_candidate = Some(bucket.id);
-            }
-
-            // 2. Check Split Criteria (Growth) - SDD Section 3.C
-            // We prioritize the *first* valid split candidate we find to avoid scanning everything strictly
-            if best_split_candidate.is_none() && bucket.should_split(target_cap) {
-                best_split_candidate = Some(bucket.id);
-            }
-        }
-
-        // DECISION LOGIC: Heal first, then Grow.
-        if max_urgency > 1.0
-            && let Some(id) = best_merge_candidate
-        {
-            println!(
-                "Janitor: 🚑 Scatter Merging Bucket {} (Urgency {:.2})",
-                id, max_urgency
-            );
-            let _ = self.index.scatter_merge(id);
-            return; // One op per tick
-        }
-
-        if let Some(id) = best_split_candidate {
-            println!(
-                "Janitor: ✂️ Splitting Bucket {} (Drift/Capacity detected)",
-                id
-            );
-            self.index.split_and_steal(id);
-        }
-    }
-
-    /// Performs the atomic swap, training (if needed), promotion, and persistence.
     async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
-        // 1. Rotate & Get Data (Blocking operation, holds WAL lock briefly)
         let data = self.index.rotate_memtable()?;
-
         if data.is_empty() {
             return Ok(None);
         }
 
-        // Prepare data vectors for processing
         let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
         let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
 
-        // 2. AUTO-TRAINING (Cold Start)
-        let is_first_run = self.index.get_quantizer().is_none();
-
-        if is_first_run {
-            println!(
-                "Janitor: First flush detected. Training index on {} samples...",
-                vectors.len()
-            );
-            self.index.train(&vectors);
+        {
+            let q_guard = self.index.get_quantizer();
+            if q_guard.is_none() {
+                println!(
+                    "Janitor: First flush. Training index on {} samples...",
+                    vectors.len()
+                );
+                self.index.train(&vectors).await?;
+                return Ok(None);
+            }
         }
 
-        // 3. PROMOTE TO L1 (Memory)
-        for (i, vec) in vectors.iter().enumerate() {
-            self.index.force_insert_l1(ids[i], vec);
-        }
+        let new_id = self.index.allocate_next_bucket_id();
+        self.index
+            .force_register_bucket_with_ids(new_id, &ids, &vectors)
+            .await?;
 
-        // 4. PERSIST TO DISK (Durability)
         let run_id = uuid::Uuid::new_v4().to_string();
-
         let path = self
             .persistence
             .flush_memtable_to_segment(&data, &self.index, &run_id)
             .await?;
-
         Ok(Some(path))
     }
 }

@@ -39,6 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             collection_name: "users".to_string(),
             vector: vec![0.1; dim],
             k: 1,
+            target_confidence: 0.9,
+            lambda: 25.0,
+            tau: 100.0,
         }))
         .await?
         .into_inner();
@@ -56,6 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             collection_name: "products".to_string(),
             vector: vec![0.9; dim],
             k: 1,
+            target_confidence: 0.9,
+            lambda: 25.0,
+            tau: 100.0,
         }))
         .await?
         .into_inner();

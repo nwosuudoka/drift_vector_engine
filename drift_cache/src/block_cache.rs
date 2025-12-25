@@ -16,54 +16,34 @@ impl<V: Cacheable> BlockCache<V> {
         }
     }
 
-    // NEW: Allow access to storage for writing new pages
     pub fn storage(&self) -> &Arc<dyn PageManager> {
         &self.storage
     }
 
-    /// The Magic Method: Transparently loads data from disk if missing from RAM.
+    /// Transparently loads data from disk if missing from RAM.
     pub async fn get(&self, page_id: &PageId) -> Result<Arc<V>> {
-        // 1. Fast Path: Check RAM (Zero-Copy)
+        // 1. Fast Path: Check RAM
         if let Some(val) = self.ram.get(page_id) {
             return Ok(val);
         }
 
         // 2. Slow Path: Disk I/O
-        // Note: In a high-concurrency scenario, multiple threads might race here
-        // and fetch the same page twice. This is acceptable for V1 (OS page cache handles it).
         let raw_bytes = self.storage.read_page(page_id.clone()).await?;
-
-        // 3. Deserialize (CPU bound)
         let obj = V::from_bytes(&raw_bytes)?;
-        // let arc_obj = Arc::new(obj);
 
-        // 4. Cache It (S3FIFO decides admission/eviction)
-        self.ram.put(page_id.clone(), obj);
+        // FIX: Wrap in Arc immediately to allow sharing regardless of caching status
+        let arc_obj = Arc::new(obj);
 
-        // 5: return the value.
-        // Ok(self.ram.get(page_id).expect("Just inserted"))
-        let cached_arc = self
-            .ram
-            .get(page_id)
-            .ok_or_else(|| std::io::Error::other("Cache rejection or race condition"))?;
+        // 3. Try to Cache (S3FIFO may reject it)
+        // We pass a clone of the Arc, so if rejected, we still hold the data.
+        self.ram.put(page_id.clone(), arc_obj.clone());
 
-        Ok(cached_arc)
+        // 4. Return the data (Guaranteed success)
+        Ok(arc_obj)
     }
 
-    // Optimized implementation to avoid the double lookup above:
+    // Optimized implementation (No change needed since get() logic is now fixed)
     pub async fn get_optimized(&self, page_id: &PageId) -> Result<Arc<V>> {
-        if let Some(val) = self.ram.get(page_id) {
-            return Ok(val);
-        }
-
-        let raw_bytes = self.storage.read_page(page_id.clone()).await?;
-        let obj = V::from_bytes(&raw_bytes)?;
-
-        // We put it in. S3FIFO wraps it in Arc internally.
-        self.ram.put(page_id.clone(), obj);
-
-        // We retrieve it immediately.
-        // (Optimally S3FIFO put would return the Arc it created, but get() is fast enough)
-        Ok(self.ram.get(page_id).expect("Just inserted"))
+        self.get(page_id).await
     }
 }

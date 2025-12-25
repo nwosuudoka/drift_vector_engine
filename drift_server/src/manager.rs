@@ -57,6 +57,11 @@ impl CollectionManager {
 
         let wal_path = coll_dir.join("current.wal");
 
+        let storage_path = coll_dir.join("storage");
+        let storage = Arc::new(drift_cache::local_store::LocalDiskManager::new(
+            storage_path,
+        ));
+
         // 4. Initialize Components
         let persistence = PersistenceManager::new(&coll_dir);
 
@@ -70,7 +75,7 @@ impl CollectionManager {
         };
 
         // 5. Init Index (Replays WAL automatically)
-        let index = Arc::new(VectorIndex::new(options, &wal_path)?);
+        let index = Arc::new(VectorIndex::new(options, &wal_path, storage)?);
 
         // 6. HYDRATION (The Fix)
         // We use the persistence instance to load historical segments from disk.
