@@ -3,7 +3,7 @@ mod tests {
     use crate::aligned::AlignedBytes;
     use crate::bucket::BucketData;
     use bit_set::BitSet;
-    use drift_cache::store::Cacheable;
+    use drift_traits::Cacheable;
 
     #[test]
     fn test_bucket_data_roundtrip_with_bitpacking() {

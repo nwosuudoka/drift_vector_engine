@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod storage_tests {
     use crate::local_store::LocalDiskManager;
-    use crate::store::{PageId, PageManager};
+    use drift_traits::{PageId, PageManager};
     use tempfile::tempdir;
 
     #[tokio::test]

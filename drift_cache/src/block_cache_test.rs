@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::block_cache::BlockCache;
-    use crate::store::{Cacheable, PageId, PageManager};
     use async_trait::async_trait;
+    use drift_traits::{Cacheable, PageId, PageManager};
     use std::io::Result;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};

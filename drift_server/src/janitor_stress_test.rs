@@ -281,7 +281,7 @@ mod stress_tests {
         }
         sleep(Duration::from_millis(300)).await;
         let headers = index.get_all_bucket_headers();
-        let existing_bucket_ids: HashSet<u32> = headers.iter().map(|h| h.id).collect();
+        let _existing_bucket_ids: HashSet<u32> = headers.iter().map(|h| h.id).collect();
         for id in 0..1_500u64 {
             let kv_bucket = index.kv.get(&id.to_le_bytes()).unwrap();
             if alive.contains(&id) {

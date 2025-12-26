@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0] - Cloud-Native Storage & Stability
+
+**Tag:** `v0.5.0-cloud-native-beta`
+
+### Added
+
+- **Cloud Storage Support:** Integrated `apache-opendal` to support S3, GCS, Azure, and Local FS uniformly.
+- **URI Configuration:** Server now accepts storage paths as URIs (e.g., `file:///data`, `s3://my-bucket`).
+- **Scratch File Writing:** Segments are buffered to a local temporary file and uploaded atomically on completion, ensuring compatibility with immutable object stores.
+- **Auto-Registration:** `DriftPageManager` automatically registers new file IDs during write operations, preventing "File ID not found" errors during training.
+
+### Changed
+
+- **Dynamic Dimensions:** Server no longer panics on dimension mismatch; it adapts to the input data dimension or validates against the existing schema.
+- **Refactored Persistence:** `PersistenceManager` now uses `DriftPageManager` instead of `LocalDiskManager`.
+
+### Fixed
+
+- **Write Page Panic:** Implemented Read-Modify-Write logic for `write_page` to support random-access writes required by `drift_core` on top of object storage.
+
 ## [0.4.0] - Single-Node Stable Release
 
 **Tag:** `v0.4.0-single-node-stable`

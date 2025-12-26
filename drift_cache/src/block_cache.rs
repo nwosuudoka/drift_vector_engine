@@ -1,5 +1,6 @@
+use drift_traits::{Cacheable, PageId, PageManager};
+
 use crate::sharded_fifo::ShardedFastS3Fifo;
-use crate::store::{Cacheable, PageId, PageManager};
 use std::io::Result;
 use std::sync::Arc;
 

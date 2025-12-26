@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::local_store::LocalDiskManager;
-    use crate::store::{PageId, PageManager}; // Adjust path if testing from outside crate
+    use drift_traits::{PageId, PageManager};
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::task;

@@ -1,0 +1,8 @@
+[package]
+name = "drift_traits"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait = "0.1" # For PageManager trait

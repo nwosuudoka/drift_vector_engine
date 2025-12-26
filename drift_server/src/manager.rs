@@ -1,6 +1,7 @@
 use crate::janitor::Janitor;
 use crate::persistence::PersistenceManager;
 use drift_core::index::{IndexOptions, VectorIndex};
+use drift_storage::disk_manager::DriftPageManager; // Updated import
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,25 +29,25 @@ impl CollectionManager {
         }
     }
 
-    /// Retrieves a collection. If it doesn't exist, creates it using the provided `dim`.
-    /// If `dim` is None for a new collection, defaults to 128.
+    /// Retrieves or creates a collection.
+    /// `dim_hint` is required if creating a NEW collection.
     pub async fn get_or_create(
         &self,
         name: &str,
         dim_hint: Option<usize>,
     ) -> std::io::Result<Arc<Collection>> {
-        // 1. Fast Path
+        // 1. Fast Path (Read Lock)
         {
             let map = self.collections.read().await;
             if let Some(coll) = map.get(name) {
-                // Optional: Verify dimension matches hint if provided
+                // Safety Check: If hint provided, ensure it matches
                 if let Some(d) = dim_hint {
                     if coll.index.config.dim != d {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             format!(
-                                "Collection '{}' exists with dim {}, but requested {}",
-                                name, coll.index.config.dim, d
+                                "Dimension Mismatch: Collection has {}, requested {}",
+                                coll.index.config.dim, d
                             ),
                         ));
                     }
@@ -55,46 +56,55 @@ impl CollectionManager {
             }
         }
 
-        // 2. Slow Path
+        // 2. Slow Path (Write Lock)
         let mut map = self.collections.write().await;
         if let Some(coll) = map.get(name) {
             return Ok(coll.clone());
         }
 
-        println!("Manager: Creating/Loading collection '{}'...", name);
+        println!("Manager: Loading/Creating collection '{}'...", name);
 
+        // Setup Paths
         let coll_dir = self.base_path.join(name);
         std::fs::create_dir_all(&coll_dir)?;
 
         let wal_path = coll_dir.join("current.wal");
-        let storage_path = coll_dir.join("storage");
-        let storage = Arc::new(drift_cache::local_store::LocalDiskManager::new(
-            storage_path,
-        ));
+
+        let storage_dir = coll_dir.join("storage");
+        std::fs::create_dir_all(&storage_dir)?;
+
+        let abs_storage_path = std::fs::canonicalize(&storage_dir).unwrap_or(storage_dir);
+        let storage_uri = format!("file://{}", abs_storage_path.to_string_lossy());
+
+        // Open DiskManager via OpenDAL
+        let storage = Arc::new(DriftPageManager::new(&storage_uri).await?);
         let persistence = PersistenceManager::new(&coll_dir);
 
-        // Determine Dimension: Hint -> 128 (Default)
+        // Dynamic Dimension or Default
         let dim = dim_hint.unwrap_or(128);
 
         let options = IndexOptions {
-            dim, // Use dynamic dimension
-            num_centroids: 16,
+            dim,
+            num_centroids: 16, // In prod, this might scale with data size
             training_sample_size: 1000,
             max_bucket_capacity: 1000,
             ef_construction: 50,
             ef_search: 20,
         };
 
+        // Initialize Index
         let index = Arc::new(VectorIndex::new(options, &wal_path, storage)?);
 
-        // Hydrate from disk
+        // Hydrate from Disk (Loads existing segments)
+        // Note: If we are recovering, we might want to check the loaded segments to confirm 'dim'
+        // matches, but VectorIndex handles safety internally usually.
         persistence.hydrate_index(&index).await?;
 
         // Start Janitor
-        let janitor_idx = index.clone();
-        let janitor_persist = persistence.clone();
+        let j_idx = index.clone();
+        let j_persist = persistence.clone();
         tokio::spawn(async move {
-            let janitor = Janitor::new(janitor_idx, janitor_persist, 2000, Duration::from_secs(2));
+            let janitor = Janitor::new(j_idx, j_persist, 2000, Duration::from_secs(2));
             janitor.run().await;
         });
 
@@ -104,7 +114,7 @@ impl CollectionManager {
         });
 
         map.insert(name.to_string(), collection.clone());
-        println!("Manager: Collection '{}' (dim: {}) is ready.", name, dim);
+        println!("Manager: Collection '{}' (dim: {}) ready.", name, dim);
 
         Ok(collection)
     }

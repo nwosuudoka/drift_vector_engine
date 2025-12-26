@@ -16,4 +16,3 @@ mod tests;
 pub use local_store::LocalDiskManager;
 pub use s3fifo::{CacheMetrics, CacheStats};
 pub use sharded_fifo::ShardedFastS3Fifo;
-pub use store::{PageId, PageManager};

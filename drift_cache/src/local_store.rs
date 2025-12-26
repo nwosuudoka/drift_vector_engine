@@ -1,5 +1,5 @@
-use crate::store::{PageId, PageManager};
 use async_trait::async_trait;
+use drift_traits::{PageId, PageManager};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

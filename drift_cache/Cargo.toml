@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 
 [dependencies]
+drift_traits = { path = "../drift_traits" }
 parking_lot = "0.12"
 twox-hash = "2.1.2"
 async-trait = "0.1"                            # For PageManager trait

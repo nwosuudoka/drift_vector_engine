@@ -20,38 +20,6 @@ pub struct DriftService {
 
 #[tonic::async_trait]
 impl Drift for DriftService {
-    // async fn insert(
-    //     &self,
-    //     request: Request<InsertRequest>,
-    // ) -> Result<Response<InsertResponse>, Status> {
-    //     let req = request.into_inner();
-    //     let vec_data = req
-    //         .vector
-    //         .ok_or_else(|| Status::invalid_argument("Vector missing"))?;
-
-    //     // 2. Resolve Collection
-    //     let collection_name = if req.collection_name.is_empty() {
-    //         "default".to_string()
-    //     } else {
-    //         req.collection_name
-    //     };
-
-    //     let collection = self
-    //         .manager
-    //         .get_or_create(&collection_name)
-    //         .await
-    //         .map_err(|e| Status::internal(format!("Failed to load collection: {}", e)))?;
-
-    //     // 3. Insert into specific index
-    //     match collection.index.insert(vec_data.id, &vec_data.values) {
-    //         Ok(_) => Ok(Response::new(InsertResponse { success: true })),
-    //         Err(e) => {
-    //             eprintln!("Insert error: {}", e);
-    //             Err(Status::internal("Failed to insert vector"))
-    //         }
-    //     }
-    // }
-
     async fn insert(
         &self,
         request: Request<InsertRequest>,

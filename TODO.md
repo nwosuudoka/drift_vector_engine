@@ -2,58 +2,57 @@
 
 #### **Section 1: Storage Layer (Level 1)**
 
-**Status:** ✅ **Complete.**
+**Status:** ✅ **Complete**
 
-- ✅ **Custom `.drift` File Format:** `SegmentWriter`/`SegmentReader`.
-- ✅ **Disk Manager:** Async I/O with `pread`/`pwrite`.
-- ✅ **Block Alignment:** 4KB aligned pages.
-- ✅ **Compression:** SQ8 Quantization.
+- ✅ **Custom `.drift` File Format:** `SegmentWriter`/`SegmentReader` with Versioning & Magic Bytes.
+- ✅ **Disk Manager:** Abstracted via `opendal` for local/cloud transparency.
+- ✅ **Block Alignment:** 4KB aligned pages for O_DIRECT compatibility.
+- ✅ **Compression:** ALP/ALP_RD quantization for high-ratio float compression.
 
 #### **Section 2: Core Indexing Logic (Level 1)**
 
-**Status:** ✅ **Complete.**
+**Status:** ✅ **Complete**
 
-- ✅ **Bucket Structure:** RAM Header + Disk Data.
+- ✅ **Bucket Structure:** RAM Header + Disk Data (Hybrid Layout).
 - ✅ **Maintenance:** Drift-Aware Split & Strict Hysteresis Merge.
 - ✅ **Safety:** Singularity Guard prevents infinite loops on duplicate data.
 
 #### **Section 3: Memory Structure (Level 0)**
 
-**Status:** ✅ **Complete.**
+**Status:** ✅ **Complete**
 
-- ✅ **MemTable:** Thread-safe HNSW Graph.
-- ✅ **Durability:** Write-Ahead Log (WAL) with recovery.
-- ✅ **Janitor:** Operation budgeting and background flushing.
+- ✅ **MemTable:** Thread-safe HNSW Graph for low-latency ingest.
+- ✅ **Durability:** Write-Ahead Log (WAL) with crash recovery.
+- ✅ **Janitor:** Background process for operation budgeting and auto-flushing.
 
 #### **Section 4: Execution Engine**
 
-**Status:** ✅ **Complete.**
+**Status:** ✅ **Complete**
 
-- ✅ **Async Architecture:** Fully async core.
-- ✅ **Routing:** Saturating Density model (Lambda/Tau).
+- ✅ **Async Architecture:** Fully non-blocking core using `tokio`.
+- ✅ **Routing:** Saturating Density model (Lambda/Tau) for query routing.
 
 #### **Section 5: Server & API**
 
-**Status:** ✅ **Complete.**
+**Status:** ✅ **Complete**
 
-- ✅ **gRPC Schema:** Defined `drift.proto` with `Train`, `Insert`, `Search`.
-- ✅ **Async Handlers:**
-  - `Train`: Non-blocking K-Means index construction.
-  - `Search`: Async retrieval with tunable parameters.
-  - `Insert`: High-throughput ingestion.
-- ✅ **Persistence Manager:** Handles index hydration on startup.
+- ✅ **gRPC Interface:** `Train`, `Insert`, `Search` via `tonic`.
+- ✅ **CLI Tool:** `drift-cli` for human interaction and management.
+- ✅ **Dynamic Config:** Auto-dimension sizing and URI-based storage handling.
 
 #### **Section 6: Scaling & Optimization**
 
-**Status:** ✅ **Complete.**
+**Status:** ✅ **Complete**
 
-- ✅ **Global ID Index:** O(1) `VectorID -> BucketID` via BitStore.
-- ✅ **Drift Correction:** Geometric center tracking.
+- ✅ **Global ID Index:** O(1) `VectorID -> BucketID` mapping.
+- ✅ **Bloom Filters:** Integrated per-segment probabilistic filters for fast negative lookups.
+- ✅ **Drift Correction:** Geometric center tracking for data distribution shifts.
 
-#### **Section 7: Cloud-Native Infrastructure (Future Work)**
+#### **Section 7: Cloud-Native Infrastructure**
 
-**Status:** ⏸️ **Pending.**
+**Status:** 🚧 **In Progress**
 
-- ⬜ **S3 Integration:** Replace local disk with Object Store backend.
-- ⬜ **Bloom Filters:** Optimization for negative lookups in segments.
-- ⬜ **Distributed Consensus:** Clustering multiple nodes.
+- ✅ **Storage Abstraction:** Replaced `std::fs` with `apache-opendal` to support S3, GCS, Azure, and Local FS uniformly.
+- ✅ **Immutable Write Pattern:** Implemented "Scratch File" strategy to build segments locally and upload atomically.
+- ⬜ **Metric Unification:** Standardize on Squared Euclidean distance to fix L0/L1 ranking mismatches.
+- ⬜ **Distributed Consensus:** Design the "Stateless Worker" clustering model for horizontal scaling.

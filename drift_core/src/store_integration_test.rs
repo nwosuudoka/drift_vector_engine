@@ -7,7 +7,7 @@ mod tests {
     use async_trait::async_trait;
     use bit_set::BitSet;
     use drift_cache::block_cache::BlockCache;
-    use drift_cache::{PageId, PageManager};
+    use drift_traits::{PageId, PageManager};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
