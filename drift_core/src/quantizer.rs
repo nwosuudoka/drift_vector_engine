@@ -8,8 +8,9 @@ pub struct Quantizer {
 }
 
 impl Quantizer {
-    /// Train the quantizer using Percentile Clipping (1% - 99%).
-    /// This handles "Soap Bubble" distributions where outliers skew the grid.
+    /// Train the quantizer using Percentile Clipping (1% - 99%) for sufficient data.
+    /// This handles "Soap Bubble" distributions where outliers skew the grid,
+    /// while preserving exact range for small datasets (<100 items).
     pub fn train(data: &[Vec<f32>]) -> Self {
         if data.is_empty() {
             panic!("Cannot train quantizer on empty data");
@@ -20,47 +21,37 @@ impl Quantizer {
         let mut max = vec![0.0; dim];
         let mut scale = vec![0.0; dim];
 
-        // Transpose and sort to find percentiles per dimension
         for i in 0..dim {
             let mut column: Vec<f32> = data.iter().map(|v| v[i]).collect();
-
-            // Sort to find percentiles
-            // Handle NaNs by pushing them to the end (or treat as equal)
+            // Sort to find percentiles (Handle NaNs)
             column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
             let len = column.len();
 
-            // Calculate how many items constitute 1%
-            // Ensure we drop at least 1 item if len is small but > 0
-            let count_to_drop = (len / 100).max(1);
+            // PUSH BACK: Only clip if we have enough data to form meaningful percentiles.
+            // If N < 100, "1%" is less than 1 item, so we shouldn't drop anything.
+            let count_to_drop = if len >= 100 { len / 100 } else { 0 };
 
-            // If len is small (e.g., 1), min(len-1) ensures we don't go out of bounds.
+            // Robust Indexing
             let p01_idx = count_to_drop.min(len - 1);
-
-            // Use saturating_sub to prevent overflow when len is small.
-            // Logic: We want the index `count_to_drop` positions from the end.
             let p99_idx = len
                 .saturating_sub(count_to_drop)
                 .saturating_sub(1)
                 .min(len - 1);
 
-            // 3: Inversion Protection
-            // On very small datasets (len=2), p01_idx might be > p99_idx.
-            // We ensure max >= min to prevent negative scaling.
-            let actual_p01_idx = p01_idx.min(p99_idx);
-            let actual_p99_idx = p01_idx.max(p99_idx);
+            // Inversion Protection (Just in case)
+            let actual_min_idx = p01_idx.min(p99_idx);
+            let actual_max_idx = p01_idx.max(p99_idx);
 
-            let p01 = column[actual_p01_idx];
-            let p99 = column[actual_p99_idx];
+            let p_min = column[actual_min_idx];
+            let p_max = column[actual_max_idx];
 
-            min[i] = p01;
-            max[i] = p99;
+            min[i] = p_min;
+            max[i] = p_max;
 
             // Calculate scale
             let range = max[i] - min[i];
-            // Prevent division by zero for constant dimensions
             scale[i] = if range.abs() < 1e-6 {
-                1.0
+                1.0 // Prevent div by zero for constant dimensions
             } else {
                 range / 255.0
             };

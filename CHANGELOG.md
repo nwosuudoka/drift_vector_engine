@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.2] - Metric Unification & Config
+
+### Added
+
+- **Global Config:** Server now configurable via CLI arguments (`--port`, `--storage-uri`) and Environment Variables (`DRIFT_PORT`, etc.).
+
+### Changed
+
+- **Metric Standardization:** The Search API now consistently returns Euclidean Distance. Internally, the engine operates on Squared Euclidean Distance for performance and correctness during ranking.
+
 ## [0.5.0] - Cloud-Native Storage & Stability
 
 **Tag:** `v0.5.0-cloud-native-beta`

@@ -9,8 +9,10 @@ use tonic::transport::Server;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
-
-    println!("🚀 Starting Drift Server with Config: {:?}", config);
+    println!("🚀 Starting Drift Server...");
+    println!("   Port: {}", config.port);
+    println!("   Storage: {}", config.storage_uri);
+    println!("   WAL Dir: {:?}", config.wal_dir);
     let addr = format!("0.0.0.0:{}", config.port).parse()?;
 
     println!("Initializing Drift Manager...");

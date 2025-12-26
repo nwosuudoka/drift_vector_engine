@@ -63,10 +63,12 @@ mod tests {
         let results = search_resp.unwrap().into_inner().results;
         assert!(!results.is_empty());
 
-        let found_999 = results.iter().any(|r| r.id == 999);
-        let found_0 = results.iter().any(|r| r.id == 0);
+        let found_999 = results.iter().find(|r| r.id == 999).unwrap();
+        let found_0 = results.iter().find(|r| r.id == 0).unwrap();
 
-        assert!(found_999, "Failed to find L0 item");
-        assert!(found_0, "Failed to find L1 item");
+        assert!(found_999.score < 0.001, "L0 Score mismatch");
+
+        let msg = format!("L1 Score mismatch {}", found_0.score);
+        assert!(found_0.score < 0.001, "{}", msg.as_str());
     }
 }
