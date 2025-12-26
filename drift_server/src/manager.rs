@@ -2,11 +2,12 @@ use crate::config::Config;
 use crate::janitor::Janitor;
 use crate::persistence::PersistenceManager;
 use drift_core::index::{IndexOptions, VectorIndex};
-use drift_storage::disk_manager::DriftPageManager; // Updated import
+use drift_storage::disk_manager::DriftPageManager;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::info; // Updated import
 
 pub struct Collection {
     pub index: Arc<VectorIndex>,
@@ -61,7 +62,7 @@ impl CollectionManager {
             return Ok(coll.clone());
         }
 
-        println!("Manager: Initializing collection '{}'", name);
+        info!("Manager: Initializing collection '{}'", name);
 
         // A. Resolve WAL Path (Local)
         // WALs are always local for speed/durability guarantees
@@ -119,7 +120,7 @@ impl CollectionManager {
         });
 
         map.insert(name.to_string(), collection.clone());
-        println!(
+        info!(
             "Manager: Collection '{}' ready (dim: {}, uri: {})",
             name, dim, storage_uri
         );

@@ -14,7 +14,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing::instrument;
+use tracing::error;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MaintenanceStatus {
@@ -263,62 +263,6 @@ impl VectorIndex {
         Ok(())
     }
 
-    // pub fn insert(&self, id: u64, vector: &[f32]) -> io::Result<()> {
-    //     {
-    //         let mut wal = self.wal.lock();
-    //         wal.write_insert(id, vector)?;
-    //         wal.flush()?;
-    //     }
-    //     let guard = epoch::pin();
-    //     let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-    //     memtable.insert(id, vector);
-
-    //     self.deleted_ids.write().remove(&id);
-    //     Ok(())
-    // }
-
-    // #[instrument(skip(self, vectors), level = "info")]
-    // pub fn insert_batch(&self, vectors: &[(u64, Vec<f32>)]) -> io::Result<()> {
-    //     // 1. Lock WAL ONCE
-    //     {
-    //         let mut wal = self.wal.lock();
-    //         for (id, vec) in vectors {
-    //             wal.write_insert(*id, vec)?;
-    //         }
-    //         wal.flush()?;
-    //     }
-
-    //     // 2. Insert into MemTable (Concurrent)
-    //     let guard = epoch::pin();
-    //     let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-
-    //     // HNSW insert is thread-safe, but here we do it sequentially to keep batch logic simple.
-    //     // For higher perf, we could use rayon here, but HNSW contention might limit gains.
-    //     for (id, vec) in vectors {
-    //         memtable.insert(*id, vec);
-    //         self.deleted_ids.write().remove(id);
-    //     }
-
-    //     Ok(())
-    // }
-
-    // pub fn delete(&self, id: u64) -> io::Result<()> {
-    //     {
-    //         let mut wal = self.wal.lock();
-    //         wal.write_delete(id)?;
-    //         wal.flush()?;
-    //     }
-    //     let guard = epoch::pin();
-    //     let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-    //     memtable.delete(id);
-
-    //     self.deleted_ids.write().insert(id);
-    //     let _ = self.kv.remove(&id.to_le_bytes());
-    //     Ok(())
-    // }
-
-    // drift_core/src/index.rs
-
     pub fn insert(&self, id: u64, vector: &[f32]) -> io::Result<()> {
         // 1. Acquire Lock (Keeps sync with Rotate)
         let mut wal = self.wal.lock();
@@ -466,7 +410,7 @@ impl VectorIndex {
         for header in selected_headers {
             match self.cache.get(&header.page_id).await {
                 Ok(data) => loaded_data.push(data),
-                Err(e) => eprintln!("Failed to load bucket {}: {}", header.id, e),
+                Err(e) => error!("Failed to load bucket {}: {}", header.id, e),
             }
         }
 

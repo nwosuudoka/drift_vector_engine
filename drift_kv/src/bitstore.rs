@@ -389,22 +389,6 @@ impl BitStore {
         Ok(())
     }
 
-    // fn read_page(file: &File, offset: u64) -> Result<DiskPage, StoreError> {
-    //     let mut buf = [0u8; PAGE_SIZE];
-    //     #[cfg(unix)]
-    //     file.read_exact_at(&mut buf, offset)?;
-
-    //     let page = DiskPage::read_from_bytes(&buf).map_err(|_| StoreError::CorruptedIndex)?;
-
-    //     if page.magic == 0 {
-    //         return Ok(DiskPage::default());
-    //     }
-    //     if page.magic != 0xDB5708E {
-    //         return Err(StoreError::CorruptedIndex);
-    //     }
-    //     Ok(page)
-    // }
-
     fn read_page(file: &File, offset: u64) -> Result<DiskPage, StoreError> {
         let mut buf = [0u8; PAGE_SIZE];
         #[cfg(unix)]

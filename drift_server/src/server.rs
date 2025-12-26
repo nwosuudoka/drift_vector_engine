@@ -9,7 +9,7 @@ use crate::{
 use std::sync::Arc;
 use std::time::Instant; // NEW: For metrics
 use tonic::{Request, Response, Status};
-use tracing::instrument;
+use tracing::{error, info, instrument};
 
 #[derive(Clone)]
 pub struct DriftService {
@@ -45,7 +45,7 @@ impl Drift for DriftService {
         match collection.index.insert(vec_data.id, &vec_data.values) {
             Ok(_) => {
                 // Metric Log
-                println!(
+                info!(
                     "[METRIC] Insert | Coll: {} | Dim: {} | Latency: {:.2?} | Count: {}",
                     collection_name,
                     dim,
@@ -55,13 +55,13 @@ impl Drift for DriftService {
                 Ok(Response::new(InsertResponse { success: true }))
             }
             Err(e) => {
-                eprintln!("[ERROR] Insert failed: {}", e);
+                error!("[ERROR] Insert failed: {}", e);
                 Err(Status::internal(format!("Failed to insert: {}", e)))
             }
         }
     }
 
-    #[instrument(skip(self, request), name = "grpc_insert_batch", level = "info")]
+    #[instrument(skip(self, request), fields(batch_size = request.get_ref().vectors.len()))]
     async fn insert_batch(
         &self,
         request: Request<InsertBatchRequest>,
@@ -94,7 +94,7 @@ impl Drift for DriftService {
 
         match collection.index.insert_batch(&batch) {
             Ok(_) => {
-                println!(
+                info!(
                     "[METRIC] InsertBatch | Coll: {} | Count: {} | Latency: {:.2?}",
                     collection_name,
                     count,
@@ -149,7 +149,7 @@ impl Drift for DriftService {
             })
             .collect::<Vec<_>>();
 
-        println!(
+        info!(
             "[METRIC] Search | Coll: {} | K: {} | Hits: {} | Latency: {:.2?}",
             collection_name,
             k,
@@ -190,7 +190,7 @@ impl Drift for DriftService {
 
         match collection.index.train(&training_data).await {
             Ok(_) => {
-                println!(
+                info!(
                     "[METRIC] Train | Coll: {} | Samples: {} | Latency: {:.2?}",
                     collection_name,
                     count,

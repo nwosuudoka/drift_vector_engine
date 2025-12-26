@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
+use tracing::{error, info, instrument};
 
 pub struct Janitor {
     index: Arc<VectorIndex>,
@@ -40,9 +41,9 @@ impl Janitor {
             let size = self.index.memtable_len();
             if size >= self.flush_threshold {
                 match self.perform_flush().await {
-                    Ok(Some(p)) => println!("Janitor: Flushed to {:?}", p),
+                    Ok(Some(p)) => info!("Janitor: Flushed to {:?}", p),
                     Ok(None) => {}
-                    Err(e) => eprintln!("Janitor Error: Failed to flush: {}", e),
+                    Err(e) => error!("Janitor Error: Failed to flush: {}", e),
                 }
             }
 
@@ -73,7 +74,7 @@ impl Janitor {
 
             // 1. SPLIT
             if header.count > (target_cap as f32 * 1.5) as u32 {
-                println!(
+                info!(
                     "Janitor: ✂️ Splitting Bucket {} (Count {})",
                     header.id, header.count
                 );
@@ -83,16 +84,16 @@ impl Janitor {
                         ops_budget -= 1;
                     }
                     Ok(MaintenanceStatus::SkippedSingularity) => {
-                        println!("Janitor: Bucket {} is a Singularity. Ignoring.", header.id);
+                        info!("Janitor: Bucket {} is a Singularity. Ignoring.", header.id);
                         self.ignore_set.lock().unwrap().insert(header.id);
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("Split failed: {}", e),
+                    Err(e) => error!("Split failed: {}", e),
                 }
             }
             // 2. MERGE
             else if header.count == 0 {
-                println!(
+                info!(
                     "Janitor: 🚑 Scatter Merging Bucket {} (Count {})",
                     header.id, header.count
                 );
@@ -103,13 +104,16 @@ impl Janitor {
                         ops_budget -= 1;
                     }
                     Ok(_) => {}
-                    Err(e) => eprintln!("Merge failed: {}", e),
+                    Err(e) => error!("Merge failed: {}", e),
                 }
             }
         }
     }
 
+    #[instrument(skip(self), level = "info")]
     async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
+        let start = std::time::Instant::now();
+
         let data = self.index.rotate_memtable()?;
         if data.is_empty() {
             return Ok(None);
@@ -121,12 +125,12 @@ impl Janitor {
         {
             let q_guard = self.index.get_quantizer();
             if q_guard.is_none() {
-                println!(
-                    "Janitor: First flush. Training index on {} samples...",
-                    vectors.len()
-                );
+                info!(count = data.len(), "Starting Index Training"); // Structured log
                 self.index.train(&vectors).await?;
-                // return Ok(None);
+                info!(
+                    duration_ms = start.elapsed().as_millis(),
+                    "Training Complete"
+                );
             }
         }
 
@@ -140,6 +144,12 @@ impl Janitor {
             .persistence
             .flush_memtable_to_segment(&data, &self.index, &run_id)
             .await?;
+
+        info!(
+            vectors = data.len(),
+            duration_ms = start.elapsed().as_millis(),
+            "Flush Complete"
+        );
         Ok(Some(path))
     }
 }

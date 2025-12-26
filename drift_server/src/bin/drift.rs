@@ -3,6 +3,7 @@ use drift_server::drift_proto::{
     InsertRequest, SearchRequest, TrainRequest, Vector, drift_client::DriftClient,
 };
 use serde_json::from_str;
+use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "drift")]
@@ -100,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             let response = client.train(req).await?;
-            println!("Train Response: {:?}", response.into_inner());
+            info!("Train Response: {:?}", response.into_inner());
         }
         Commands::Insert {
             collection,
@@ -116,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             let response = client.insert(req).await?;
-            println!("Insert Response: {:?}", response.into_inner());
+            info!("Insert Response: {:?}", response.into_inner());
         }
         Commands::Search {
             collection,
@@ -141,9 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let response = client.search(req).await?;
             let results = response.into_inner().results;
 
-            println!("--- Search Results ({}) ---", results.len());
+            info!("--- Search Results ({}) ---", results.len());
             for (i, res) in results.iter().enumerate() {
-                println!("#{}: ID={}, Score={:.4}", i + 1, res.id, res.score);
+                info!("#{}: ID={}, Score={:.4}", i + 1, res.id, res.score);
             }
         }
     }
