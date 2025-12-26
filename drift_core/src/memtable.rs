@@ -68,7 +68,7 @@ impl MemTable {
             .read()
             .search(query, k + tombstones.len(), ef_search) // Ask for more to account for filtering
             .into_iter()
-            .map(|n| (n.d_id as u64, n.distance))
+            .map(|n| (n.d_id as u64, n.distance * n.distance))
             .filter(|(id, _)| !tombstones.contains(id)) // Filter
             .take(k)
             .collect()

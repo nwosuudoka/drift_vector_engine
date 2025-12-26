@@ -1,19 +1,28 @@
+use clap::Parser;
+use drift_server::config::Config;
+use drift_server::drift_proto::drift_server::DriftServer;
 use drift_server::manager::CollectionManager;
+use drift_server::server::DriftService;
 use std::sync::Arc;
 use tonic::transport::Server;
 
-use drift_server::server::DriftService;
-use drift_server::drift_proto::drift_server::DriftServer;
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "127.0.0.1:50051".parse()?;
+    let config = Config::parse();
+
+    println!("🚀 Starting Drift Server with Config: {:?}", config);
+    let addr = format!("0.0.0.0:{}", config.port).parse()?;
 
     println!("Initializing Drift Manager...");
-    let data_dir = std::path::Path::new("./data");
+    // let data_dir = std::path::Path::new("./data");
 
-    // Initialize Manager (Handles directories and lazy loading)
-    let manager = Arc::new(CollectionManager::new(data_dir));
+    let path_str = if config.storage_uri.starts_with("file://") {
+        config.storage_uri.strip_prefix("file://").unwrap()
+    } else {
+        "./data" // Fallback for now if S3 is passed but manager expects Path
+    };
+
+    let manager = Arc::new(CollectionManager::new(path_str));
 
     let service = DriftService { manager };
 

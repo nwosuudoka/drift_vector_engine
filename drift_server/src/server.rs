@@ -92,7 +92,7 @@ impl Drift for DriftService {
             .into_iter()
             .map(|r| SearchResult {
                 id: r.id,
-                score: r.distance,
+                score: r.distance.sqrt(),
             })
             .collect();
 

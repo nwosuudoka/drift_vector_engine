@@ -1,3 +1,4 @@
+pub mod config;
 pub mod janitor;
 pub mod manager;
 pub mod persistence;
