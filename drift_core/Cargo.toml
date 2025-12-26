@@ -33,3 +33,4 @@ drift_cache = { path = "../drift_cache" }
 drift_traits = { path = "../drift_traits" }
 zerocopy = "0.8.31"
 async-trait = "0.1.89"
+tracing = "0.1"

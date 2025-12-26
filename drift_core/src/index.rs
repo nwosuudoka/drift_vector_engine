@@ -14,6 +14,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use tracing::instrument;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MaintenanceStatus {
@@ -262,34 +263,120 @@ impl VectorIndex {
         Ok(())
     }
 
+    // pub fn insert(&self, id: u64, vector: &[f32]) -> io::Result<()> {
+    //     {
+    //         let mut wal = self.wal.lock();
+    //         wal.write_insert(id, vector)?;
+    //         wal.flush()?;
+    //     }
+    //     let guard = epoch::pin();
+    //     let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+    //     memtable.insert(id, vector);
+
+    //     self.deleted_ids.write().remove(&id);
+    //     Ok(())
+    // }
+
+    // #[instrument(skip(self, vectors), level = "info")]
+    // pub fn insert_batch(&self, vectors: &[(u64, Vec<f32>)]) -> io::Result<()> {
+    //     // 1. Lock WAL ONCE
+    //     {
+    //         let mut wal = self.wal.lock();
+    //         for (id, vec) in vectors {
+    //             wal.write_insert(*id, vec)?;
+    //         }
+    //         wal.flush()?;
+    //     }
+
+    //     // 2. Insert into MemTable (Concurrent)
+    //     let guard = epoch::pin();
+    //     let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+    //     // HNSW insert is thread-safe, but here we do it sequentially to keep batch logic simple.
+    //     // For higher perf, we could use rayon here, but HNSW contention might limit gains.
+    //     for (id, vec) in vectors {
+    //         memtable.insert(*id, vec);
+    //         self.deleted_ids.write().remove(id);
+    //     }
+
+    //     Ok(())
+    // }
+
+    // pub fn delete(&self, id: u64) -> io::Result<()> {
+    //     {
+    //         let mut wal = self.wal.lock();
+    //         wal.write_delete(id)?;
+    //         wal.flush()?;
+    //     }
+    //     let guard = epoch::pin();
+    //     let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+    //     memtable.delete(id);
+
+    //     self.deleted_ids.write().insert(id);
+    //     let _ = self.kv.remove(&id.to_le_bytes());
+    //     Ok(())
+    // }
+
+    // drift_core/src/index.rs
+
     pub fn insert(&self, id: u64, vector: &[f32]) -> io::Result<()> {
-        {
-            let mut wal = self.wal.lock();
-            wal.write_insert(id, vector)?;
-            wal.flush()?;
-        }
+        // 1. Acquire Lock (Keeps sync with Rotate)
+        let mut wal = self.wal.lock();
+
+        // 2. Write to WAL (Buffered)
+        wal.write_insert(id, vector)?;
+        // PERF FIX: Removed wal.flush() to prevent fsync bottleneck
+
+        // 3. Insert into Memory (Safe from rotation race)
         let guard = epoch::pin();
         let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
         memtable.insert(id, vector);
 
         self.deleted_ids.write().remove(&id);
+
+        Ok(())
+    }
+
+    pub fn insert_batch(&self, vectors: &[(u64, Vec<f32>)]) -> io::Result<()> {
+        // 1. Acquire Lock
+        let mut wal = self.wal.lock();
+
+        // 2. Write Batch
+        for (id, vec) in vectors {
+            wal.write_insert(*id, vec)?;
+        }
+        // PERF FIX: Removed wal.flush()
+
+        // 3. Insert Batch
+        let guard = epoch::pin();
+        let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+        for (id, vec) in vectors {
+            memtable.insert(*id, vec);
+            self.deleted_ids.write().remove(id);
+        }
+
         Ok(())
     }
 
     pub fn delete(&self, id: u64) -> io::Result<()> {
-        {
-            let mut wal = self.wal.lock();
-            wal.write_delete(id)?;
-            wal.flush()?;
-        }
+        // 1. Acquire Lock
+        let mut wal = self.wal.lock();
+
+        // 2. Write WAL
+        wal.write_delete(id)?;
+        wal.flush()?;
+
+        // 3. Update Memory
         let guard = epoch::pin();
         let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
         memtable.delete(id);
 
         self.deleted_ids.write().insert(id);
         let _ = self.kv.remove(&id.to_le_bytes());
+
         Ok(())
-    }
+    } // Lock released here
 
     pub async fn search_async(
         &self,
@@ -952,11 +1039,34 @@ impl VectorIndex {
         memtable.len()
     }
 
+    // pub fn rotate_memtable(&self) -> io::Result<Vec<(u64, Vec<f32>)>> {
+    //     let mut wal = self.wal.lock();
+    //     let guard = epoch::pin();
+    //     let current_memtable_ref =
+    //         unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+    //     let data = current_memtable_ref.extract_all();
+
+    //     let new_memtable = Arc::new(MemTable::new(
+    //         self.config.max_bucket_capacity * 10,
+    //         self.config.dim,
+    //         self.config.ef_construction,
+    //         16,
+    //     ));
+    //     self.memtable
+    //         .store(Owned::new(new_memtable), Ordering::Release);
+    //     wal.truncate()?;
+    //     Ok(data)
+    // }
+
     pub fn rotate_memtable(&self) -> io::Result<Vec<(u64, Vec<f32>)>> {
+        // 1. Acquire Lock (Blocks any active inserts)
         let mut wal = self.wal.lock();
+
         let guard = epoch::pin();
         let current_memtable_ref =
             unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+        // 2. Extract Data (Safe because no inserts are happening due to WAL lock)
         let data = current_memtable_ref.extract_all();
 
         let new_memtable = Arc::new(MemTable::new(
@@ -965,11 +1075,16 @@ impl VectorIndex {
             self.config.ef_construction,
             16,
         ));
+
+        // 3. Swap Pointers
         self.memtable
             .store(Owned::new(new_memtable), Ordering::Release);
+
+        // 4. Truncate WAL
         wal.truncate()?;
+
         Ok(data)
-    }
+    } // Lock released here. New inserts will pick up the new MemTable.
 
     pub fn get_quantizer(&self) -> Option<Arc<Quantizer>> {
         self.quantizer.read().clone()

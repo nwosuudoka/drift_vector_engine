@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::config::Config;
     use crate::drift_proto::{
         InsertRequest, SearchRequest, TrainRequest, Vector, drift_server::Drift,
     };
@@ -9,10 +10,24 @@ mod tests {
     use tempfile::tempdir;
     use tonic::Request;
 
+    fn default_test_config(path: &std::path::Path) -> Config {
+        Config {
+            port: 50051,
+            storage_uri: format!("file://{}", path.join("storage").to_string_lossy()),
+            wal_dir: path.join("wal"),
+            default_dim: 128,
+            max_bucket_capacity: 1000,
+            ef_construction: 50,
+            ef_search: 50,
+        }
+    }
+
     #[tokio::test]
     async fn test_server_full_lifecycle() {
         let dir = tempdir().unwrap();
-        let manager = Arc::new(CollectionManager::new(dir.path()));
+        let config = default_test_config(dir.path());
+
+        let manager = Arc::new(CollectionManager::new(config.clone()));
         let service = DriftService { manager };
         let collection = "lifecycle_test";
         let dim = 128; // Must match Manager default

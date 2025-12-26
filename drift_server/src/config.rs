@@ -23,4 +23,12 @@ pub struct Config {
     /// Max vectors per memory bucket before flush
     #[arg(long, env = "DRIFT_MAX_BUCKET_CAPACITY", default_value_t = 1000)]
     pub max_bucket_capacity: usize,
+
+    /// HNSW Construction Depth (Higher = Better Graph, Slower Insert)
+    #[arg(long, env = "DRIFT_EF_CONSTRUCTION", default_value_t = 128)]
+    pub ef_construction: usize,
+
+    /// HNSW Search Depth (Higher = Better Recall, Slower Search)
+    #[arg(long, env = "DRIFT_EF_SEARCH", default_value_t = 50)]
+    pub ef_search: usize,
 }

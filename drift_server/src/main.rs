@@ -5,30 +5,41 @@ use drift_server::manager::CollectionManager;
 use drift_server::server::DriftService;
 use std::sync::Arc;
 use tonic::transport::Server;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (chrome_layer, _guard) = tracing_chrome::ChromeLayerBuilder::new().build();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(chrome_layer)
+        .init();
+
     let config = Config::parse();
-    println!("🚀 Starting Drift Server...");
-    println!("   Port: {}", config.port);
-    println!("   Storage: {}", config.storage_uri);
-    println!("   WAL Dir: {:?}", config.wal_dir);
+
+    // Banner
+    println!("========================================");
+    println!("   🚀 DRIFT VECTOR ENGINE v0.5.4");
+    println!("========================================");
+    println!("Config Loaded:");
+    println!("  • Port:            {}", config.port);
+    println!("  • Storage URI:     {}", config.storage_uri);
+    println!("  • WAL Path:        {:?}", config.wal_dir);
+    println!("  • Default Dim:     {}", config.default_dim);
+    println!("  • Max Bucket Cap:  {}", config.max_bucket_capacity);
+    println!("  • HNSW Ef_Const:   {}", config.ef_construction);
+    println!("  • HNSW Ef_Search:  {}", config.ef_search);
+    println!("----------------------------------------");
+
     let addr = format!("0.0.0.0:{}", config.port).parse()?;
 
-    println!("Initializing Drift Manager...");
-    // let data_dir = std::path::Path::new("./data");
-
-    let path_str = if config.storage_uri.starts_with("file://") {
-        config.storage_uri.strip_prefix("file://").unwrap()
-    } else {
-        "./data" // Fallback for now if S3 is passed but manager expects Path
-    };
-
-    let manager = Arc::new(CollectionManager::new(path_str));
+    // 2. Initialize Manager (Inject Config)
+    let manager = Arc::new(CollectionManager::new(config));
 
     let service = DriftService { manager };
 
-    println!("Drift Multi-Tenant Server listening on {}", addr);
+    println!("✅ Server ready and listening on {}", addr);
+
     Server::builder()
         .add_service(DriftServer::new(service))
         .serve(addr)

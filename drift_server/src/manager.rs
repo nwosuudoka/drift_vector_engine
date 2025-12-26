@@ -1,9 +1,9 @@
+use crate::config::Config;
 use crate::janitor::Janitor;
 use crate::persistence::PersistenceManager;
 use drift_core::index::{IndexOptions, VectorIndex};
 use drift_storage::disk_manager::DriftPageManager; // Updated import
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -14,90 +14,95 @@ pub struct Collection {
 }
 
 pub struct CollectionManager {
-    base_path: PathBuf,
+    // base_path: PathBuf,
+    config: Config,
     collections: RwLock<HashMap<String, Arc<Collection>>>,
 }
 
 impl CollectionManager {
-    pub fn new(base_path: impl Into<PathBuf>) -> Self {
-        let path = base_path.into();
-        std::fs::create_dir_all(&path).expect("Failed to create data root");
+    pub fn new(config: Config) -> Self {
+        // let path = base_path.into();
+        // std::fs::create_dir_all(&path).expect("Failed to create data root");
+        std::fs::create_dir_all(&config.wal_dir).expect("Failed to create WAL root");
 
         Self {
-            base_path: path,
+            config,
             collections: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Retrieves or creates a collection.
-    /// `dim_hint` is required if creating a NEW collection.
     pub async fn get_or_create(
         &self,
         name: &str,
         dim_hint: Option<usize>,
     ) -> std::io::Result<Arc<Collection>> {
-        // 1. Fast Path (Read Lock)
+        // 1. Fast Path
         {
             let map = self.collections.read().await;
             if let Some(coll) = map.get(name) {
-                // Safety Check: If hint provided, ensure it matches
-                if let Some(d) = dim_hint {
-                    if coll.index.config.dim != d {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!(
-                                "Dimension Mismatch: Collection has {}, requested {}",
-                                coll.index.config.dim, d
-                            ),
-                        ));
-                    }
+                if let Some(d) = dim_hint
+                    && coll.index.config.dim != d
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Dimension mismatch: Existing={}, Requested={}",
+                            coll.index.config.dim, d
+                        ),
+                    ));
                 }
                 return Ok(coll.clone());
             }
         }
 
-        // 2. Slow Path (Write Lock)
+        // 2. Slow Path
         let mut map = self.collections.write().await;
         if let Some(coll) = map.get(name) {
             return Ok(coll.clone());
         }
 
-        println!("Manager: Loading/Creating collection '{}'...", name);
+        println!("Manager: Initializing collection '{}'", name);
 
-        // Setup Paths
-        let coll_dir = self.base_path.join(name);
-        std::fs::create_dir_all(&coll_dir)?;
+        // A. Resolve WAL Path (Local)
+        // WALs are always local for speed/durability guarantees
+        let coll_wal_dir = self.config.wal_dir.join(name);
+        std::fs::create_dir_all(&coll_wal_dir)?;
+        let wal_path = coll_wal_dir.join("current.wal");
 
-        let wal_path = coll_dir.join("current.wal");
+        // B. Resolve Storage URI (Cloud/Local)
+        // If config is "s3://bucket/data", collection is "s3://bucket/data/{name}"
+        // If config is "file:///data", collection is "file:///data/{name}"
+        let storage_uri = if self.config.storage_uri.ends_with('/') {
+            format!("{}{}", self.config.storage_uri, name)
+        } else {
+            format!("{}/{}", self.config.storage_uri, name)
+        };
 
-        let storage_dir = coll_dir.join("storage");
-        std::fs::create_dir_all(&storage_dir)?;
+        // For file://, ensure the directory exists physically
+        if storage_uri.starts_with("file://") {
+            let path_str = storage_uri.strip_prefix("file://").unwrap();
+            std::fs::create_dir_all(path_str)?;
+        }
 
-        let abs_storage_path = std::fs::canonicalize(&storage_dir).unwrap_or(storage_dir);
-        let storage_uri = format!("file://{}", abs_storage_path.to_string_lossy());
-
-        // Open DiskManager via OpenDAL
         let storage = Arc::new(DriftPageManager::new(&storage_uri).await?);
-        let persistence = PersistenceManager::new(&coll_dir);
 
-        // Dynamic Dimension or Default
-        let dim = dim_hint.unwrap_or(128);
+        // Persistence needs the base WAL dir for temp files/recovery logic
+        let persistence = PersistenceManager::new(&coll_wal_dir);
+
+        let dim = dim_hint.unwrap_or(self.config.default_dim);
 
         let options = IndexOptions {
             dim,
-            num_centroids: 16, // In prod, this might scale with data size
+            num_centroids: 16,
             training_sample_size: 1000,
-            max_bucket_capacity: 1000,
-            ef_construction: 50,
-            ef_search: 20,
+            max_bucket_capacity: self.config.max_bucket_capacity, // Use Config
+            ef_construction: self.config.ef_construction,
+            ef_search: self.config.ef_search,
         };
 
-        // Initialize Index
         let index = Arc::new(VectorIndex::new(options, &wal_path, storage)?);
 
-        // Hydrate from Disk (Loads existing segments)
-        // Note: If we are recovering, we might want to check the loaded segments to confirm 'dim'
-        // matches, but VectorIndex handles safety internally usually.
+        // Hydrate
         persistence.hydrate_index(&index).await?;
 
         // Start Janitor
@@ -114,7 +119,10 @@ impl CollectionManager {
         });
 
         map.insert(name.to_string(), collection.clone());
-        println!("Manager: Collection '{}' (dim: {}) ready.", name, dim);
+        println!(
+            "Manager: Collection '{}' ready (dim: {}, uri: {})",
+            name, dim, storage_uri
+        );
 
         Ok(collection)
     }

@@ -126,7 +126,7 @@ impl Janitor {
                     vectors.len()
                 );
                 self.index.train(&vectors).await?;
-                return Ok(None);
+                // return Ok(None);
             }
         }
 
