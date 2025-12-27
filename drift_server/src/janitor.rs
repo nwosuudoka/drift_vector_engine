@@ -110,22 +110,37 @@ impl Janitor {
         }
     }
 
+    // In drift_server/src/janitor.rs
     #[instrument(skip(self), level = "info")]
     async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
         let start = std::time::Instant::now();
 
-        let data = self.index.rotate_memtable()?;
+        // 1. Rotate & Freeze (Non-Blocking)
+        // This is fast. It just swaps pointers.
+        let memtable_arc = match self.index.rotate_and_freeze()? {
+            Some(m) => m,
+            None => {
+                // If None, it means the previous flush is still frozen (backpressure).
+                // We simply return and try again next tick.
+                return Ok(None);
+            }
+        };
+
+        let data = memtable_arc.extract_all();
         if data.is_empty() {
+            // Even if empty, we must confirm flush to unfreeze the slot!
+            self.index.confirm_flush()?;
             return Ok(None);
         }
 
         let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
         let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
 
+        // 2. Train (Heavy CPU)
         {
             let q_guard = self.index.get_quantizer();
             if q_guard.is_none() {
-                info!(count = data.len(), "Starting Index Training"); // Structured log
+                info!(count = data.len(), "Starting Index Training");
                 self.index.train(&vectors).await?;
                 info!(
                     duration_ms = start.elapsed().as_millis(),
@@ -134,6 +149,7 @@ impl Janitor {
             }
         }
 
+        // 3. Persist (Heavy IO)
         let new_id = self.index.allocate_next_bucket_id();
         self.index
             .force_register_bucket_with_ids(new_id, &ids, &vectors)
@@ -144,6 +160,10 @@ impl Janitor {
             .persistence
             .flush_memtable_to_segment(&data, &self.index, &run_id)
             .await?;
+
+        // 4. Confirm Flush (Cleanup)
+        // This clears the frozen slot and truncates the WAL.
+        self.index.confirm_flush()?;
 
         info!(
             vectors = data.len(),

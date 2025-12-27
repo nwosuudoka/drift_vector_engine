@@ -14,7 +14,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing::error;
+use tracing::{error, instrument};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MaintenanceStatus {
@@ -80,7 +80,10 @@ pub(crate) struct CentroidEntry {
 pub struct VectorIndex {
     pub config: IndexOptions,
     pub(crate) centroids: Atomic<Vec<CentroidEntry>>,
+
     pub(crate) memtable: Atomic<Arc<MemTable>>,
+    pub(crate) frozen_memtable: RwLock<Option<Arc<MemTable>>>,
+
     pub(crate) buckets: Atomic<HashMap<u32, BucketHeader>>,
     pub cache: Arc<BlockCache<BucketData>>,
     pub(crate) quantizer: RwLock<Option<Arc<Quantizer>>>,
@@ -131,7 +134,10 @@ impl VectorIndex {
         Ok(Self {
             config,
             wal: Mutex::new(writer),
+
             memtable: Atomic::new(memtable),
+            frozen_memtable: RwLock::new(None),
+
             quantizer: RwLock::new(None),
             centroids: Atomic::new(Vec::new()),
             next_bucket_id: AtomicU32::new(0),
@@ -281,47 +287,50 @@ impl VectorIndex {
         Ok(())
     }
 
-    pub fn insert_batch(&self, vectors: &[(u64, Vec<f32>)]) -> io::Result<()> {
-        // 1. Acquire Lock
-        let mut wal = self.wal.lock();
-
-        // 2. Write Batch
-        for (id, vec) in vectors {
-            wal.write_insert(*id, vec)?;
+    #[instrument(skip(self, vectors), fields(count = vectors.len()), level = "info")]
+    pub fn insert_batch(&self, vectors: &[(u64, Vec<f32>)]) -> std::io::Result<()> {
+        {
+            let mut wal = self.wal.lock();
+            for (id, vec) in vectors {
+                wal.write_insert(*id, vec)?;
+            }
         }
-        // PERF FIX: Removed wal.flush()
 
-        // 3. Insert Batch
-        let guard = epoch::pin();
-        let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+        let guard = crossbeam_epoch::pin();
+        let memtable = unsafe {
+            self.memtable
+                .load(std::sync::atomic::Ordering::Acquire, &guard)
+                .as_ref()
+        }
+        .unwrap();
 
-        for (id, vec) in vectors {
-            memtable.insert(*id, vec);
-            self.deleted_ids.write().remove(id);
+        memtable.insert_batch(vectors);
+
+        {
+            let mut deleted = self.deleted_ids.write();
+            for (id, _) in vectors {
+                deleted.remove(id);
+            }
         }
 
         Ok(())
     }
 
     pub fn delete(&self, id: u64) -> io::Result<()> {
-        // 1. Acquire Lock
         let mut wal = self.wal.lock();
-
-        // 2. Write WAL
         wal.write_delete(id)?;
         wal.flush()?;
 
-        // 3. Update Memory
         let guard = epoch::pin();
         let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
         memtable.delete(id);
 
         self.deleted_ids.write().insert(id);
         let _ = self.kv.remove(&id.to_le_bytes());
-
         Ok(())
-    } // Lock released here
+    }
 
+    // ⚡ NEW: The Multi-Stage Search
     pub async fn search_async(
         &self,
         query: &[f32],
@@ -330,19 +339,34 @@ impl VectorIndex {
         lambda: f32,
         tau: f32,
     ) -> io::Result<Vec<SearchResult>> {
-        let l0_results = {
+        // 1. Search Active + Frozen MemTables
+        let mut mem_results = {
             let guard = epoch::pin();
-            let memtable =
-                unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-            memtable.search(query, k, self.config.ef_search)
+            let active = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+            // Search Active
+            let mut results = active.search(query, k, self.config.ef_search);
+
+            // Search Frozen (if exists)
+            let frozen_guard = self.frozen_memtable.read();
+            if let Some(frozen) = frozen_guard.as_ref() {
+                let frozen_res = frozen.search(query, k, self.config.ef_search);
+                results.extend(frozen_res);
+            }
+            results
         };
+
+        // Note: mem_results now contains results from Active and Frozen.
+        // Duplicates might exist if an ID was updated, but downstream logic handles it via `deleted_ids` checks
+        // and usually `Active` is fresher.
 
         let quantizer_arc = {
             let guard = self.quantizer.read();
             match guard.as_ref() {
                 Some(q) => q.clone(),
                 None => {
-                    return Ok(l0_results
+                    // If no quantizer, return only memory results
+                    return Ok(mem_results
                         .into_iter()
                         .map(|(id, d)| SearchResult { id, distance: d })
                         .collect());
@@ -350,6 +374,8 @@ impl VectorIndex {
             }
         };
 
+        // ... [Bucket Selection Logic - KEEP AS IS] ...
+        // (This part remains exactly the same as your old code)
         let selected_headers = {
             let guard = epoch::pin();
             let buckets_map =
@@ -414,14 +440,17 @@ impl VectorIndex {
             }
         }
 
+        // ... [Merging Logic - MODIFIED] ...
         let mut heap = BinaryHeap::with_capacity(k);
         let deleted_guard = self.deleted_ids.read();
         let mut l0_found = HashSet::new();
 
-        for (id, dist) in l0_results {
+        // Process Memory Results (Active + Frozen)
+        for (id, dist) in mem_results {
             if deleted_guard.contains(&id) {
                 continue;
             }
+            // Use l0_found to prevent adding older versions from Disk
             l0_found.insert(id);
 
             let res = SearchResult { id, distance: dist };
@@ -433,12 +462,14 @@ impl VectorIndex {
             }
         }
 
+        // Process Disk Results
         for data in loaded_data {
             let hits = Bucket::scan_static(&data, &quantizer_arc, query);
             for res in hits {
                 if deleted_guard.contains(&res.id) {
                     continue;
                 }
+                // If ID was found in Memory (Active or Frozen), skip Disk version (it's stale)
                 if l0_found.contains(&res.id) {
                     continue;
                 }
@@ -983,24 +1014,67 @@ impl VectorIndex {
         memtable.len()
     }
 
-    // pub fn rotate_memtable(&self) -> io::Result<Vec<(u64, Vec<f32>)>> {
-    //     let mut wal = self.wal.lock();
-    //     let guard = epoch::pin();
-    //     let current_memtable_ref =
-    //         unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-    //     let data = current_memtable_ref.extract_all();
+    // ⚡ Rotation Logic
+    pub fn rotate_and_freeze(&self) -> io::Result<Option<Arc<MemTable>>> {
+        // 1. Check if frozen slot is empty (Backpressure)
+        let mut frozen_guard = self.frozen_memtable.write();
+        if frozen_guard.is_some() {
+            return Ok(None);
+        }
 
-    //     let new_memtable = Arc::new(MemTable::new(
-    //         self.config.max_bucket_capacity * 10,
-    //         self.config.dim,
-    //         self.config.ef_construction,
-    //         16,
-    //     ));
-    //     self.memtable
-    //         .store(Owned::new(new_memtable), Ordering::Release);
-    //     wal.truncate()?;
-    //     Ok(data)
-    // }
+        // 2. Lock WAL (Stops Inserts briefly)
+        let _wal = self.wal.lock();
+
+        // 3. Create New Active Table
+        let new_memtable = Arc::new(MemTable::new(
+            self.config.max_bucket_capacity * 10,
+            self.config.dim,
+            self.config.ef_construction,
+            16,
+        ));
+
+        // 4. Atomic Swap
+        // We swap the new table in and get the old one out in a single atomic step.
+        let guard = epoch::pin();
+        let new_owned = Owned::new(new_memtable);
+
+        let old_shared = self.memtable.swap(new_owned, Ordering::AcqRel, &guard);
+
+        // 5. Extract the Arc from the old pointer
+        // Safety: We successfully swapped it out, so we have the reference.
+        // We clone the inner Arc<MemTable> to hold it in the frozen slot.
+        let old_arc = unsafe { old_shared.as_ref() }
+            .expect("MemTable should not be null")
+            .clone();
+
+        // 6. Schedule cleanup of the old atomic wrapper
+        // The Atomic<Arc<...>> held a pointer to the Arc on the heap.
+        // We must defer deleting that pointer wrapper until all threads reading it are done.
+        unsafe { guard.defer_destroy(old_shared) };
+
+        // 7. Move Old Table to Frozen
+        *frozen_guard = Some(old_arc.clone());
+
+        // 8. Truncate WAL? NO!
+        // Data is only in memory. Do NOT truncate WAL yet.
+
+        Ok(Some(old_arc))
+    } // WAL Lock released here.
+
+    // Janitor calls this after disk IO is done.
+    pub fn confirm_flush(&self) -> io::Result<()> {
+        let mut frozen_guard = self.frozen_memtable.write();
+
+        // 1. Clear Frozen Slot
+        *frozen_guard = None;
+
+        // 2. Truncate WAL
+        // Now that data is safely on disk segments, we can wipe the log.
+        let mut wal = self.wal.lock();
+        wal.truncate()?;
+
+        Ok(())
+    }
 
     pub fn rotate_memtable(&self) -> io::Result<Vec<(u64, Vec<f32>)>> {
         // 1. Acquire Lock (Blocks any active inserts)

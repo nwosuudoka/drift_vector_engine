@@ -14,7 +14,7 @@ mod manager_tests; // Add this line
 mod server_tests;
 
 #[cfg(test)]
-#[cfg(feature = "heavy-tests")]
+#[cfg(feature = "stress-test")]
 mod server_heavy_load_test;
 
 // Export the generated protobuf code so binaries (client) can use it
