@@ -198,7 +198,7 @@ mod pretrained_tests {
             storage_uri: format!("file://{}", dir.path().join("storage").to_string_lossy()),
             wal_dir: dir.path().join("wal"),
             default_dim: DIM,
-            max_bucket_capacity: 110_000, // Trigger flushes often
+            max_bucket_capacity: 2_000, // Trigger flushes often
             ef_construction: 80,
             ef_search: 200,
         };

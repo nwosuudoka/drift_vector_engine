@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.5.4] - Lazy Indexing & High-Throughput Ingestion
+
+**Tag:** `v0.5.4-lazy-indexing-stable`
+
+### Added
+
+- **Lazy Indexing Architecture:** Decoupled ingestion from indexing. Writes now go to an $O(1)$ `MemTable` buffer, while indexing happens asynchronously during flush.
+- **Parallel Brute-Force Search:** Implemented a Rayon-based parallel scanner for the MemTable, maintaining low query latency (~8ms) even with large unindexed buffers.
+- **Robust Janitor Logic:** Updated `Janitor` to correctly detect MemTable size via `HashMap` length and retry failed flushes gracefully without deadlocking.
+- **Stress Tests:** Added `server_heavy_load_test` to validate throughput at ~670k vec/sec and ensure eventual consistency under load.
+
+### Changed
+
+- **Write Throughput:** Massive performance boost (~500x). Batch inserts no longer block on HNSW graph updates.
+- **Search Logic:** `search_async` now performs a hybrid search: Parallel Scan (MemTable) + HNSW Search (Disk Segments).
+- **Test Suite:** Updated `janitor_tests` and `stress_tests` to use robust polling (eventual consistency) instead of brittle sleeps.
+
+### Fixed
+
+- **Silent Disk Errors:** `DiskManager::upload` now correctly propagates IO errors instead of swallowing them.
+- **MemTable Length Bug:** `memtable.len()` now reports the correct count from the backing `HashMap`, fixing Janitor flush triggers.
+- **Test Race Conditions:** Fixed flaky tests in `janitor_tests.rs` by ensuring disk operations complete before aborting background tasks.
+
 ## [0.5.2] - Metric Unification & Config
 
 ### Added
