@@ -146,19 +146,6 @@ impl MemTable {
         data.remove(&id);
     }
 
-    // Update search to filter results
-    // pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
-    //     let tombstones = self.tombstones.read();
-    //     self.hnsw
-    //         .read()
-    //         .search(query, k + tombstones.len(), ef_search) // Ask for more to account for filtering
-    //         .into_iter()
-    //         .map(|n| (n.d_id as u64, n.distance * n.distance))
-    //         .filter(|(id, _)| !tombstones.contains(id)) // Filter
-    //         .take(k)
-    //         .collect()
-    // }
-
     /// Brute Force Scan (O(N))
     /// Optimized for throughput on 10k-100k items.
     pub fn search(&self, query: &[f32], k: usize, _ef_search: usize) -> Vec<(u64, f32)> {
