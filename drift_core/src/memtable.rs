@@ -2,9 +2,10 @@
 
 use hnsw_rs::prelude::*;
 use parking_lot::RwLock;
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use tracing::{Level, instrument, span};
+use tracing::{Level, span};
 
 /// Wrapper to allow f32 in BinaryHeap (Max-Heap)
 #[derive(Debug, PartialEq)]
@@ -148,45 +149,104 @@ impl MemTable {
 
     /// Brute Force Scan (O(N))
     /// Optimized for throughput on 10k-100k items.
+    // pub fn search(&self, query: &[f32], k: usize, _ef_search: usize) -> Vec<(u64, f32)> {
+    //     let tombstones = self.tombstones.read();
+    //     let data = self.data.read();
+
+    //     // MaxHeap to maintain the K smallest distances.
+    //     // We push items in. If heap > K, we pop the MAX element.
+    //     let mut heap = BinaryHeap::with_capacity(k + 1);
+
+    //     for (id, vector) in data.iter() {
+    //         if tombstones.contains(id) {
+    //             continue;
+    //         }
+
+    //         // SIMD-friendly L2 Squared calculation
+    //         let dist_sq: f32 = l2_sq_simd_friendly(query, vector);
+
+    //         let item = HeapItem {
+    //             distance: OrderedFloat(dist_sq),
+    //             id: *id,
+    //         };
+
+    //         if heap.len() < k {
+    //             heap.push(item);
+    //         } else if item.distance < heap.peek().unwrap().distance {
+    //             // New item is smaller than the largest in the heap
+    //             heap.pop();
+    //             heap.push(item);
+    //         }
+    //     }
+
+    //     // Convert Heap to sorted Vector
+    //     let mut result: Vec<(u64, f32)> = heap
+    //         .into_iter()
+    //         .map(|item| (item.id, item.distance.0))
+    //         .collect();
+
+    //     // Heap iteration is arbitrary, so we must sort finally
+    //     result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+    //     result
+    // }
+
     pub fn search(&self, query: &[f32], k: usize, _ef_search: usize) -> Vec<(u64, f32)> {
         let tombstones = self.tombstones.read();
         let data = self.data.read();
 
-        // MaxHeap to maintain the K smallest distances.
-        // We push items in. If heap > K, we pop the MAX element.
-        let mut heap = BinaryHeap::with_capacity(k + 1);
+        // Snapshot tombstones to a thread-safe structure if needed,
+        // but since we hold the read lock on `data`, and `tombstones` logic is coupled,
+        // we just read the local reference. Rayon handles the scope.
 
-        for (id, vector) in data.iter() {
-            if tombstones.contains(id) {
-                continue;
-            }
+        let final_heap = data
+            .par_iter() // 1. Iterate in Parallel
+            .fold(
+                || BinaryHeap::with_capacity(k + 1), // 2. Init Local Heap
+                |mut heap, (id, vector)| {
+                    // Filter tombstone
+                    if tombstones.contains(id) {
+                        return heap;
+                    }
 
-            // SIMD-friendly L2 Squared calculation
-            let dist_sq: f32 = l2_sq_simd_friendly(query, vector);
+                    let dist_sq = l2_sq_simd_friendly(query, vector);
+                    let item = HeapItem {
+                        distance: OrderedFloat(dist_sq),
+                        id: *id,
+                    };
 
-            let item = HeapItem {
-                distance: OrderedFloat(dist_sq),
-                id: *id,
-            };
+                    // Maintain Top-K
+                    if heap.len() < k {
+                        heap.push(item);
+                    } else if item.distance < heap.peek().unwrap().distance {
+                        heap.pop();
+                        heap.push(item);
+                    }
+                    heap
+                },
+            )
+            .reduce(
+                || BinaryHeap::with_capacity(k), // 3. Reduce (Merge Heaps)
+                |mut a, b| {
+                    for item in b {
+                        if a.len() < k {
+                            a.push(item);
+                        } else if item.distance < a.peek().unwrap().distance {
+                            a.pop();
+                            a.push(item);
+                        }
+                    }
+                    a
+                },
+            );
 
-            if heap.len() < k {
-                heap.push(item);
-            } else if item.distance < heap.peek().unwrap().distance {
-                // New item is smaller than the largest in the heap
-                heap.pop();
-                heap.push(item);
-            }
-        }
-
-        // Convert Heap to sorted Vector
-        let mut result: Vec<(u64, f32)> = heap
+        // 4. Final Sort
+        let mut result: Vec<(u64, f32)> = final_heap
             .into_iter()
             .map(|item| (item.id, item.distance.0))
             .collect();
 
-        // Heap iteration is arbitrary, so we must sort finally
         result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
         result
     }
 
