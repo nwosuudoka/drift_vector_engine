@@ -11,7 +11,6 @@ pub struct Janitor {
     persistence: PersistenceManager,
     flush_threshold: usize,
     check_interval: Duration,
-    // Track buckets that are "Unsplittable" to prevent infinite loops
     ignore_set: std::sync::Mutex<HashSet<u32>>,
 }
 
@@ -33,21 +32,23 @@ impl Janitor {
 
     pub async fn run(&self) {
         let mut interval = time::interval(self.check_interval);
-
         loop {
             interval.tick().await;
 
-            // 1. Flush (Priority High)
-            let size = self.index.memtable_len();
-            if size >= self.flush_threshold {
+            // 1. Flush Logic
+            // Check if we need to flush (Threshold met OR pending frozen work from a failed retry)
+            let mem_size = self.index.memtable_len();
+            let has_frozen = self.index.frozen_memtable.read().is_some();
+
+            if mem_size >= self.flush_threshold || has_frozen {
                 match self.perform_flush().await {
                     Ok(Some(p)) => info!("Janitor: Flushed to {:?}", p),
-                    Ok(None) => {}
+                    Ok(None) => {} // No work needed
                     Err(e) => error!("Janitor Error: Failed to flush: {}", e),
                 }
             }
 
-            // 2. Maintenance (Priority Low)
+            // 2. Maintenance
             self.perform_maintenance().await;
         }
     }
@@ -55,16 +56,12 @@ impl Janitor {
     async fn perform_maintenance(&self) {
         let buckets = self.index.get_all_bucket_headers();
         let target_cap = self.index.config.max_bucket_capacity as u32;
-
-        // BUDGET: Only do 1 heavy op per tick to prevent starvation
         let mut ops_budget = 1;
 
         for header in buckets {
             if ops_budget == 0 {
                 break;
             }
-
-            // Check Ignore List (Scoped)
             {
                 let guard = self.ignore_set.lock().unwrap();
                 if guard.contains(&header.id) {
@@ -72,17 +69,13 @@ impl Janitor {
                 }
             }
 
-            // 1. SPLIT
             if header.count > (target_cap as f32 * 1.5) as u32 {
                 info!(
                     "Janitor: ✂️ Splitting Bucket {} (Count {})",
                     header.id, header.count
                 );
-
                 match self.index.split_and_steal(header.id).await {
-                    Ok(MaintenanceStatus::Completed) => {
-                        ops_budget -= 1;
-                    }
+                    Ok(MaintenanceStatus::Completed) => ops_budget -= 1,
                     Ok(MaintenanceStatus::SkippedSingularity) => {
                         info!("Janitor: Bucket {} is a Singularity. Ignoring.", header.id);
                         self.ignore_set.lock().unwrap().insert(header.id);
@@ -90,19 +83,14 @@ impl Janitor {
                     Ok(_) => {}
                     Err(e) => error!("Split failed: {}", e),
                 }
-            }
-            // 2. MERGE
-            else if header.count == 0 {
+            } else if header.count == 0 {
                 info!(
                     "Janitor: 🚑 Scatter Merging Bucket {} (Count {})",
                     header.id, header.count
                 );
-                self.ignore_set.lock().unwrap().remove(&header.id); // Cleanup
-
+                self.ignore_set.lock().unwrap().remove(&header.id);
                 match self.index.scatter_merge(header.id).await {
-                    Ok(MaintenanceStatus::Completed) => {
-                        ops_budget -= 1;
-                    }
+                    Ok(MaintenanceStatus::Completed) => ops_budget -= 1,
                     Ok(_) => {}
                     Err(e) => error!("Merge failed: {}", e),
                 }
@@ -110,33 +98,36 @@ impl Janitor {
         }
     }
 
-    // In drift_server/src/janitor.rs
     #[instrument(skip(self), level = "info")]
     async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
         let start = std::time::Instant::now();
 
-        // 1. Rotate & Freeze (Non-Blocking)
-        // This is fast. It just swaps pointers.
-        let memtable_arc = match self.index.rotate_and_freeze()? {
-            Some(m) => m,
-            None => {
-                // If None, it means the previous flush is still frozen (backpressure).
-                // We simply return and try again next tick.
-                return Ok(None);
+        // 1. Get Data (Retry logic)
+        // If a frozen memtable exists (retry scenario), use it.
+        // Otherwise, try to rotate.
+        let memtable_arc = {
+            let frozen = self.index.frozen_memtable.read();
+            if let Some(m) = frozen.as_ref() {
+                m.clone()
+            } else {
+                drop(frozen); // Release lock
+                match self.index.rotate_and_freeze()? {
+                    Some(m) => m,
+                    None => return Ok(None),
+                }
             }
         };
 
         let data = memtable_arc.extract_all();
         if data.is_empty() {
-            // Even if empty, we must confirm flush to unfreeze the slot!
-            self.index.confirm_flush()?;
+            self.index.confirm_flush()?; // Clear empty frozen slot
             return Ok(None);
         }
 
         let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
         let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
 
-        // 2. Train (Heavy CPU)
+        // 2. Train
         {
             let q_guard = self.index.get_quantizer();
             if q_guard.is_none() {
@@ -149,7 +140,7 @@ impl Janitor {
             }
         }
 
-        // 3. Persist (Heavy IO)
+        // 3. Persist
         let new_id = self.index.allocate_next_bucket_id();
         self.index
             .force_register_bucket_with_ids(new_id, &ids, &vectors)
@@ -161,8 +152,8 @@ impl Janitor {
             .flush_memtable_to_segment(&data, &self.index, &run_id)
             .await?;
 
-        // 4. Confirm Flush (Cleanup)
-        // This clears the frozen slot and truncates the WAL.
+        // 4. Cleanup
+        // Only verify flush if persistence succeeded.
         self.index.confirm_flush()?;
 
         info!(

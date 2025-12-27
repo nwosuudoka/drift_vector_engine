@@ -3,7 +3,7 @@
 use hnsw_rs::prelude::*;
 use parking_lot::RwLock;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use tracing::{Level, instrument, span};
 
 /// Wrapper to allow f32 in BinaryHeap (Max-Heap)
@@ -85,11 +85,9 @@ impl MemTable {
         }
     }
 
-    // Inside impl MemTable { ... }
     pub fn insert(&self, id: u64, vector: &[f32]) {
         // 1. Tombstone Logic
         {
-            // "entered()" starts the timer immediately
             let _span = span!(Level::TRACE, "lock_tombstones").entered();
             let mut tombstones = self.tombstones.write();
             if tombstones.contains(&id) {
@@ -97,24 +95,23 @@ impl MemTable {
             }
         }
 
-        // 2. Data Map Insert
+        // 2. Data Map Insert (O(1))
         {
             let _span = span!(Level::TRACE, "lock_data_map").entered();
-            // This measures waiting for the lock + writing the data
             self.data.write().insert(id, vector.to_vec());
         }
 
-        // 3. HNSW Insert (The likely bottleneck)
+        // 3. HNSW Insert -> DISABLED for Lazy Indexing
+        // We skip the expensive graph update.
+        // Indexing will happen in bulk during the background flush.
+        /*
         {
             let _span = span!(Level::INFO, "lock_hnsw_insert").entered();
-            // This is the heavy operation.
-            // If this span takes 1.5ms, it's CPU bound.
-            // If it takes 500ms, it means multiple threads are fighting for this lock.
             self.hnsw.write().insert((vector, id as usize));
         }
+        */
     }
 
-    // 👇 ADD THIS NEW METHOD
     pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) {
         // 1. Lock Tombstones ONCE
         {
@@ -136,35 +133,8 @@ impl MemTable {
             }
         }
 
-        // 3. Lock HNSW ONCE (Critical Optimization)
-
-        {
-            let _span = span!(Level::INFO, "lock_hnsw_batch").entered();
-            let hnsw = self.hnsw.write();
-
-            let capacity = self.capacity; // Get the configured capacity
-            let current_count = hnsw.get_nb_point();
-
-            // ⚡ SAFETY CHECK:
-            // If we are about to exceed capacity, log a warning or panic.
-            if current_count + batch.len() > capacity {
-                tracing::error!(
-                    "CRITICAL: MemTable HNSW capacity exceeded! Cap: {}, Current: {}, Batch: {}",
-                    capacity,
-                    current_count,
-                    batch.len()
-                );
-                // In a real DB, you might trigger an emergency flush here.
-                // For now, let's panic so tests fail loudly instead of silently.
-                if cfg!(test) {
-                    panic!("MemTable Capacity Exceeded");
-                }
-            }
-
-            for (id, vector) in batch {
-                hnsw.insert((vector, *id as usize));
-            }
-        }
+        // 3. HNSW Insert -> DISABLED
+        // Eliminates the O(Batch * log N) bottleneck.
     }
 
     pub fn delete(&self, id: u64) {
@@ -177,20 +147,64 @@ impl MemTable {
     }
 
     // Update search to filter results
-    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
+    // pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
+    //     let tombstones = self.tombstones.read();
+    //     self.hnsw
+    //         .read()
+    //         .search(query, k + tombstones.len(), ef_search) // Ask for more to account for filtering
+    //         .into_iter()
+    //         .map(|n| (n.d_id as u64, n.distance * n.distance))
+    //         .filter(|(id, _)| !tombstones.contains(id)) // Filter
+    //         .take(k)
+    //         .collect()
+    // }
+
+    /// Brute Force Scan (O(N))
+    /// Optimized for throughput on 10k-100k items.
+    pub fn search(&self, query: &[f32], k: usize, _ef_search: usize) -> Vec<(u64, f32)> {
         let tombstones = self.tombstones.read();
-        self.hnsw
-            .read()
-            .search(query, k + tombstones.len(), ef_search) // Ask for more to account for filtering
+        let data = self.data.read();
+
+        // MaxHeap to maintain the K smallest distances.
+        // We push items in. If heap > K, we pop the MAX element.
+        let mut heap = BinaryHeap::with_capacity(k + 1);
+
+        for (id, vector) in data.iter() {
+            if tombstones.contains(id) {
+                continue;
+            }
+
+            // SIMD-friendly L2 Squared calculation
+            let dist_sq: f32 = l2_sq_simd_friendly(query, vector);
+
+            let item = HeapItem {
+                distance: OrderedFloat(dist_sq),
+                id: *id,
+            };
+
+            if heap.len() < k {
+                heap.push(item);
+            } else if item.distance < heap.peek().unwrap().distance {
+                // New item is smaller than the largest in the heap
+                heap.pop();
+                heap.push(item);
+            }
+        }
+
+        // Convert Heap to sorted Vector
+        let mut result: Vec<(u64, f32)> = heap
             .into_iter()
-            .map(|n| (n.d_id as u64, n.distance * n.distance))
-            .filter(|(id, _)| !tombstones.contains(id)) // Filter
-            .take(k)
-            .collect()
+            .map(|item| (item.id, item.distance.0))
+            .collect();
+
+        // Heap iteration is arbitrary, so we must sort finally
+        result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+        result
     }
 
     pub fn len(&self) -> usize {
-        self.hnsw.read().get_nb_point()
+        self.data.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -206,4 +220,21 @@ impl MemTable {
             .map(|(k, v)| (*k, v.clone()))
             .collect()
     }
+}
+
+/// Explicit loop structure to encourage auto-vectorization.
+/// Modern compilers (LLVM) vectorize this better than zip().map().sum() in some debug profiles.
+#[inline(always)]
+fn l2_sq_simd_friendly(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0;
+    let n = a.len();
+    // Hint to compiler about slice length equality to remove bounds checks inside loop
+    let a = &a[..n];
+    let b = &b[..n];
+
+    for i in 0..n {
+        let diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    sum
 }

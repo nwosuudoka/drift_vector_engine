@@ -82,7 +82,7 @@ pub struct VectorIndex {
     pub(crate) centroids: Atomic<Vec<CentroidEntry>>,
 
     pub(crate) memtable: Atomic<Arc<MemTable>>,
-    pub(crate) frozen_memtable: RwLock<Option<Arc<MemTable>>>,
+    pub frozen_memtable: RwLock<Option<Arc<MemTable>>>,
 
     pub(crate) buckets: Atomic<HashMap<u32, BucketHeader>>,
     pub cache: Arc<BlockCache<BucketData>>,

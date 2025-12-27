@@ -76,16 +76,14 @@ impl DiskManager {
     }
 
     pub async fn upload(&self, data: Vec<u8>) -> io::Result<()> {
-        let _result = self
-            .op
+        self.op
             .write(&self.path, data)
             .await
-            .map_err(io::Error::other);
+            .map_err(io::Error::other)?;
+        println!("successfully stored file");
         Ok(())
     }
 }
-
-// --- NEW: DriftPageManager (Collection Registry) ---
 
 #[derive(Clone)]
 pub struct DriftPageManager {
