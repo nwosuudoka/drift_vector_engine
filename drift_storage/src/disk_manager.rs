@@ -80,7 +80,6 @@ impl DiskManager {
             .write(&self.path, data)
             .await
             .map_err(io::Error::other)?;
-        println!("successfully stored file");
         Ok(())
     }
 }

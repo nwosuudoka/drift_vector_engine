@@ -109,8 +109,16 @@ impl CollectionManager {
         // Start Janitor
         let j_idx = index.clone();
         let j_persist = persistence.clone();
+
+        let flush_threshold = self.config.max_bucket_capacity;
+        let refresh_rate = 100;
         tokio::spawn(async move {
-            let janitor = Janitor::new(j_idx, j_persist, 2000, Duration::from_secs(2));
+            let janitor = Janitor::new(
+                j_idx,
+                j_persist,
+                flush_threshold,
+                Duration::from_millis(refresh_rate),
+            );
             janitor.run().await;
         });
 

@@ -319,14 +319,33 @@ impl VectorIndex {
     pub fn delete(&self, id: u64) -> io::Result<()> {
         let mut wal = self.wal.lock();
         wal.write_delete(id)?;
-        wal.flush()?;
+        wal.flush()?; // Consider removing flush for speed if WAL is buffered
 
         let guard = epoch::pin();
         let memtable = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
         memtable.delete(id);
 
         self.deleted_ids.write().insert(id);
-        let _ = self.kv.remove(&id.to_le_bytes());
+
+        let id_bytes = id.to_le_bytes();
+
+        // We use .get() which returns Result<Option<IVec>>
+        if let Ok(Some(bucket_id_bytes)) = self.kv.get(&id_bytes) {
+            // Convert bytes to u32
+            // BitStore usually returns Vec<u8> or IVec. Assuming Slice/Vec here.
+            let bucket_id = u32::from_le_bytes(bucket_id_bytes[..4].try_into().unwrap());
+
+            // Read-Only Lock on Buckets Map!
+            // We do NOT need `update_buckets` (Write Lock).
+            // The Header is shared (Arc), so we can mutate its interior Atomics.
+            let buckets = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+            if let Some(header) = buckets.get(&bucket_id) {
+                header.mark_tombstone(); // ✅ Atomic Update
+            }
+        }
+
+        let _ = self.kv.remove(&id_bytes);
         Ok(())
     }
 
@@ -340,7 +359,7 @@ impl VectorIndex {
         tau: f32,
     ) -> io::Result<Vec<SearchResult>> {
         // 1. Search Active + Frozen MemTables
-        let mut mem_results = {
+        let mem_results = {
             let guard = epoch::pin();
             let active = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
 
@@ -419,18 +438,22 @@ impl VectorIndex {
                     }
                 }
 
-                if headers.is_empty() {
-                    if let Some(best) = buckets_map.values().min_by(|a, b| {
+                if headers.is_empty()
+                    && let Some(best) = buckets_map.values().min_by(|a, b| {
                         crate::math::l2_sq(query, &a.centroid)
                             .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
                             .unwrap()
-                    }) {
-                        headers.push((*best).clone());
-                    }
+                    })
+                {
+                    headers.push((*best).clone());
                 }
                 headers
             }
         };
+
+        for header in &selected_headers {
+            header.touch();
+        }
 
         let mut loaded_data = Vec::with_capacity(selected_headers.len());
         for header in selected_headers {
@@ -440,7 +463,6 @@ impl VectorIndex {
             }
         }
 
-        // ... [Merging Logic - MODIFIED] ...
         let mut heap = BinaryHeap::with_capacity(k);
         let deleted_guard = self.deleted_ids.read();
         let mut l0_found = HashSet::new();

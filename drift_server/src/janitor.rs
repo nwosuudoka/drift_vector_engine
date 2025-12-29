@@ -1,8 +1,8 @@
 use crate::persistence::PersistenceManager;
 use drift_core::index::{MaintenanceStatus, VectorIndex};
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::HashSet, sync::atomic::Ordering};
 use tokio::time;
 use tracing::{error, info, instrument};
 
@@ -69,6 +69,15 @@ impl Janitor {
                 }
             }
 
+            let _ =
+                header
+                    .stats
+                    .temperature
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| Some(t * 0.98));
+
+            let urgency = header.calculate_urgency(target_cap as usize);
+
+            // Make that value configurable
             if header.count > (target_cap as f32 * 1.5) as u32 {
                 info!(
                     "Janitor: ✂️ Splitting Bucket {} (Count {})",
@@ -83,7 +92,8 @@ impl Janitor {
                     Ok(_) => {}
                     Err(e) => error!("Split failed: {}", e),
                 }
-            } else if header.count == 0 {
+            // } else if header.count == 0 || (header.count < 50 && capacity_ratio < 0.1) {
+            } else if urgency > 1.5 {
                 info!(
                     "Janitor: 🚑 Scatter Merging Bucket {} (Count {})",
                     header.id, header.count
