@@ -29,6 +29,6 @@ pub struct Config {
     pub ef_construction: usize,
 
     /// HNSW Search Depth (Higher = Better Recall, Slower Search)
-    #[arg(long, env = "DRIFT_EF_SEARCH", default_value_t = 50)]
+#[arg(long, env = "DRIFT_EF_SEARCH", default_value_t = 50)]
     pub ef_search: usize,
 }

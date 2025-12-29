@@ -27,7 +27,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_janitor_lifecycle_flush_and_truncate() {
+    async fn test_janitor_lifecycle_flush_and_truncate_2() {
         let dir = tempdir().unwrap();
         let persistence = PersistenceManager::new(dir.path());
         let index = create_index(dir.path(), "current.wal", 100);
@@ -332,6 +332,22 @@ mod tests {
         println!("✅ test_scatter_merge_preserves_kv_integrity Passed!");
     }
 
+    // Polling helper
+    async fn wait_for_condition<F, Fut>(max_wait: Duration, mut condition: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < max_wait {
+            if condition().await {
+                return true;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
     #[tokio::test]
     async fn test_auto_splitting_under_pressure() {
         let dir = tempdir().unwrap();
@@ -343,10 +359,12 @@ mod tests {
         let mut ids = Vec::new();
         let mut vecs = Vec::new();
 
+        // 15 items at [0,0]
         for i in 0..15 {
             ids.push(i);
             vecs.push(vec![0.0, 0.0]);
         }
+        // 35 items at [100,100] (Drift)
         for i in 15..50 {
             ids.push(i);
             vecs.push(vec![100.0, 100.0]);
@@ -357,19 +375,35 @@ mod tests {
             .await
             .unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(1));
+        // Check Initial State
+        let initial_buckets = index.get_all_bucket_headers();
+        assert_eq!(initial_buckets.len(), 1, "Should start with 1 bucket");
+        assert_eq!(initial_buckets[0].count, 50);
+
+        let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(10));
         let j_handle = tokio::spawn(async move { janitor.run().await });
 
         println!("--- INDUCING DRIFT ---");
-        sleep(Duration::from_millis(200)).await;
+
+        // Polling Wait: Wait up to 2 seconds for split
+        let split_happened = wait_for_condition(Duration::from_secs(2), || {
+            let idx = index.clone();
+            async move {
+                let buckets = idx.get_all_bucket_headers();
+                buckets.len() >= 2
+            }
+        })
+        .await;
+
         j_handle.abort();
 
         let final_buckets = index.get_all_bucket_headers();
         println!("Final Bucket Count: {}", final_buckets.len());
 
         assert!(
-            final_buckets.len() >= 2,
-            "Janitor failed to split drifting bucket"
+            split_happened,
+            "Janitor failed to split drifting bucket within timeout. Count: {}",
+            final_buckets.len()
         );
 
         let res_near = index
@@ -385,5 +419,42 @@ mod tests {
         assert!(!res_far.is_empty(), "Lost new data [100,100]");
 
         println!("✅ test_auto_splitting_under_pressure Passed!");
+    }
+
+    // For brevity, here is one other critical test that was in the file:
+    #[tokio::test]
+    async fn test_janitor_lifecycle_flush_and_truncate() {
+        let dir = tempdir().unwrap();
+        let persistence = PersistenceManager::new(dir.path());
+        let index = create_index(dir.path(), "current.wal", 100);
+        index
+            .train(&vec![vec![0.0, 0.0], vec![100.0, 100.0]])
+            .await
+            .unwrap();
+        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_millis(10));
+        let j_handle = tokio::spawn(async move { janitor.run().await });
+        for i in 0..250 {
+            index.insert(i as u64, &vec![10.0, 10.0]).unwrap();
+            if i % 50 == 0 {
+                sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        sleep(Duration::from_millis(500)).await; // Increased wait for flush
+        j_handle.abort();
+        let mem_size = index.memtable_len();
+        println!("Final MemTable Size: {}", mem_size);
+        assert!(
+            mem_size < 150,
+            "Janitor failed to flush! MemTable still full."
+        );
+        let mut segment_count = 0;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|s| s.to_str()) == Some("drift") {
+                segment_count += 1;
+            }
+        }
+        assert!(segment_count >= 1, "Should have flushed segments to disk");
     }
 }

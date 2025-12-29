@@ -4,6 +4,19 @@ use crate::segment_writer::SegmentWriter;
 use rand::Rng;
 use tempfile::tempdir;
 
+/// Helper to generate random vectors
+fn generate_vectors(count: usize, dim: usize) -> Vec<Vec<f32>> {
+    let mut rng = rand::rng();
+    (0..count)
+        .map(|_| (0..dim).map(|_| rng.random::<f32>()).collect())
+        .collect()
+}
+
+/// Helper to generate dummy SQ8 codes for testing storage integrity
+fn generate_sq8_blob(count: usize, dim: usize, pattern: u8) -> Vec<u8> {
+    vec![pattern; count * dim]
+}
+
 #[tokio::test]
 async fn test_opendal_local_fs_flow() {
     let dir = tempdir().unwrap();
@@ -11,33 +24,39 @@ async fn test_opendal_local_fs_flow() {
     let abs_path = dir.path().join("test_seg.drift");
     let uri = format!("file://{}", abs_path.to_str().unwrap());
 
-    // 1. Write (using scratch file + atomic upload)
+    let dim = 2;
+    // Data setup
+    let ids = vec![100, 200];
+    let vecs = vec![vec![1.0, 1.0], vec![2.0, 2.0]];
+    let codes = vec![0x10, 0x10, 0x20, 0x20]; // Mock SQ8 codes
+
+    // 1. Write (using Dual-Tier to persist both index and data)
     let manager = DiskManager::open(&uri).await.unwrap();
     let mut writer = SegmentWriter::new(manager, vec![0x01, 0x02]).await.unwrap();
 
     writer
-        .write_bucket(1, &[100, 200], &vec![vec![1.0], vec![2.0]])
+        .write_bucket_dual(1, &ids, &vecs, &codes, dim)
         .await
         .unwrap();
     writer.finalize().await.unwrap();
 
-    // 2. Read (using range requests)
+    // 2. Read
     let reader = SegmentReader::open(&uri).await.unwrap();
 
     assert_eq!(reader.read_metadata(), &[0x01, 0x02]);
     assert!(reader.might_contain(100));
 
-    let (ids, vecs) = reader.read_bucket(1).await.unwrap();
-    assert_eq!(ids, vec![100, 200]);
-    assert_eq!(vecs[0][0], 1.0);
-}
+    // A. Verify Fast Path (SQ8 Blob)
+    let (read_ids, read_codes) = reader.read_bucket(1).await.unwrap();
+    assert_eq!(read_ids, ids);
+    assert_eq!(read_codes, codes, "SQ8 Index Blob corrupted");
 
-/// Helper to generate random vectors
-fn generate_vectors(count: usize, dim: usize) -> Vec<Vec<f32>> {
-    let mut rng = rand::rng();
-    (0..count)
-        .map(|_| (0..dim).map(|_| rng.random::<f32>()).collect())
-        .collect()
+    // B. Verify Cold Path (High Fidelity Floats)
+    let read_vecs = reader.read_bucket_high_fidelity(1).await.unwrap();
+    assert_eq!(read_vecs.len(), 2);
+    // Check lossless roundtrip (ALP should match exactly for simple integers)
+    assert_eq!(read_vecs[0][0], 1.0);
+    assert_eq!(read_vecs[1][0], 2.0);
 }
 
 #[tokio::test]
@@ -54,16 +73,19 @@ async fn test_heavy_integration_scenario() {
     let b1_id = 10;
     let b1_ids = vec![100, 101, 102];
     let b1_vecs = generate_vectors(3, dim);
+    let b1_codes = generate_sq8_blob(3, dim, 0xAA);
 
     // Bucket 2: Large, random IDs
     let b2_id = 20;
     let b2_ids: Vec<u64> = (2000..3000).collect();
     let b2_vecs = generate_vectors(1000, dim);
+    let b2_codes = generate_sq8_blob(1000, dim, 0xBB);
 
     // Bucket 3: Edge case (Single vector)
     let b3_id = 30;
     let b3_ids = vec![99999];
     let b3_vecs = generate_vectors(1, dim);
+    let b3_codes = generate_sq8_blob(1, dim, 0xCC);
 
     // --- WRITE PHASE ---
     {
@@ -72,9 +94,18 @@ async fn test_heavy_integration_scenario() {
             .await
             .unwrap();
 
-        writer.write_bucket(b1_id, &b1_ids, &b1_vecs).await.unwrap();
-        writer.write_bucket(b2_id, &b2_ids, &b2_vecs).await.unwrap();
-        writer.write_bucket(b3_id, &b3_ids, &b3_vecs).await.unwrap();
+        writer
+            .write_bucket_dual(b1_id, &b1_ids, &b1_vecs, &b1_codes, dim)
+            .await
+            .unwrap();
+        writer
+            .write_bucket_dual(b2_id, &b2_ids, &b2_vecs, &b2_codes, dim)
+            .await
+            .unwrap();
+        writer
+            .write_bucket_dual(b3_id, &b3_ids, &b3_vecs, &b3_codes, dim)
+            .await
+            .unwrap();
 
         writer.finalize().await.unwrap();
     }
@@ -90,36 +121,32 @@ async fn test_heavy_integration_scenario() {
     );
 
     // 2. Verify Bloom Filter (Probabilistic check)
-    // Should definitely contain these
     assert!(reader.might_contain(100));
     assert!(reader.might_contain(2500));
     assert!(reader.might_contain(99999));
-    // Should NOT contain these
     assert!(!reader.might_contain(1));
     assert!(!reader.might_contain(500000));
 
-    // 3. Verify Bucket 1 (Small)
-    let (ids, vecs) = reader.read_bucket(b1_id).await.unwrap();
+    // 3. Verify Bucket 1 (Fast Path)
+    let (ids, codes) = reader.read_bucket(b1_id).await.unwrap();
     assert_eq!(ids, b1_ids);
-    assert_eq!(vecs.len(), b1_vecs.len());
-    // Check first vector values
+    assert_eq!(codes, b1_codes);
+
+    // 4. Verify Bucket 2 (Cold Path - High Fidelity)
+    let vecs = reader.read_bucket_high_fidelity(b2_id).await.unwrap();
+    assert_eq!(vecs.len(), 1000);
+    // Spot check data integrity
     for i in 0..dim {
         assert!(
-            (vecs[0][i] - b1_vecs[0][i]).abs() < 1e-5,
-            "Vector data mismatch in Bucket 1"
+            (vecs[0][i] - b2_vecs[0][i]).abs() < 1e-5,
+            "Vector data mismatch in Bucket 2"
         );
     }
 
-    // 4. Verify Bucket 2 (Large)
-    let (ids, vecs) = reader.read_bucket(b2_id).await.unwrap();
-    assert_eq!(ids.len(), 1000);
-    assert_eq!(vecs.len(), 1000);
-    assert_eq!(ids[500], 2500); // Check mid-point ID
-
-    // 5. Verify Bucket 3 (Edge case)
-    let (ids, vecs) = reader.read_bucket(b3_id).await.unwrap();
+    // 5. Verify Bucket 3 (Fast Path)
+    let (ids, codes) = reader.read_bucket(b3_id).await.unwrap();
     assert_eq!(ids, b3_ids);
-    assert_eq!(vecs.len(), 1);
+    assert_eq!(codes, b3_codes);
 
     // 6. Verify Error Handling (Missing Bucket)
     let err = reader.read_bucket(999).await;
@@ -138,7 +165,7 @@ async fn test_empty_write_handling() {
     // Write a segment with NO buckets
     {
         let manager = DiskManager::open(&uri).await.unwrap();
-        let writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+        let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
         writer.finalize().await.unwrap();
     }
 

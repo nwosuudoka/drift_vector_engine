@@ -1,5 +1,5 @@
 #[cfg(test)]
-#[cfg(feature = "heavy-tests")]
+#[cfg(feature = "stress-test")]
 mod tests {
     use crate::config::Config;
     use crate::drift_proto::{
@@ -23,7 +23,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    // #[ignore]
     async fn test_server_heavy_load_performance() {
         let dir = tempdir().unwrap();
 
@@ -156,7 +156,7 @@ mod tests {
 }
 
 #[cfg(test)]
-#[cfg(feature = "heavy-tests")]
+#[cfg(feature = "stress-test")]
 mod pretrained_tests {
     use crate::config::Config;
     use crate::drift_proto::{
@@ -180,11 +180,17 @@ mod pretrained_tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    // #[ignore]
     async fn test_server_heavy_load_performance() {
         // =================================================================
         // 1. SETUP
         // =================================================================
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("drift_server=trace,info") // Show traces for your app, info for others
+            .with_test_writer() // Print to test output
+            .try_init(); // Safe to call multiple times
+
         let dir = tempdir().unwrap();
 
         let config = Config {
@@ -192,7 +198,7 @@ mod pretrained_tests {
             storage_uri: format!("file://{}", dir.path().join("storage").to_string_lossy()),
             wal_dir: dir.path().join("wal"),
             default_dim: DIM,
-            max_bucket_capacity: 2000, // Trigger flushes often
+            max_bucket_capacity: 2_000, // Trigger flushes often
             ef_construction: 80,
             ef_search: 200,
         };

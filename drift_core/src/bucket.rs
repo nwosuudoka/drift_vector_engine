@@ -6,13 +6,84 @@ use atomic_float::AtomicF32;
 use bit_set::BitSet;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use drift_traits::{Cacheable, PageId};
-use parking_lot::RwLock;
-use std::collections::BinaryHeap;
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Write};
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
+// --- SHARED STATS (Recovered from previous step) ---
+#[derive(Debug)]
+pub struct BucketStats {
+    pub tombstone_count: AtomicU32,
+    pub temperature: AtomicF32,
+}
+
+impl Default for BucketStats {
+    fn default() -> Self {
+        Self {
+            tombstone_count: AtomicU32::new(0),
+            temperature: AtomicF32::new(0.5),
+        }
+    }
+}
+
+// --- HEADER ---
+#[derive(Debug, Clone)]
+pub struct BucketHeader {
+    pub id: u32,
+    pub centroid: Vec<f32>,
+    pub count: u32,
+    pub page_id: PageId,
+    pub stats: Arc<BucketStats>,
+}
+
+impl BucketHeader {
+    pub fn new(id: u32, centroid: Vec<f32>, count: u32, page_id: PageId) -> Self {
+        Self {
+            id,
+            centroid,
+            count,
+            page_id,
+            stats: Arc::new(BucketStats::default()),
+        }
+    }
+
+    pub fn touch(&self) {
+        const ALPHA: f32 = 0.05;
+        let _ =
+            self.stats
+                .temperature
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    if current >= 1.0 {
+                        None
+                    } else {
+                        Some(current + ALPHA * (1.0 - current))
+                    }
+                });
+    }
+
+    pub fn mark_tombstone(&self) {
+        self.stats.tombstone_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn calculate_urgency(&self, target_capacity: usize) -> f32 {
+        let total = self.count as f32;
+        let dead = self.stats.tombstone_count.load(Ordering::Relaxed) as f32;
+        let temp = self.stats.temperature.load(Ordering::Relaxed);
+        let live = (total - dead).max(0.0);
+        let emptiness = if live < target_capacity as f32 {
+            (target_capacity as f32 - live) / target_capacity as f32
+        } else {
+            0.0
+        };
+        let zombie_ratio = if total > 0.0 { dead / total } else { 0.0 };
+        const EPSILON: f32 = 0.001;
+        const BETA: f32 = 3.0;
+        (emptiness / (temp + EPSILON)) + (BETA * zombie_ratio)
+    }
+}
+
+// --- DATA ---
 pub struct BucketData {
     pub codes: AlignedBytes,
     pub vids: Vec<u64>,
@@ -22,9 +93,6 @@ pub struct BucketData {
 impl Cacheable for BucketData {
     fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(data);
-
-        // 1. Read Header
-        // Valid Hex Literal (BDAT001 approx)
         let magic = cursor.read_u32::<LittleEndian>()?;
         if magic != 0xBD47001 {
             return Err(Error::new(ErrorKind::InvalidData, "Invalid Bucket Magic"));
@@ -32,43 +100,31 @@ impl Cacheable for BucketData {
         let count = cursor.read_u32::<LittleEndian>()? as usize;
         let dim = cursor.read_u32::<LittleEndian>()? as usize;
 
-        // 2. Read Codes
         let codes_len = count * dim;
         let mut codes = AlignedBytes::new(codes_len);
-
         unsafe {
             codes.set_len(codes_len);
         }
-
         cursor.read_exact(codes.as_mut_slice())?;
 
-        // 3. Read VIDs
         let mut vids = Vec::with_capacity(count);
         for _ in 0..count {
             vids.push(cursor.read_u64::<LittleEndian>()?);
         }
 
-        // 4. Read Tombstones (BitPacked)
-        // [Num_Blocks(u32)] [Bit_Width(u8)] [Packed_Len(u32)] [Packed_Data...]
         let num_blocks = cursor.read_u32::<LittleEndian>()? as usize;
         let bit_width = cursor.read_u8()? as usize;
         let packed_len = cursor.read_u32::<LittleEndian>()? as usize;
-
         let mut packed_data = vec![0u32; packed_len];
-        #[allow(clippy::needless_range_loop)]
         for i in 0..packed_len {
             packed_data[i] = cursor.read_u32::<LittleEndian>()?;
         }
 
-        // Unpack
         let mut blocks = vec![0u32; num_blocks];
         if num_blocks > 0 {
             unpack_u32_dynamic(&packed_data, num_blocks, bit_width, &mut blocks);
         }
 
-        // Reconstruct BitSet from blocks
-        // BitSet uses BitVec, which can be constructed from bytes.
-        // We cast &[u32] -> &[u8] safely.
         let mut tombstones = BitSet::with_capacity(count);
         for (i, block) in blocks.iter().enumerate() {
             if *block == 0 {
@@ -92,366 +148,74 @@ impl Cacheable for BucketData {
 impl BucketData {
     pub fn to_bytes(&self, dim: usize) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-
-        // Header
-        buf.write_u32::<LittleEndian>(0xBD47001)?; // Magic Fixed
+        buf.write_u32::<LittleEndian>(0xBD47001)?;
         buf.write_u32::<LittleEndian>(self.vids.len() as u32)?;
         buf.write_u32::<LittleEndian>(dim as u32)?;
-
-        // Codes
         buf.write_all(self.codes.as_slice())?;
-
-        // VIDs
         for vid in &self.vids {
             buf.write_u64::<LittleEndian>(*vid)?;
         }
-
-        // Tombstones (BitPacked)
-        // Access inner storage: BitVec storage is usually Vec<u32>
         let blocks = self.tombstones.get_ref().storage();
-
-        // Prepare output buffer for packing
-        // Max size is same as input (width=32)
         let mut packed_buf = vec![0u32; blocks.len()];
-
         let (width, packed_count) = if blocks.is_empty() {
             (1, 0)
         } else {
             pack_u32_dynamic(blocks, &mut packed_buf)
         };
-
-        // Write Metadata
-        buf.write_u32::<LittleEndian>(blocks.len() as u32)?; // Num Blocks
-        buf.write_u8(width as u8)?; // Bit Width
-        buf.write_u32::<LittleEndian>(packed_count as u32)?; // Packed Word Count
-
-        // Write Packed Data
-        #[allow(clippy::needless_range_loop)]
+        buf.write_u32::<LittleEndian>(blocks.len() as u32)?;
+        buf.write_u8(width as u8)?;
+        buf.write_u32::<LittleEndian>(packed_count as u32)?;
         for i in 0..packed_count {
             buf.write_u32::<LittleEndian>(packed_buf[i])?;
         }
-
         Ok(buf)
     }
 
-    /// Reconstructs all valid vectors (skipping tombstones) from this data block.
-    /// Used during Splitting/Merging to recover the training data.
     pub fn reconstruct(&self, quantizer: &Quantizer) -> (Vec<Vec<f32>>, Vec<u64>) {
         let dim = quantizer.min.len();
         let count = self.vids.len();
-
         let mut vecs = Vec::with_capacity(count);
         let mut ids = Vec::with_capacity(count);
-
         for i in 0..count {
             if self.tombstones.contains(i) {
                 continue;
             }
-
             let start = i * dim;
-            let end = start + dim;
-            // Safe slicing with new AlignedBytes index trait
-            let code = &self.codes[start..end];
-
-            let vec = quantizer.reconstruct(code);
-            vecs.push(vec);
+            let code = &self.codes[start..start + dim];
+            vecs.push(quantizer.reconstruct(code));
             ids.push(self.vids[i]);
         }
         (vecs, ids)
     }
-}
 
-/// The RAM-resident metadata for a bucket.
-/// This allows us to find the "Right Bucket" without loading the "Heavy Data".
-#[derive(Debug, Clone)]
-pub struct BucketHeader {
-    pub id: u32,
-    pub centroid: Vec<f32>, // For routing (ADC/L2 distance)
-    pub count: u32,         // For density weighting
-    pub page_id: PageId,    // Pointer to Disk/Cache
-}
+    // NEW: Zero-copy construction from components
+    pub fn from_components(codes: Vec<u8>, vids: Vec<u64>) -> Self {
+        // We need to ensure alignment for SIMD.
+        // Vec<u8> might not be 64-byte aligned.
+        // We copy it into AlignedBytes.
+        let mut aligned = AlignedBytes::new(codes.len());
+        unsafe {
+            // Fast copy
+            std::ptr::copy_nonoverlapping(
+                codes.as_ptr(),
+                aligned.as_mut_slice().as_mut_ptr(),
+                codes.len(),
+            );
+            aligned.set_len(codes.len());
+        }
 
-impl BucketHeader {
-    pub fn new(id: u32, centroid: Vec<f32>, count: u32, page_id: PageId) -> Self {
         Self {
-            id,
-            centroid,
-            count,
-            page_id,
+            codes: aligned,
+            vids: vids.clone(),
+            tombstones: BitSet::with_capacity(vids.len()),
         }
     }
 }
 
-pub struct Bucket {
-    pub id: u32,
-    pub quantizer: Arc<Quantizer>, // NEW: Buckets know how to read themselves
-    pub data: RwLock<BucketData>,
-
-    // Stats
-    pub centroid: RwLock<Vec<f32>>,
-    pub running_sum: RwLock<Vec<f32>>,
-    pub count: AtomicU32,
-    pub tombstone_count: AtomicU32,
-    pub temperature: AtomicF32,
-    pub last_maintenance: AtomicU64,
-}
+// --- BUCKET OPERATIONS ---
+pub struct Bucket;
 
 impl Bucket {
-    pub fn new(id: u32, capacity: usize, dim: usize, quantizer: Arc<Quantizer>) -> Self {
-        Self {
-            id,
-            quantizer,
-            data: RwLock::new(BucketData {
-                codes: AlignedBytes::new(capacity * dim),
-                vids: Vec::with_capacity(capacity),
-                tombstones: BitSet::with_capacity(capacity),
-            }),
-            centroid: RwLock::new(vec![0.0; dim]),
-            running_sum: RwLock::new(vec![0.0; dim]),
-            count: AtomicU32::new(0),
-            tombstone_count: AtomicU32::new(0),
-            temperature: AtomicF32::new(1.0),
-            last_maintenance: AtomicU64::new(0),
-        }
-    }
-
-    pub fn insert(&self, vid: u64, code: &[u8]) {
-        let mut data = self.data.write();
-        data.vids.push(vid);
-        for &b in code {
-            data.codes.push(b);
-        }
-
-        // Ensure tombstone bitset stays in sync
-        if data.tombstones.contains(data.vids.len() - 1) {
-            let n = data.vids.len() - 1;
-            data.tombstones.remove(n);
-        }
-
-        self.count.fetch_add(1, Ordering::Relaxed);
-
-        let vec = self.quantizer.reconstruct(code);
-        let mut sum = self.running_sum.write();
-        for (i, val) in vec.iter().enumerate() {
-            sum[i] += val;
-        }
-    }
-
-    pub fn should_split(&self, target_capacity: usize) -> bool {
-        let count = self.count.load(Ordering::Relaxed) as usize;
-        // 1. Capacity Check (> 80% full)
-        let threshold = (target_capacity as f32 * 0.8) as usize;
-        if count < threshold {
-            return false;
-        }
-
-        // 2. Drift Calculation (> 0.15)
-        let stored_centroid = self.centroid.read();
-        let sum = self.running_sum.read();
-
-        // Current Mean = Sum / Count
-        let mut current_centroid = vec![0.0; stored_centroid.len()];
-        if count > 0 {
-            for i in 0..stored_centroid.len() {
-                current_centroid[i] = sum[i] / count as f32;
-            }
-        }
-
-        // Euclidean Distance
-        let drift_sq: f32 = stored_centroid
-            .iter()
-            .zip(current_centroid.iter())
-            .map(|(a, b)| (a - b).powi(2))
-            .sum();
-
-        let drift = drift_sq.sqrt();
-        const TARGET_DRIFT: f32 = 0.15;
-
-        // SDD Threshold: 0.15
-        drift > TARGET_DRIFT
-    }
-
-    /// The Heating Operation (Hot Path)
-    /// T_new = T_old + alpha * (1.0 - T_old)
-    pub fn touch(&self) {
-        const ALPHA: f32 = 0.05;
-        // Optimization: Stop atomic writes if already max heat
-        if self.temperature.load(Ordering::Relaxed) > 0.99 {
-            return;
-        }
-        let _ = self
-            .temperature
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
-                Some(t + ALPHA * (1.0 - t))
-            });
-    }
-
-    /// The Cooling Operation
-    pub fn decay_temperature(&self) {
-        const LAMBDA: f32 = 0.98;
-        let _ = self
-            .temperature
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| Some(t * LAMBDA));
-    }
-
-    /// Calculate Urgency based on Equation (5)
-    /// Urgency = (Emptiness / (T + epsilon)) + (Beta * ZombieRatio)
-    pub fn calculate_urgency(&self, target_capacity: usize) -> f32 {
-        let count = self.count.load(Ordering::Relaxed) as f32;
-        let dead = self.tombstone_count.load(Ordering::Relaxed) as f32;
-        let temp = self.temperature.load(Ordering::Relaxed);
-
-        // 1. Calculate Live Count (Saturating sub to be safe)
-        let live = (count - dead).max(0.0);
-
-        // 2. Calculate Emptiness (0.0 to 1.0)
-        // If target is 100 and live is 10, Emptiness is 0.9.
-        let emptiness = if live < target_capacity as f32 {
-            (target_capacity as f32 - live) / target_capacity as f32
-        } else {
-            0.0
-        };
-
-        // 3. Calculate Zombie Ratio (0.0 to 1.0)
-        let zombie_ratio = if count > 0.0 { dead / count } else { 0.0 };
-
-        // 4. Constants
-        const EPSILON: f32 = 0.001; // Avoid div by zero
-        const BETA: f32 = 3.0; // Weight for dead data
-
-        // 5. The Formula
-        // High Temp (1.0) -> Denominator ~1.0 -> Low Score (Protected)
-        // Low Temp (0.0) -> Denominator ~0.001 -> High Score (Urgent)
-        (emptiness / (temp + EPSILON)) + (BETA * zombie_ratio)
-    }
-
-    /// Helper: Reconstruct all VALID vectors (f32) for splitting.
-    /// Skips tombstones.
-    pub fn extract_reconstructed(&self) -> (Vec<Vec<f32>>, Vec<u64>) {
-        let data = self.data.read();
-        let dim = self.quantizer.min.len();
-        let count = data.vids.len();
-
-        let mut vecs = Vec::with_capacity(count);
-        let mut ids = Vec::with_capacity(count);
-
-        for i in 0..count {
-            if data.tombstones.contains(i) {
-                continue;
-            }
-
-            let start = i * dim;
-            let code = &data.codes.as_slice()[start..start + dim];
-            let vec = self.quantizer.reconstruct(code);
-
-            vecs.push(vec);
-            ids.push(data.vids[i]);
-        }
-        (vecs, ids)
-    }
-
-    /// Optimized ADC Scan (Asymmetric Distance Calculation).
-    /// Dispatches to AVX2 or NEON kernels based on hardware.
-    pub fn scan_adc(&self, lut: &[f32], k: usize) -> Vec<SearchResult> {
-        self.temperature.fetch_add(1.0, Ordering::Relaxed);
-
-        let data = self.data.read();
-        let n_codes = data.vids.len();
-        // LUT is flattened: [dim * 256] floats
-        let dim = lut.len() / 256;
-
-        // Prepare Heap
-        let mut local_heap = BinaryHeap::with_capacity(k);
-
-        // Access raw pointers for kernels
-        let codes_base = data.codes.as_ptr();
-
-        for i in 0..n_codes {
-            // Logical Delete Check
-            if data.tombstones.contains(i) {
-                continue;
-            }
-
-            // Calculate Distance (Hot Loop)
-            // Offset in the codes buffer: vector_index * dimension
-            let offset = i * dim;
-
-            let dist = unsafe { compute_distance_simd(codes_base.add(offset), lut, dim) };
-
-            // Heap Management (Keep Top-K Smallest Distances)
-            // Note: BinaryHeap is Max-Heap. We want smallest distance.
-            // So we store SearchResult which implements Ord based on distance.
-            // If we want smallest K, we push. If heap > K, we pop the MAX element.
-            let result = SearchResult {
-                id: data.vids[i],
-                distance: dist,
-            };
-
-            if local_heap.len() < k {
-                local_heap.push(result);
-            } else if dist < local_heap.peek().unwrap().distance {
-                local_heap.pop();
-                local_heap.push(result);
-            }
-        }
-
-        // Return sorted vectors
-        let mut results = local_heap.into_vec();
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
-        results
-    }
-
-    /// Helper: Removes specific VIDs for Neighbor Stealing.
-    /// Returns the reconstructed vectors for the removed IDs.
-    pub fn steal_vectors(&self, target_ids: &[u64]) -> Vec<Vec<f32>> {
-        let mut data = self.data.write();
-        let mut stolen_vecs = Vec::new();
-        let dim = self.quantizer.min.len();
-
-        // Optimization: Create a HashSet/Bitmap for O(1) lookup if target_ids is large.
-        // For strict budget of 50, linear scan is acceptable (50 * N).
-        // However, we must physically remove them from `vids` and `codes`.
-        // This is O(N) memory move. In production, we usually mark Tombstone instead
-        // and copy the data out.
-
-        for &id in target_ids {
-            if let Some(pos) = data.vids.iter().position(|&x| x == id) {
-                // 1. Reconstruct
-                let start = pos * dim;
-                let code = &data.codes.as_slice()[start..start + dim];
-                let vec = self.quantizer.reconstruct(code);
-                stolen_vecs.push(vec);
-
-                // 2. Mark as Tombstone (Logical Move)
-                // Physical removal happens during next compaction/split.
-                data.tombstones.insert(pos);
-                self.tombstone_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        stolen_vecs
-    }
-
-    /// NEW: Marks a vector ID as deleted (Tombstone).
-    /// Returns true if the ID was found and marked.
-    pub fn delete(&self, vid: u64) -> bool {
-        let mut data = self.data.write();
-
-        // Linear scan is acceptable here because:
-        // 1. Buckets are small (~1000 items).
-        // 2. This happens in parallel across buckets in the Index.
-        // 3. It's much cheaper than maintaining a Hashmap per bucket.
-        if let Some(pos) = data.vids.iter().position(|&x| x == vid) {
-            // Only count if not already deleted
-            if !data.tombstones.contains(pos) {
-                data.tombstones.insert(pos);
-                self.tombstone_count.fetch_add(1, Ordering::Relaxed);
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Stateless Scan: Performs search on detached BucketData.
     pub fn scan_static(
         data: &BucketData,
         quantizer: &Quantizer,
@@ -483,130 +247,60 @@ impl Bucket {
         }
         results
     }
-}
+    /// ⚡ HOT PATH: Scans bucket using Precomputed LUT.
+    /// This replaces the old `scan_static` that used `quantizer.distance_adc`.
+    ///
+    /// # Arguments
+    /// * `lut`: Precomputed [Dim * 256] float array from Quantizer.
+    pub fn scan_with_lut(data: &BucketData, lut: &[f32], dim: usize) -> Vec<SearchResult> {
+        let mut results = Vec::with_capacity(data.vids.len());
 
-// =================================================================================
-//  SIMD KERNELS
-// =================================================================================
+        // Ensure LUT matches dimension (Sanity Check)
+        debug_assert_eq!(lut.len(), dim * 256);
 
-/// Dispatcher: Chooses best kernel at compile time
-#[inline(always)]
-unsafe fn compute_distance_simd(code_ptr: *const u8, lut: &[f32], dim: usize) -> f32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if is_x86_feature_detected!("avx2") {
-            return compute_distance_avx2(code_ptr, lut.as_ptr(), dim);
+        // Raw pointers for speed in loop
+        let codes_ptr = data.codes.as_ptr();
+        let lut_ptr = lut.as_ptr();
+
+        for i in 0..data.vids.len() {
+            if data.tombstones.contains(i) {
+                continue;
+            }
+
+            let code_offset = i * dim;
+
+            // Unsafe call to optimized distance kernel
+            // Safety: We verified buffer sizes above.
+            let dist = unsafe { compute_distance_lut(codes_ptr.add(code_offset), lut_ptr, dim) };
+
+            results.push(SearchResult {
+                id: data.vids[i],
+                distance: dist,
+            });
         }
+        results
     }
-
-    // Fallback or ARM
-    compute_distance_scalar_unrolled(code_ptr, lut, dim)
 }
 
-/// AVX2 Kernel: Uses Gather for 8-way parallel lookup.
-/// Processes 8 dimensions per cycle.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn compute_distance_avx2(mut code_ptr: *const u8, lut_ptr: *const f32, dim: usize) -> f32 {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let mut sum_vec = _mm256_setzero_ps();
-    let mut i = 0;
-
-    // We process 8 dimensions at a time.
-    // Base offsets for LUT: [0*256, 1*256, ..., 7*256]
-    // These align the gathering to the correct dimension block in the flattened LUT.
-    let mut offsets = _mm256_set_epi32(
-        7 * 256,
-        6 * 256,
-        5 * 256,
-        4 * 256,
-        3 * 256,
-        2 * 256,
-        1 * 256,
-        0 * 256,
-    );
-    let offset_step = _mm256_set1_epi32(8 * 256);
-
-    while i + 8 <= dim {
-        // 1. Load 8 bytes of codes (8 dimensions)
-        // We load as i64 (8 bytes) then expand to 8 x 32-bit integers
-        let raw_codes_64 = (code_ptr as *const i64).read_unaligned();
-        let codes_128 = _mm_cvtsi64_si128(raw_codes_64);
-
-        // Expand u8 -> i32 (Zero extend)
-        let codes_idx = _mm256_cvtepu8_epi32(codes_128);
-
-        // 2. Calculate exact indices: LUT_Index = Base_Offset + Code_Byte
-        let gather_indices = _mm256_add_epi32(offsets, codes_idx);
-
-        // 3. VGATHER: Load 8 floats from LUT using the calculated indices
-        // scale=4 (sizeof f32)
-        let values = _mm256_i32gather_ps(lut_ptr, gather_indices, 4);
-
-        // 4. Accumulate
-        sum_vec = _mm256_add_ps(sum_vec, values);
-
-        // Advance
-        code_ptr = code_ptr.add(8);
-        offsets = _mm256_add_epi32(offsets, offset_step);
-        i += 8;
-    }
-
-    // Horizontal Sum of the 8 accumulators
-    // AVX2 H-Sum trick
-    let t1 = _mm256_hadd_ps(sum_vec, sum_vec);
-    let t2 = _mm256_hadd_ps(t1, t1);
-    let t3 = _mm256_extractf128_ps(t2, 1);
-    let t4 = _mm_add_ss(_mm256_castps256_ps128(t2), t3);
-    let mut sum = _mm_cvtss_f32(t4);
-
-    // Handle Remainder (Scalar)
-    let lut_slice = std::slice::from_raw_parts(lut_ptr, dim * 256);
-    while i < dim {
-        let code = *code_ptr as usize;
-        // lut index = dim_index * 256 + code
-        let lut_idx = (i << 8) + code;
-        sum += lut_slice[lut_idx];
-
-        code_ptr = code_ptr.add(1);
-        i += 1;
-    }
-
-    sum
-}
-
-/// Fallback / NEON Kernel
-/// Uses 4x Unrolling to saturate instruction pipeline.
-unsafe fn compute_distance_scalar_unrolled(
-    mut code_ptr: *const u8,
-    lut: &[f32],
-    dim: usize,
-) -> f32 {
+/// ⚡ CORE KERNEL: Computes distance using LUT lookups.
+/// Manually unrolled 4x to saturate instruction pipeline.
+#[inline(always)]
+unsafe fn compute_distance_lut(mut code_ptr: *const u8, lut_ptr: *const f32, dim: usize) -> f32 {
     let mut sum = 0.0;
     let mut i = 0;
 
-    // Unroll 4x
+    // 4x Unrolling
     while i + 4 <= dim {
         let c0 = *code_ptr.add(0) as usize;
         let c1 = *code_ptr.add(1) as usize;
         let c2 = *code_ptr.add(2) as usize;
         let c3 = *code_ptr.add(3) as usize;
 
-        // LUT Access Pattern:
-        // i * 256 + c
-        let idx0 = ((i + 0) << 8) + c0;
-        let idx1 = ((i + 1) << 8) + c1;
-        let idx2 = ((i + 2) << 8) + c2;
-        let idx3 = ((i + 3) << 8) + c3;
-
-        let v0 = *lut.get_unchecked(idx0);
-        let v1 = *lut.get_unchecked(idx1);
-        let v2 = *lut.get_unchecked(idx2);
-        let v3 = *lut.get_unchecked(idx3);
+        // LUT Layout: [dim_index * 256 + byte_value]
+        let v0 = *lut_ptr.add((i + 0) * 256 + c0);
+        let v1 = *lut_ptr.add((i + 1) * 256 + c1);
+        let v2 = *lut_ptr.add((i + 2) * 256 + c2);
+        let v3 = *lut_ptr.add((i + 3) * 256 + c3);
 
         sum += v0 + v1 + v2 + v3;
 
@@ -617,8 +311,8 @@ unsafe fn compute_distance_scalar_unrolled(
     // Remainder
     while i < dim {
         let c = *code_ptr as usize;
-        let idx = (i << 8) + c;
-        sum += *lut.get_unchecked(idx);
+        let val = *lut_ptr.add(i * 256 + c);
+        sum += val;
         code_ptr = code_ptr.add(1);
         i += 1;
     }
@@ -626,15 +320,14 @@ unsafe fn compute_distance_scalar_unrolled(
     sum
 }
 
+// AlignedBytes boilerplate
 impl Index<Range<usize>> for AlignedBytes {
     type Output = [u8];
-
     #[inline]
     fn index(&self, range: Range<usize>) -> &Self::Output {
         &self.as_slice()[range]
     }
 }
-
 impl IndexMut<Range<usize>> for AlignedBytes {
     #[inline]
     fn index_mut(&mut self, range: Range<usize>) -> &mut Self::Output {

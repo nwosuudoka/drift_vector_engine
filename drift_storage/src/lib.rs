@@ -9,6 +9,9 @@ pub mod segment_writer;
 #[cfg(test)]
 mod open_dal_integration;
 
+#[cfg(test)]
+mod segment_test;
+
 // SHARED CONSTANTS (Single Source of Truth)
 pub const MAGIC_BYTES: &[u8; 8] = b"DRIFT_V1";
 pub const FOOTER_SIZE: usize = 64; // 8*7 fields + 1 version + 7 padding = 64

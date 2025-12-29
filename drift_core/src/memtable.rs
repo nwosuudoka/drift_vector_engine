@@ -2,10 +2,58 @@
 
 use hnsw_rs::prelude::*;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use tracing::{Level, span};
 
-/// Level 0: The In-Memory Graph (MemTable).
-/// Stores uncompressed f32 vectors for high recall on recent data.
+/// Wrapper to allow f32 in BinaryHeap (Max-Heap)
+#[derive(Debug, PartialEq)]
+struct OrderedFloat(f32);
+
+impl Eq for OrderedFloat {}
+
+impl PartialOrd for OrderedFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+
+impl Ord for OrderedFloat {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Handle NaNs by pushing them to the end
+        self.partial_cmp(other).unwrap_or(Ordering::Less)
+    }
+}
+
+/// Helper struct to keep track of top-k candidates in the heap
+#[derive(Debug, PartialEq, Eq)]
+struct HeapItem {
+    distance: OrderedFloat,
+    id: u64,
+}
+
+// Order by distance so BinaryHeap acts as a Max-Heap on distance.
+// We keep the K smallest items. If new_item < max_in_heap, replace max.
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.distance.partial_cmp(&other.distance)
+    }
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance.cmp(&other.distance)
+    }
+}
+
+/// Level 0: The In-Memory Buffer (MemTable).
+///
+/// Stores raw f32 vectors.
+/// - Writes are O(1) (HashMap insert).
+/// - Reads are O(N) (Linear Scan).
+///
+/// The HNSW field is kept for compatibility but is NOT updated synchronously.
 pub struct MemTable {
     // Hnsw is thread-safe for searching, but we wrap our secondary storage in locks
     pub hnsw: RwLock<Hnsw<'static, f32, DistL2>>,
@@ -39,17 +87,55 @@ impl MemTable {
     }
 
     pub fn insert(&self, id: u64, vector: &[f32]) {
+        // 1. Tombstone Logic
         {
+            let _span = span!(Level::TRACE, "lock_tombstones").entered();
             let mut tombstones = self.tombstones.write();
             if tombstones.contains(&id) {
                 tombstones.remove(&id);
             }
         }
 
-        self.tombstones.write().remove(&id);
+        // 2. Data Map Insert (O(1))
+        {
+            let _span = span!(Level::TRACE, "lock_data_map").entered();
+            self.data.write().insert(id, vector.to_vec());
+        }
 
-        self.data.write().insert(id, vector.to_vec());
-        self.hnsw.write().insert((vector, id as usize));
+        // 3. HNSW Insert -> DISABLED for Lazy Indexing
+        // We skip the expensive graph update.
+        // Indexing will happen in bulk during the background flush.
+        /*
+        {
+            let _span = span!(Level::INFO, "lock_hnsw_insert").entered();
+            self.hnsw.write().insert((vector, id as usize));
+        }
+        */
+    }
+
+    pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) {
+        // 1. Lock Tombstones ONCE
+        {
+            let _span = span!(Level::TRACE, "lock_tombstones_batch").entered();
+            let mut tombstones = self.tombstones.write();
+            for (id, _) in batch {
+                if tombstones.contains(id) {
+                    tombstones.remove(id);
+                }
+            }
+        }
+
+        // 2. Lock Data Map ONCE
+        {
+            let _span = span!(Level::TRACE, "lock_data_map_batch").entered();
+            let mut data = self.data.write();
+            for (id, vector) in batch {
+                data.insert(*id, vector.clone());
+            }
+        }
+
+        // 3. HNSW Insert -> DISABLED
+        // Eliminates the O(Batch * log N) bottleneck.
     }
 
     pub fn delete(&self, id: u64) {
@@ -61,21 +147,111 @@ impl MemTable {
         data.remove(&id);
     }
 
-    // Update search to filter results
-    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
+    /// Brute Force Scan (O(N))
+    /// Optimized for throughput on 10k-100k items.
+    // pub fn search(&self, query: &[f32], k: usize, _ef_search: usize) -> Vec<(u64, f32)> {
+    //     let tombstones = self.tombstones.read();
+    //     let data = self.data.read();
+
+    //     // MaxHeap to maintain the K smallest distances.
+    //     // We push items in. If heap > K, we pop the MAX element.
+    //     let mut heap = BinaryHeap::with_capacity(k + 1);
+
+    //     for (id, vector) in data.iter() {
+    //         if tombstones.contains(id) {
+    //             continue;
+    //         }
+
+    //         // SIMD-friendly L2 Squared calculation
+    //         let dist_sq: f32 = l2_sq_simd_friendly(query, vector);
+
+    //         let item = HeapItem {
+    //             distance: OrderedFloat(dist_sq),
+    //             id: *id,
+    //         };
+
+    //         if heap.len() < k {
+    //             heap.push(item);
+    //         } else if item.distance < heap.peek().unwrap().distance {
+    //             // New item is smaller than the largest in the heap
+    //             heap.pop();
+    //             heap.push(item);
+    //         }
+    //     }
+
+    //     // Convert Heap to sorted Vector
+    //     let mut result: Vec<(u64, f32)> = heap
+    //         .into_iter()
+    //         .map(|item| (item.id, item.distance.0))
+    //         .collect();
+
+    //     // Heap iteration is arbitrary, so we must sort finally
+    //     result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+    //     result
+    // }
+
+    pub fn search(&self, query: &[f32], k: usize, _ef_search: usize) -> Vec<(u64, f32)> {
         let tombstones = self.tombstones.read();
-        self.hnsw
-            .read()
-            .search(query, k + tombstones.len(), ef_search) // Ask for more to account for filtering
+        let data = self.data.read();
+
+        // Snapshot tombstones to a thread-safe structure if needed,
+        // but since we hold the read lock on `data`, and `tombstones` logic is coupled,
+        // we just read the local reference. Rayon handles the scope.
+
+        let final_heap = data
+            .par_iter() // 1. Iterate in Parallel
+            .fold(
+                || BinaryHeap::with_capacity(k + 1), // 2. Init Local Heap
+                |mut heap, (id, vector)| {
+                    // Filter tombstone
+                    if tombstones.contains(id) {
+                        return heap;
+                    }
+
+                    let dist_sq = l2_sq_simd_friendly(query, vector);
+                    let item = HeapItem {
+                        distance: OrderedFloat(dist_sq),
+                        id: *id,
+                    };
+
+                    // Maintain Top-K
+                    if heap.len() < k {
+                        heap.push(item);
+                    } else if item.distance < heap.peek().unwrap().distance {
+                        heap.pop();
+                        heap.push(item);
+                    }
+                    heap
+                },
+            )
+            .reduce(
+                || BinaryHeap::with_capacity(k), // 3. Reduce (Merge Heaps)
+                |mut a, b| {
+                    for item in b {
+                        if a.len() < k {
+                            a.push(item);
+                        } else if item.distance < a.peek().unwrap().distance {
+                            a.pop();
+                            a.push(item);
+                        }
+                    }
+                    a
+                },
+            );
+
+        // 4. Final Sort
+        let mut result: Vec<(u64, f32)> = final_heap
             .into_iter()
-            .map(|n| (n.d_id as u64, n.distance * n.distance))
-            .filter(|(id, _)| !tombstones.contains(id)) // Filter
-            .take(k)
-            .collect()
+            .map(|item| (item.id, item.distance.0))
+            .collect();
+
+        result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        result
     }
 
     pub fn len(&self) -> usize {
-        self.hnsw.read().get_nb_point()
+        self.data.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -91,4 +267,21 @@ impl MemTable {
             .map(|(k, v)| (*k, v.clone()))
             .collect()
     }
+}
+
+/// Explicit loop structure to encourage auto-vectorization.
+/// Modern compilers (LLVM) vectorize this better than zip().map().sum() in some debug profiles.
+#[inline(always)]
+fn l2_sq_simd_friendly(a: &[f32], b: &[f32]) -> f32 {
+    let mut sum = 0.0;
+    let n = a.len();
+    // Hint to compiler about slice length equality to remove bounds checks inside loop
+    let a = &a[..n];
+    let b = &b[..n];
+
+    for i in 0..n {
+        let diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+    sum
 }
