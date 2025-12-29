@@ -2,7 +2,7 @@
 mod tests {
     use crate::aligned::AlignedBytes;
     use crate::bucket::Bucket; // for scan_static
-    use crate::bucket::{BucketData, BucketHeader};
+    use crate::bucket::BucketData;
     use crate::quantizer::Quantizer;
     use async_trait::async_trait;
     use bit_set::BitSet;

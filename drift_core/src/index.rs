@@ -379,12 +379,17 @@ impl VectorIndex {
         // Duplicates might exist if an ID was updated, but downstream logic handles it via `deleted_ids` checks
         // and usually `Active` is fresher.
 
-        let quantizer_arc = {
+        // 1. Get Quantizer & Precompute LUT
+        let (quantizer_arc, lut) = {
             let guard = self.quantizer.read();
             match guard.as_ref() {
-                Some(q) => q.clone(),
+                Some(q) => {
+                    // ⚡ PERFORMANCE FIX: Precompute LUT once!
+                    let lut = q.precompute_lut(query);
+                    (q.clone(), Some(lut))
+                }
                 None => {
-                    // If no quantizer, return only memory results
+                    // FIX: Remove the tuple wrapper. Just return directly.
                     return Ok(mem_results
                         .into_iter()
                         .map(|(id, d)| SearchResult { id, distance: d })
@@ -393,7 +398,8 @@ impl VectorIndex {
             }
         };
 
-        // ... [Bucket Selection Logic - KEEP AS IS] ...
+        let lut = lut.unwrap();
+
         // (This part remains exactly the same as your old code)
         let selected_headers = {
             let guard = epoch::pin();
@@ -485,13 +491,15 @@ impl VectorIndex {
         }
 
         // Process Disk Results
+        let dim = self.config.dim;
         for data in loaded_data {
-            let hits = Bucket::scan_static(&data, &quantizer_arc, query);
+            // PASS LUT HERE
+            let hits = Bucket::scan_with_lut(&data, &lut, dim);
+
             for res in hits {
                 if deleted_guard.contains(&res.id) {
                     continue;
                 }
-                // If ID was found in Memory (Active or Frozen), skip Disk version (it's stale)
                 if l0_found.contains(&res.id) {
                     continue;
                 }

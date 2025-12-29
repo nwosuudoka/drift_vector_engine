@@ -14,6 +14,9 @@ mod manager_tests; // Add this line
 mod server_tests;
 
 #[cfg(test)]
+mod persistence_tests;
+
+#[cfg(test)]
 #[cfg(feature = "stress-test")]
 mod server_heavy_load_test;
 

@@ -8,6 +8,10 @@
 - ✅ **Disk Manager:** Abstracted via `opendal` for local/cloud transparency.
 - ✅ **Block Alignment:** 4KB aligned pages for O_DIRECT compatibility.
 - ✅ **Compression:** ALP/ALP_RD quantization for high-ratio float compression.
+- ✅ **Dual-Tier Storage Strategy:** Implemented architecture for Fast (SQ8) vs Cold (ALP) paths.
+- ✅ **"The Blob" Alignment:** - [x] `SegmentWriter` writes contiguous `BucketData` blobs (Header+Codes+IDs) for the index.
+  - [x] `SegmentReader` supports fetching Raw SQ8 blobs and lazy-loading High-Fidelity data.
+  - [x] `PersistenceManager` implements fallback logic to hydrate from SQ8 if ALP is missing (Robustness).
 
 #### **Section 2: Core Indexing Logic (Level 1)**
 
@@ -34,6 +38,15 @@
 - ✅ **Hybrid Search:** Merges results from Parallel Scan (RAM) and HNSW (Disk). [cite: 701]
 - ✅ **Routing:** Saturating Density model (Lambda/Tau) for query routing.
 - ✅ **Parallelism:** `rayon` integration for high-speed brute-force scanning of unindexed data.
+- ✅ **Async Architecture:** Fully non-blocking core using `tokio`.
+- ✅ **Hybrid Search:** Merges results from Parallel Scan (RAM) and HNSW (Disk).
+- 🔄 **ADC Optimization (Critique A):**
+  - [x] Implement `Quantizer::precompute_lut`.
+  - [x] Update `Bucket::scan` to use LUT instead of float math.
+  - [ ] Verify 10x speedup in benchmarks.
+- ⬜ **Storage Format Alignment (Critique B):**
+  - [x] Store raw SQ8 bytes in `index_blob` for fast mapping.
+  - [x] Store ALP bytes in `data_blob` for high-fidelity retrieval.
 
 #### **Section 5: Server & API**
 

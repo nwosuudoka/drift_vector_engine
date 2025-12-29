@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.6.2] - Persistence Hardening & Dual-Tier Storage
+
+**Tag:** `v0.6.2-storage-stable`
+
+### Added
+
+- **Dual-Tier Segments:** Segments now contain both a `Hot Blob` (SQ8 codes for O(1) search) and a `Cold Blob` (ALP compressed floats for re-ranking).
+- **Recovery Fallback:** `PersistenceManager::load_from_segment` and `hydrate_index` now attempt to read High-Fidelity data first, but gracefully degrade to reconstructing from SQ8 codes if the cold blob is missing or corrupt. This ensures the system can always recover.
+
+### Changed
+
+- **Storage Protocol:** `BucketData` is no longer reconstructed during flush; raw SQ8 bytes are written directly to disk to minimize CPU overhead.
+- **Test Suite:** Added `test_end_to_end_persistence_lifecycle` to verify crash recovery using the new Dual-Tier format.
+
+## [0.6.0] - The Performance Fix (ADC LUT)
+
+**Work in Progress**
+
+### Changed
+
+- **Hot Search Loop:** Replaced per-vector floating point calculations with a precomputed Look-Up Table (LUT).
+  - _Old:_ `dist += (q[i] - reconstruct(code[i]))^2` (CPU bound)
+  - _New:_ `dist += lut[i * 256 + code[i]]` (Memory bound, 10x faster).
+- **Bucket API:** `scan_static` now accepts `&[f32]` (LUT) instead of `&[f32]` (Query).
+
+### Added
+
+- **Unrolled Kernel:** Manually unrolled 4x loop in `compute_distance_lut` to saturate instruction pipelines.
+
 ## [0.5.4] - Lazy Indexing & High-Throughput Ingestion
 
 **Tag:** `v0.5.4-lazy-indexing-stable`

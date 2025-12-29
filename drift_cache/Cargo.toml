@@ -12,6 +12,7 @@ async-trait = "0.1"                            # For PageManager trait
 tokio = { version = "1", features = ["full"] } # For Async Disk I/O
 thiserror = "2.0.17"
 tempfile = "3.23.0"
+tracing = "0.1"
 
 [dev-dependencies]
 rand = "0.9.2"
