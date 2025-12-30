@@ -4,10 +4,13 @@ Orchestration layer that wires the core index and storage format from `PAPER.pdf
 
 ## Implemented features
 - **gRPC service**: `Train`, `Insert`, and `Search` endpoints generated from `drift.proto`, wired via Tonic.
+- **CLI + simulations**: `drift` CLI client plus `drift_sim`/`churn_sim` binaries for stress and drift testing.
 - **Multi-tenant collections**: per-collection storage directories under `./data/<collection>/` with isolated WAL + segments.
 - **Janitor loop**: configurable background task that watches the L0 memtable size, triggers `rotate_memtable`, and flushes snapshots to disk segments.
 - **Persistence manager**: writes both L1 buckets and L0 snapshots to new `.drift` segments, embedding quantizer bytes and checksums; can rebuild a `VectorIndex` from a segment plus WAL.
 - **WAL integration**: flush paths preserve durability guarantees by coordinating WAL truncation with memtable rotation.
+- **Tombstone persistence + compaction**: flushes tombstones to disk and runs Scavenger compaction on dirty buckets to reclaim memory.
+- **Configurable storage**: CLI/env configuration for `--storage-uri`, `--wal-dir`, default dimensions, and HNSW tuning.
 - **Integration tests**: cover janitor flush paths and persistence round-trips (`wal_integration_test.rs`, `janitor_tests.rs`, `persistence_test.rs`, `server_tests.rs`).
 
 ## Usage sketch
@@ -28,6 +31,9 @@ tokio::spawn(async move { janitor.run().await; });
 ## gRPC quickstart
 - Run the server: `cargo run -p drift_server` (listens on `127.0.0.1:50051`).
 - Use the bundled client demo: `cargo run -p drift_server --bin client`.
+- CLI client: `cargo run -p drift_server --bin drift -- --help`.
+- Drift harness: `cargo run -p drift_server --bin drift_sim`.
+- Configure storage: `cargo run -p drift_server -- --storage-uri file://./data` (or set `DRIFT_STORAGE_URI`).
 - Protobuf definitions live in `drift_server/proto/drift.proto` (fields include `collection_name`, `vector`, `k`, `target_confidence`, `lambda`, `tau`).
 
 This crate binds together `drift_core` and `drift_storage` and exposes the gRPC API for training, inserting, and searching the drift-aware index.

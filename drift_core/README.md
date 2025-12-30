@@ -4,12 +4,14 @@ Core engine for the drift-aware ANN described in `PAPER.pdf`: HNSW-backed memtab
 
 ## Implemented features
 - **L0 MemTable**: thread-safe HNSW over raw f32 vectors for high-recall recent data; exposes `insert`, `search`, and snapshot extraction for flushing.
+- **Lazy indexing**: decouples ingestion from HNSW updates so flush-time indexing keeps writes O(1).
 - **Write-Ahead Log**: framed WAL (`WalWriter`/`WalReader`) with CRC32, length prefixing, append-only inserts, and replay on startup for crash recovery.
 - **Quantization**: percentile-clipped SQ8 quantizer (1–99% clipping) with encode/reconstruct and LUT-based ADC for PQ buckets.
 - **Bucketed L1**: centroid routing table, SIMD ADC scans, temperature/urgency tracking, tombstones, and 64-byte aligned storage for PQ codes.
 - **Async search + train**: `search_async` and async K-Means training for disk-native buckets without blocking the runtime.
+- **Search correctness**: RAM-first execution order, phase separation (async IO vs sync CPU), and a recall guardrail for sparse/new buckets.
 - **Disk-native plumbing**: `BlockCache` for bucket pages plus a persistent `BitStore` for O(1) `VectorID -> BucketID` lookups.
-- **Maintenance**: bucket splitting, neighbor stealing, rebalance, and scatter-merge; atomic COW updates of centroid/bucket maps using epoch GC.
+- **Maintenance**: bucket splitting, neighbor stealing, rebalance, scatter-merge, and Scavenger compaction to rewrite dirty buckets; atomic COW updates of centroid/bucket maps using epoch GC.
 - **Training**: k-means++ trainer with empty-cluster rescue, used for initial centroid placement and splitting; helper to force-register hydrated buckets.
 
 ## Key modules
@@ -20,6 +22,7 @@ Core engine for the drift-aware ANN described in `PAPER.pdf`: HNSW-backed memtab
 - `quantizer.rs`: SQ8 encode/reconstruct + LUT generation.
 - `kmeans.rs`: k-means++ trainer with robustness tests.
 - `aligned.rs`: 64-byte aligned byte buffer used by buckets.
+- `tombstone.rs`: tombstone file format shared with persistence.
 
 ## Usage sketch
 ```rust
