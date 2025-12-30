@@ -315,7 +315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..10 {
         sleep(Duration::from_millis(500)).await;
         // Check bucket count
-        let buckets = coll_ref.index.get_all_bucket_headers().len();
+        let _buckets = coll_ref.index.get_all_bucket_headers().len();
         // Also check if any buckets have 0 count
         let empty_buckets = coll_ref
             .index

@@ -565,6 +565,7 @@ version = "0.1.0"
 dependencies = [
  "bincode 2.0.1",
  "clap",
+ "crossbeam-epoch",
  "drift_cache",
  "drift_core",
  "drift_storage",

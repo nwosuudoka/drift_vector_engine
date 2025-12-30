@@ -1,6 +1,6 @@
 use clap::Parser;
 use drift_server::drift_proto::drift_server::Drift;
-use drift_server::drift_proto::{InsertRequest, SearchRequest, Vector};
+use drift_server::drift_proto::{InsertRequest, SearchRequest, TrainRequest, Vector};
 use drift_server::manager::CollectionManager;
 use drift_server::server::DriftService;
 use rand::prelude::*;
@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tonic::Request;
 
 // =================================================================
-// 1. DATA GENERATOR (Harder Mode)
+// 1. THE DRIFT SIMULATION ENGINE
 // =================================================================
 
 struct DriftingCluster {
@@ -23,8 +23,10 @@ struct DriftingCluster {
 
 impl DriftingCluster {
     fn new(rng: &mut impl Rng, dim: usize, drift_speed: f32) -> Self {
+        // Initialize random position in 100x100 hypercube
         let center: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 100.0).collect();
-        // Increased velocity variance
+
+        // Initialize random velocity vector
         let velocity: Vec<f32> = (0..dim)
             .map(|_| (rng.random::<f32>() - 0.5) * drift_speed)
             .collect();
@@ -32,11 +34,12 @@ impl DriftingCluster {
         Self {
             center,
             velocity,
-            std_dev: 20.0,
+            std_dev: 15.0, // Spread of the cluster
         }
     }
 
     fn tick(&mut self) {
+        // Apply velocity to position
         for (c, v) in self.center.iter_mut().zip(&self.velocity) {
             *c += *v;
         }
@@ -52,7 +55,6 @@ impl DriftingCluster {
 }
 
 struct World {
-    _dim: usize,
     clusters: Vec<DriftingCluster>,
     rng: StdRng,
 }
@@ -63,12 +65,7 @@ impl World {
         let clusters = (0..num_clusters)
             .map(|_| DriftingCluster::new(&mut rng, dim, drift_speed))
             .collect();
-
-        Self {
-            _dim: dim,
-            clusters,
-            rng,
-        }
+        Self { clusters, rng }
     }
 
     fn drift(&mut self) {
@@ -80,6 +77,7 @@ impl World {
     fn generate_batch(&mut self, batch_size: usize, start_id: u64) -> Vec<Vector> {
         let mut batch = Vec::with_capacity(batch_size);
         for i in 0..batch_size {
+            // Pick a random cluster for this point
             let cluster_idx = self.rng.random_range(0..self.clusters.len());
             let vec = self.clusters[cluster_idx].generate_point(&mut self.rng);
 
@@ -93,7 +91,7 @@ impl World {
 }
 
 // =================================================================
-// 2. HELPERS
+// 2. GROUND TRUTH & METRICS
 // =================================================================
 
 fn calculate_ground_truth(all_vectors: &[(u64, Vec<f32>)], query: &[f32], k: usize) -> Vec<u64> {
@@ -105,6 +103,7 @@ fn calculate_ground_truth(all_vectors: &[(u64, Vec<f32>)], query: &[f32], k: usi
         })
         .collect();
 
+    // Sort by Distance ASC
     scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     scored.into_iter().take(k).map(|(id, _)| id).collect()
 }
@@ -120,7 +119,7 @@ fn calculate_recall(results: &[u64], ground_truth: &[u64]) -> f32 {
     hits as f32 / ground_truth.len() as f32
 }
 
-// 🛑 FORCE FLUSH: Ensures we are testing L1 (Disk) not L0 (RAM)
+// Wait for MemTable to flush so we test the Disk Index
 async fn force_flush_and_wait(service: &DriftService, collection: &str) {
     let coll = service
         .manager
@@ -128,24 +127,22 @@ async fn force_flush_and_wait(service: &DriftService, collection: &str) {
         .await
         .unwrap();
 
-    // Busy wait until MemTable is drained by Janitor
-    // We assume the Janitor is running in the background (spawned by manager)
+    // Busy wait for Janitor
     let mut retries = 0;
     while coll.index.memtable_len() > 0 {
         sleep(Duration::from_millis(100)).await;
         retries += 1;
         if retries > 100 {
-            // 10s timeout
-            println!("⚠️ Warning: MemTable didn't flush completely.");
+            println!("⚠️ Warning: MemTable flush timeout.");
             break;
         }
     }
-    // Extra buffer for file sys sync
+    // Buffer for FS sync
     sleep(Duration::from_millis(500)).await;
 }
 
 // =================================================================
-// 3. SIMULATION RUNNER
+// 3. MAIN HARNESS
 // =================================================================
 
 #[derive(Parser)]
@@ -160,24 +157,19 @@ struct Args {
     batch_size: usize,
 }
 
-// drift_server/src/bin/drift_sim.rs
-
-// ... (Imports stay the same) ...
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    // 1. Spin up Server
     let dir = tempdir()?;
     let config = drift_server::config::Config {
-        port: 50052,
+        port: 50055,
         storage_uri: format!("file://{}", dir.path().join("storage").to_string_lossy()),
         wal_dir: dir.path().join("wal"),
         default_dim: args.dim,
-        // 600 * 1.5 = 900.
-        // Since we insert 1000 items, 1000 > 900, so the Janitor WILL split every bucket.
-        max_bucket_capacity: 600,
+        max_bucket_capacity: 600, // Small capacity to force frequent Splitting
         ef_construction: 64,
         ef_search: 64,
     };
@@ -186,48 +178,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = DriftService {
         manager: manager.clone(),
     };
-    let collection_name = "sim_world";
+    let collection_name = "drift_simulation";
 
-    // Speed: 5.0 is aggressive.
-    let mut world = World::new(args.dim, args.clusters, 3.0, 999);
-    // let mut world = World::new(args.dim, args.clusters, 5.0, 999);
+    // 2. Initialize World
+    // Drift Speed 5.0 is fast. It means clusters move 5 units per tick.
+    // Over 20 ticks, they move 100 units (entire initial width).
+    let mut world = World::new(args.dim, args.clusters, 5.0, 999);
     let mut shadow_db: Vec<(u64, Vec<f32>)> = Vec::new();
     let mut next_id = 0;
 
-    println!("🌍 Starting Hard-Mode Drift Simulation");
+    println!("🌍 Starting Concept Drift Simulation");
     println!("   • Clusters: {}", args.clusters);
-    println!("   • Drift Speed: 5.0 (High)");
-    println!("   • Bucket Cap: 900 (Forces flush)");
+    println!("   • Velocity: 5.0 (High)");
+    println!("   • Buckets:  Splitting enabled at 900 vectors");
 
-    // ... (Training Phase stays the same) ...
-    // ... Copy the Phase 1 block from previous code ...
-    println!("\n📚 Phase 1: Initial Training...");
-    let mut train_batch = world.generate_batch(2000, next_id);
-
-    if !train_batch.is_empty() {
-        train_batch[0].values = vec![-1000.0; args.dim];
-        train_batch[1].values = vec![1000.0; args.dim];
-    }
-
+    // 3. Initial Training
+    println!("\n📚 Phase 1: Training...");
+    let train_batch = world.generate_batch(2000, next_id);
     next_id += 2000;
+
     for v in &train_batch {
         shadow_db.push((v.id, v.values.clone()));
     }
 
-    let train_req = Request::new(drift_server::drift_proto::TrainRequest {
+    let train_req = Request::new(TrainRequest {
         collection_name: collection_name.to_string(),
         vectors: train_batch,
     });
     service.train(train_req).await?;
-    println!("✅ Training Complete.");
+    println!("✅ Index Trained.");
 
-    // Loop
+    // 4. The Loop
     for b in 1..=args.batches {
+        // A. Move the World
         world.drift();
+
+        // B. Generate New Data (at new positions)
         let batch = world.generate_batch(args.batch_size, next_id);
         next_id += args.batch_size as u64;
 
-        // Ingest
+        // C. Ingest
         for v in &batch {
             shadow_db.push((v.id, v.values.clone()));
             service
@@ -238,10 +228,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
         }
 
-        // Wait for flush
+        // D. Flush (Push to Disk)
         force_flush_and_wait(&service, collection_name).await;
 
-        // Measure
+        // E. Verify Recall
+        // We query for a point generated from the *current* cluster positions.
+        // If the index hasn't adapted (split/merged), it will look in old locations and miss.
         let query_vec = world.clusters[0].generate_point(&mut world.rng);
         let k = 10;
         let ground_truth = calculate_ground_truth(&shadow_db, &query_vec, k);
@@ -251,11 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             vector: query_vec,
             k: k as u32,
             target_confidence: 0.95,
-
-            // FIX 2: Lower Lambda to allow "fuzzier" matching as data drifts away
-            // 0.1 means probability decays slower over distance.
-            lambda: 0.1,
-
+            lambda: 0.5, // Decaying score
             tau: 100.0,
         });
 
@@ -266,7 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let result_ids: Vec<u64> = response.results.iter().map(|r| r.id).collect();
         let recall = calculate_recall(&result_ids, &ground_truth);
 
-        // Check adaptability
+        // Check Bucket Count (Adaptability Metric)
         let coll = manager.get_or_create(collection_name, None).await.unwrap();
         let bucket_count = coll.index.get_all_bucket_headers().len();
 
@@ -279,8 +267,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shadow_db.len()
         );
 
-        if recall < 0.7 {
-            println!("   ⚠️  CRITICAL: Recall dropped significantly!");
+        if recall < 0.8 {
+            println!("   ⚠️  Recall Drop Detected! Index might be lagging behind drift.");
         }
     }
 

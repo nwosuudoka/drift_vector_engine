@@ -1,10 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use crate::bucket::BucketHeader;
     use crate::index::{IndexOptions, MaintenanceStatus, VectorIndex};
     use crossbeam_epoch::{self as epoch};
     use drift_cache::local_store::LocalDiskManager;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;

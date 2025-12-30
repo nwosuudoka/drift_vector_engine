@@ -1,11 +1,12 @@
 use drift_core::index::{IndexOptions, VectorIndex};
 use drift_core::quantizer::Quantizer;
+use drift_core::tombstone::TombstoneFile;
 use drift_storage::disk_manager::{DiskManager, DriftPageManager};
 use drift_storage::segment_reader::SegmentReader;
 use drift_storage::segment_writer::SegmentWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct PersistenceManager {
@@ -235,5 +236,56 @@ impl PersistenceManager {
             }
         }
         Ok(())
+    }
+
+    /// Flushes a snapshot of deleted IDs to a sidecar file.
+    pub async fn flush_tombstones(&self, ids: &[u64], run_id: &str) -> std::io::Result<PathBuf> {
+        if ids.is_empty() {
+            return Ok(self.base_path.clone());
+        }
+
+        let file_name = format!("tombstones_{}.drift", run_id);
+        let file_path = self.base_path.join(&file_name);
+        let uri = Self::to_uri(&file_path);
+
+        let file = TombstoneFile::new(ids.to_vec());
+        let bytes = file.to_bytes()?;
+
+        let manager = DiskManager::open(&uri).await?;
+        manager.upload(bytes).await?;
+
+        info!("Flushed {} tombstones to {}", ids.len(), file_name);
+        Ok(file_path)
+    }
+
+    /// Loads ALL tombstone files and returns the aggregated set.
+    pub async fn load_all_tombstones(&self) -> std::io::Result<Vec<u64>> {
+        let mut all_deleted = Vec::new();
+
+        if !self.base_path.exists() {
+            return Ok(vec![]);
+        }
+
+        let mut read_dir = tokio::fs::read_dir(&self.base_path).await?;
+
+        while let Some(entry) = read_dir.next_entry().await? {
+            let path = entry.path();
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+            if name.starts_with("tombstones_") && name.ends_with(".drift") {
+                let uri = Self::to_uri(&path);
+                let manager = DiskManager::open(&uri).await?;
+
+                let len = manager.len().await?;
+                if len > 0 {
+                    let bytes = manager.read_at(0, len as usize).await?;
+                    match TombstoneFile::from_bytes(&bytes) {
+                        Ok(file) => all_deleted.extend(file.deleted_ids),
+                        Err(e) => warn!("Failed to load tombstone file {:?}: {}", path, e),
+                    }
+                }
+            }
+        }
+        Ok(all_deleted)
     }
 }

@@ -48,7 +48,12 @@ impl Janitor {
                 }
             }
 
-            // 2. Maintenance
+            // 2. Scavenge (Disk -> Disk Compaction)
+            if let Err(e) = self.scavenge().await {
+                error!("Janitor: Scavenge failed: {}", e);
+            }
+
+            // 3. Maintenance
             self.perform_maintenance().await;
         }
     }
@@ -162,8 +167,19 @@ impl Janitor {
             .flush_memtable_to_segment(&data, &self.index, &run_id)
             .await?;
 
-        // 4. Cleanup
+        // 4. Flush Tombstones
+        // We snapshot the entire set. This is safe and robust for now.
+        // Compaction (future) will delete these files when they are no longer needed.
+        let deleted_snapshot: Vec<u64> = self.index.deleted_ids.read().iter().cloned().collect();
+
+        // Cleanup
         // Only verify flush if persistence succeeded.
+        if !deleted_snapshot.is_empty() {
+            self.persistence
+                .flush_tombstones(&deleted_snapshot, &run_id)
+                .await?;
+        }
+
         self.index.confirm_flush()?;
 
         info!(
@@ -172,5 +188,59 @@ impl Janitor {
             "Flush Complete"
         );
         Ok(Some(path))
+    }
+
+    // In drift_server/src/janitor.rs
+
+    pub async fn scavenge(&self) -> std::io::Result<()> {
+        // Optimization: If global deleted set is small, don't bother scanning.
+        if self.index.deleted_ids.read().len() < 100 {
+            return Ok(());
+        }
+
+        // 1. Identify Dirty Buckets
+        // We scan headers and check the AtomicU32 tombstone_count.
+        let headers = self.index.get_all_bucket_headers();
+        let mut dirty_candidates = Vec::new();
+
+        for header in headers {
+            let total = header.count as f32;
+            if total == 0.0 {
+                continue;
+            }
+
+            // SAFETY: This load is atomic and safe.
+            // It reflects the current count updated by delete() calls.
+            let dead = header
+                .stats
+                .tombstone_count
+                .load(std::sync::atomic::Ordering::Relaxed) as f32;
+
+            // Threshold: > 20% dead items
+            if (dead / total) > 0.20 {
+                dirty_candidates.push(header.id);
+            }
+        }
+
+        // 2. Compact One Candidate
+        // We process one per cycle to be gentle on system resources.
+        if let Some(bucket_id) = dirty_candidates.first() {
+            info!("Janitor: Scavenging bucket {} (Dirty)", bucket_id);
+
+            if let Ok(Some(purged_ids)) = self.index.compact_bucket(*bucket_id).await
+                && !purged_ids.is_empty()
+            {
+                info!("Janitor: Purged {} IDs from memory.", purged_ids.len());
+
+                // 3. FREE MEMORY
+                // Now we can safely remove these IDs from the global filter
+                let mut write_guard = self.index.deleted_ids.write();
+                for id in purged_ids {
+                    write_guard.remove(&id);
+                }
+            }
+        }
+
+        Ok(())
     }
 }

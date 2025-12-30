@@ -32,3 +32,6 @@ tonic-prost-build = "0.14.2"
 
 [features]
 stress-test = []
+
+[dev-dependencies]
+crossbeam-epoch = "0.9"

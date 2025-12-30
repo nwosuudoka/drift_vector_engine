@@ -50,7 +50,7 @@ mod tests {
 
         // 2. Train Quantizer
         let quantizer = Quantizer::train(&samples);
-        let q_arc = Arc::new(quantizer.clone());
+        let _q_arc = Arc::new(quantizer.clone());
 
         // 3. Create BucketData
         let mut bucket_data = BucketData {
@@ -92,7 +92,7 @@ mod tests {
         assert_eq!(loaded_arc.codes.len(), count * dim);
 
         // 8. Verify Reconstruction
-        let (rec_vecs, rec_ids) = loaded_arc.reconstruct(&quantizer);
+        let (rec_vecs, _rec_ids) = loaded_arc.reconstruct(&quantizer);
         assert_eq!(rec_vecs.len(), count);
 
         // Check accuracy (SQ8 is lossy, but [1.0, 1.0...] should be close)

@@ -165,7 +165,7 @@ async fn test_empty_write_handling() {
     // Write a segment with NO buckets
     {
         let manager = DiskManager::open(&uri).await.unwrap();
-        let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+        let writer = SegmentWriter::new(manager, vec![]).await.unwrap();
         writer.finalize().await.unwrap();
     }
 

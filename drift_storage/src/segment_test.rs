@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use crate::compression::wrapper::CompressionStrategy;
     use crate::disk_manager::DiskManager;
     use crate::segment_reader::SegmentReader;
     use crate::segment_writer::{CompressionType, SegmentWriter};

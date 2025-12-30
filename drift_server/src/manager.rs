@@ -118,6 +118,17 @@ impl CollectionManager {
         // Hydrate
         persistence.hydrate_index(&index).await?;
 
+        // NEW: Hydrate Tombstones
+        let deleted_ids = persistence.load_all_tombstones().await?;
+        if !deleted_ids.is_empty() {
+            info!(
+                "Manager: Restored {} deleted IDs for collection '{}'",
+                deleted_ids.len(),
+                name
+            );
+            index.deleted_ids.write().extend(deleted_ids);
+        }
+
         // Start Janitor
         let j_idx = index.clone();
         let j_persist = persistence.clone();

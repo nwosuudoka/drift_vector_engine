@@ -5,7 +5,6 @@ mod tests {
     use crate::quantizer::Quantizer;
     use bit_set::BitSet;
     use drift_traits::PageId;
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
     // --- Helpers ---

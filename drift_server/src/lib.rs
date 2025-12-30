@@ -17,6 +17,12 @@ mod server_tests;
 mod persistence_tests;
 
 #[cfg(test)]
+mod tombstone_test;
+
+#[cfg(test)]
+mod scavenger_test;
+
+#[cfg(test)]
 #[cfg(feature = "stress-test")]
 mod server_heavy_load_test;
 

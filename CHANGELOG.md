@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.6.4] - Compaction & Correctness Hardening
+
+**Tag:** `v0.6.4-stable-core`
+
+### Added
+
+- **The Scavenger (Compaction):** Implemented a Copy-on-Write compaction engine that rewrites "dirty" buckets (>20% deleted) and frees up RAM from the global tombstone set.
+- **Recall Guardrail:** Added a geometric safety check to `search_async` that forces scanning of the closest bucket, preventing "density starvation" where small, new buckets were ignored by the probabilistic router.
+- **Drift Simulation Harness:** Added `drift_sim` binary to validate the engine against heavy concept drift, proving adaptability and self-healing capabilities.
+
+### Changed
+
+- **Search Architecture:** Refactored `search_async` into "RAM-First" execution order. This closes a race condition where data moving from RAM to Disk during the search I/O window could be missed.
+- **Phase Separation:** Split search logic into distinct Async I/O and Sync CPU phases to prevent `!Send` lock guard panics across await points without expensive cloning.
+
+### Fixed
+
+- **Memory Leak:** Fixed the unbounded growth of `deleted_ids` by implementing the Scavenger to physically purge deletes from disk and memory.
+- **Race Condition:** Fixed a "Hole in the Timeline" bug in Release mode where high-speed flushes caused searches to miss data.
+
+## [0.6.3] - Tiered Caching & Tombstone Stability
+
+**Tag:** `v0.6.3-cache-stable`
+
+### Added
+
+- **Tiered Page Cache:** Implemented `TieredPageManager` which composes a Local (NVMe) and Remote (S3) store.
+- **Read-Ahead Optimization:** Reads from Remote are aligned to 4MB chunks to amortize S3 latency and populate the local cache efficiently.
+- **Tombstone Persistence:** (Upcoming) Logic to persist deleted IDs to avoid resurrection after WAL truncation.
+
 ## [0.6.2] - Persistence Hardening & Dual-Tier Storage
 
 **Tag:** `v0.6.2-storage-stable`
