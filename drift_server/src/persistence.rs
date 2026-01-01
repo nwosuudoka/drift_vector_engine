@@ -47,17 +47,17 @@ impl PersistenceManager {
 
         let headers = index.get_all_bucket_headers();
         for header in headers {
-            if let Ok(data) = index.cache.get(&header.page_id).await {
-                if !data.vids.is_empty() {
-                    writer
-                        .write_bucket_sq8(
-                            header.id,
-                            &data.vids,
-                            data.codes.as_slice(),
-                            index.config.dim,
-                        )
-                        .await?;
-                }
+            if let Ok(data) = index.cache.get(&header.page_id).await
+                && !data.vids.is_empty()
+            {
+                writer
+                    .write_bucket_sq8(
+                        header.id,
+                        &data.vids,
+                        data.codes.as_slice(),
+                        index.config.dim,
+                    )
+                    .await?;
             }
         }
         writer.finalize().await?;
@@ -220,8 +220,7 @@ impl PersistenceManager {
                             rec_vecs
                         } else {
                             // Should be impossible if we just set it above
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            return Err(std::io::Error::other(
                                 "Missing Quantizer during hydration",
                             ));
                         }

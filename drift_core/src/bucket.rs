@@ -116,8 +116,8 @@ impl Cacheable for BucketData {
         let bit_width = cursor.read_u8()? as usize;
         let packed_len = cursor.read_u32::<LittleEndian>()? as usize;
         let mut packed_data = vec![0u32; packed_len];
-        for i in 0..packed_len {
-            packed_data[i] = cursor.read_u32::<LittleEndian>()?;
+        for packed_value in &mut packed_data {
+            *packed_value = cursor.read_u32::<LittleEndian>()?;
         }
 
         let mut blocks = vec![0u32; num_blocks];
@@ -165,8 +165,8 @@ impl BucketData {
         buf.write_u32::<LittleEndian>(blocks.len() as u32)?;
         buf.write_u8(width as u8)?;
         buf.write_u32::<LittleEndian>(packed_count as u32)?;
-        for i in 0..packed_count {
-            buf.write_u32::<LittleEndian>(packed_buf[i])?;
+        for &value in &packed_buf[0..packed_count] {
+            buf.write_u32::<LittleEndian>(value)?;
         }
         Ok(buf)
     }
