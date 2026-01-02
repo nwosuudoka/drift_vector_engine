@@ -3,6 +3,7 @@ mod tests {
     use crate::disk_manager::DiskManager;
     use crate::segment_reader::SegmentReader;
     use crate::segment_writer::{CompressionType, SegmentWriter};
+    use opendal::{Operator, services};
     use rand::Rng;
     use tempfile::tempdir;
 
@@ -16,25 +17,30 @@ mod tests {
     }
 
     /// Simulates a Quantizer producing SQ8 codes from floats.
-    /// Just maps float -> u8 via simple scaling for testing storage.
     fn mock_quantize(vecs: &[Vec<f32>]) -> Vec<u8> {
         let mut codes = Vec::with_capacity(vecs.len() * vecs[0].len());
         for v in vecs {
             for &val in v {
-                // Mock quantization: (val * 10.0) % 255
                 codes.push(((val * 10.0) as u32 % 255) as u8);
             }
         }
         codes
     }
 
+    // Helper to create a local FS operator
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
     // --- Test 1: The "Dual-Tier" Flush (L0 -> L1) ---
-    // This is the most critical path: persisting fresh data.
     #[tokio::test]
     async fn test_dual_tier_flush_and_read() {
         let dir = tempdir().unwrap();
-        let file_path = dir.path().join("dual_tier.drift");
-        let uri = format!("file://{}", file_path.to_str().unwrap());
+        // ⚡ CHANGE: Create Operator
+        let op = create_local_operator(dir.path());
+        let filename = "dual_tier.drift";
 
         let dim = 128;
         let count = 100;
@@ -43,14 +49,14 @@ mod tests {
         // 1. Generate Data
         let raw_vectors = generate_random_vectors(count, dim);
         let ids: Vec<u64> = (0..count as u64).collect();
-        let sq8_codes = mock_quantize(&raw_vectors); // Simulate Quantizer output
+        let sq8_codes = mock_quantize(&raw_vectors);
 
-        // Mock Quantizer Config (Metadata)
         let q_config = vec![0xAA, 0xBB, 0xCC];
 
         // 2. Write Segment (Dual Tier)
         {
-            let manager = DiskManager::open(&uri).await.unwrap();
+            // ⚡ CHANGE: Inject Operator + Filename
+            let manager = DiskManager::new(op.clone(), filename.to_string());
             let mut writer = SegmentWriter::new(manager, q_config.clone()).await.unwrap();
 
             writer
@@ -62,7 +68,10 @@ mod tests {
         }
 
         // 3. Read Back
-        let reader = SegmentReader::open(&uri).await.expect("Open failed");
+        // ⚡ CHANGE: Use open_with_op
+        let reader = SegmentReader::open_with_op(op.clone(), filename)
+            .await
+            .expect("Open failed");
 
         // A. Verify Metadata
         assert_eq!(reader.read_metadata(), &q_config);
@@ -71,19 +80,18 @@ mod tests {
         let loc = reader.index.buckets.get(&bucket_id).unwrap();
         assert_eq!(loc.vector_count, count);
         assert_eq!(loc.compression_type, CompressionType::Compressed as u8);
-        assert!(loc.index_length > 0); // SQ8 Blob exists
-        assert!(loc.data_length > 0); // ALP Blob exists
+        assert!(loc.index_length > 0);
+        assert!(loc.data_length > 0);
 
-        // C. FAST PATH: Read SQ8 (Hot Cache Load)
+        // C. FAST PATH: Read SQ8
         let (read_ids, read_codes) = reader.read_bucket(bucket_id).await.unwrap();
         assert_eq!(read_ids, ids);
         assert_eq!(read_codes, sq8_codes, "SQ8 Index blob corrupted");
 
-        // D. COLD PATH: Read Floats (Re-ranking / Recovery)
+        // D. COLD PATH: Read Floats
         let read_floats = reader.read_bucket_high_fidelity(bucket_id).await.unwrap();
         assert_eq!(read_floats.len(), count);
 
-        // Check fuzzy equality (ALP is lossy-ish depending on float precision, but usually exact for simple randoms)
         let f1 = &raw_vectors[0];
         let f2 = &read_floats[0];
         for (a, b) in f1.iter().zip(f2.iter()) {
@@ -92,26 +100,22 @@ mod tests {
     }
 
     // --- Test 2: The "Maintenance" Path (L1 -> L1) ---
-    // This tests Split/Merge where we only move SQ8 codes.
     #[tokio::test]
     async fn test_sq8_only_maintenance_write() {
         let dir = tempdir().unwrap();
-        let uri = format!(
-            "file://{}",
-            dir.path().join("maintenance.drift").to_str().unwrap()
-        );
+        let op = create_local_operator(dir.path());
+        let filename = "maintenance.drift";
 
         let dim = 64;
         let count = 50;
         let bucket_id = 99;
 
-        // Data
         let ids: Vec<u64> = (1000..1050).collect();
-        let sq8_codes = vec![0x7F; count * dim]; // All grey values
+        let sq8_codes = vec![0x7F; count * dim];
 
         // 1. Write Segment (SQ8 Only)
         {
-            let manager = DiskManager::open(&uri).await.unwrap();
+            let manager = DiskManager::new(op.clone(), filename.to_string());
             let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
 
             writer
@@ -123,7 +127,9 @@ mod tests {
         }
 
         // 2. Read Back
-        let reader = SegmentReader::open(&uri).await.unwrap();
+        let reader = SegmentReader::open_with_op(op.clone(), filename)
+            .await
+            .unwrap();
         let loc = reader.index.buckets.get(&bucket_id).unwrap();
 
         // Assertions
@@ -145,8 +151,10 @@ mod tests {
     #[tokio::test]
     async fn test_validations() {
         let dir = tempdir().unwrap();
-        let uri = format!("file://{}", dir.path().join("bad.drift").to_str().unwrap());
-        let manager = DiskManager::open(&uri).await.unwrap();
+        let op = create_local_operator(dir.path());
+        let filename = "bad.drift";
+
+        let manager = DiskManager::new(op.clone(), filename.to_string());
         let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
 
         // 1. Dimension Mismatch
@@ -181,10 +189,8 @@ mod tests {
     #[tokio::test]
     async fn test_bloom_filter_persistence() {
         let dir = tempdir().unwrap();
-        let uri = format!(
-            "file://{}",
-            dir.path().join("bloom.drift").to_str().unwrap()
-        );
+        let op = create_local_operator(dir.path());
+        let filename = "bloom.drift";
 
         let ids = vec![42, 999, 10_000];
         let dim = 4;
@@ -192,14 +198,16 @@ mod tests {
 
         // Write
         {
-            let manager = DiskManager::open(&uri).await.unwrap();
+            let manager = DiskManager::new(op.clone(), filename.to_string());
             let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
             writer.write_bucket_sq8(1, &ids, &codes, dim).await.unwrap();
             writer.finalize().await.unwrap();
         }
 
         // Read
-        let reader = SegmentReader::open(&uri).await.unwrap();
+        let reader = SegmentReader::open_with_op(op.clone(), filename)
+            .await
+            .unwrap();
 
         // Check Positive
         assert!(reader.might_contain(42));
