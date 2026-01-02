@@ -353,14 +353,13 @@ impl VectorIndex {
         Ok(())
     }
 
-    // ZERO-COST FIX: Reordered Execution (Phase Separation)
     pub async fn search_async(
         &self,
         query: &[f32],
         k: usize,
-        target_confidence: f32,
-        lambda: f32,
-        tau: f32,
+        target_confidence: f32, // Parameter from Table 2 [cite: 68]
+        lambda: f32,            // Decay rate [cite: 21]
+        tau: f32,               // Critical Mass
     ) -> io::Result<Vec<SearchResult>> {
         // --- PHASE 1: SNAPSHOT & PRE-CALCULATION ---
 
@@ -370,18 +369,11 @@ impl VectorIndex {
             guard.as_ref().map(|q| q.precompute_lut(query))
         };
 
-        // ⚡ FIX: Search MemTable FIRST (Before yielding/awaiting)
-        // This closes the "Hole in the Timeline". If the Janitor runs after this,
-        // we already have the results from RAM.
-        // We do NOT filter deletes yet (that requires a lock we don't want to hold during await).
+        // MemTable Search [Remains same]
         let mem_results = {
             let guard = epoch::pin();
             let active = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-
-            // Search Active
             let mut results = active.search(query, k, self.config.ef_search);
-
-            // Search Frozen (if exists)
             let frozen_guard = self.frozen_memtable.read();
             if let Some(frozen) = frozen_guard.as_ref() {
                 results.extend(frozen.search(query, k, self.config.ef_search));
@@ -389,7 +381,7 @@ impl VectorIndex {
             results
         };
 
-        // B. Select Buckets (IVF Logic)
+        // B. Select Buckets (Saturating Density-Awareness)
         let selected_headers = {
             let guard = epoch::pin();
             let buckets_map =
@@ -404,7 +396,7 @@ impl VectorIndex {
                     clusters.entry(key).or_default().push(header);
                 }
 
-                // 1. Calculate Scores (Probability of finding the neighbor)
+                // ⚡ IMPLEMENTATION OF EQ (3): P_eff = P_geom * R(b)
                 let mut candidates: Vec<(Vec<&BucketHeader>, f32)> = clusters
                     .into_values()
                     .map(|headers| {
@@ -413,20 +405,25 @@ impl VectorIndex {
 
                         let dist_sq = crate::math::l2_sq(query, centroid);
                         let dist = dist_sq.sqrt();
-                        let p_geom = (-lambda * dist).exp();
-                        let p_density = 1.0 - (-(total_count as f32) / tau).exp();
 
-                        (headers, p_geom * p_density)
+                        // P_geom (Eq 1) [cite: 21]
+                        let p_geom = (-lambda * dist).exp();
+
+                        // R(b) - Saturating Density (Eq 2) [cite: 29]
+                        let reliability = 1.0 - (-(total_count as f32) / tau).exp();
+
+                        // P_eff (Eq 3) [cite: 33]
+                        let p_eff = p_geom * reliability;
+
+                        (headers, p_eff)
                     })
                     .collect();
 
-                // Sort by Score (High to Low)
                 candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
 
                 let mut headers = Vec::new();
                 let mut acc_conf = 0.0;
 
-                // 2. Select by Confidence
                 for (group, score) in candidates {
                     acc_conf += score;
                     for h in group {
@@ -437,26 +434,27 @@ impl VectorIndex {
                     }
                 }
 
-                // 3. ⚡ RECALL GUARDRAIL: Always include the Geometrically Closest bucket
-                // This protects small buckets (low density) from being starved by large buckets.
-                // If the query lands directly inside a bucket, we MUST scan it.
+                // RECALL GUARDRAIL: Always include geometrically closest
                 if let Some(best) = buckets_map.values().min_by(|a, b| {
                     crate::math::l2_sq(query, &a.centroid)
                         .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
                         .unwrap_or(CmpOrdering::Equal)
                 }) {
-                    // Only add if not already selected via probability
                     if !headers.iter().any(|h| h.id == best.id) {
                         headers.push((*best).clone());
                     }
+                }
+
+                // Update "Heat" for Urgency Calculation
+                for header in &headers {
+                    header.touch();
                 }
 
                 headers
             }
         };
 
-        // C. Load Data (THE ASYNC AWAIT)
-        // It is now safe to yield. We have captured RAM (mem_results) and requested Disk (selected_headers).
+        // C. Load Data
         let mut loaded_data = Vec::with_capacity(selected_headers.len());
         for header in selected_headers {
             match self.cache.get(&header.page_id).await {
@@ -466,39 +464,34 @@ impl VectorIndex {
         }
 
         // --- PHASE 2: SYNCHRONOUS MERGE & FILTER ---
-
         let deleted_guard = self.deleted_ids.read();
         let mut heap = BinaryHeap::with_capacity(k);
-        let mut l0_found = HashSet::new(); // Deduplication set
+        let mut l0_found = HashSet::new();
 
-        // D. Process MemTable Results (Already computed in Phase 1)
+        // Process MemTable
         for (id, dist) in mem_results {
             if deleted_guard.contains(&id) {
                 continue;
             }
-
             l0_found.insert(id);
             let res = SearchResult { id, distance: dist };
             Self::push_to_heap(&mut heap, res, k);
         }
 
-        // F. Scan Disk Results
+        // Process Disk (Using ADC)
         if let Some(lut_vec) = &lut {
             let dim = self.config.dim;
             for data in loaded_data {
-                // SIMD Scan
+                // ADC Scan via Bucket Kernel [cite: 41]
                 let hits = Bucket::scan_with_lut(&data, lut_vec, dim);
 
                 for res in hits {
                     if deleted_guard.contains(&res.id) {
                         continue;
                     }
-
-                    // Dedupe: If we found it in RAM, ignore the Disk version (RAM is newer)
                     if l0_found.contains(&res.id) {
                         continue;
                     }
-
                     Self::push_to_heap(&mut heap, res, k);
                 }
             }
@@ -513,7 +506,7 @@ impl VectorIndex {
         Ok(sorted)
     }
 
-    // Helper to keep code clean
+    // Helper for Heap
     fn push_to_heap(heap: &mut BinaryHeap<SearchResult>, res: SearchResult, k: usize) {
         if heap.len() < k {
             heap.push(res);
@@ -522,6 +515,180 @@ impl VectorIndex {
             heap.push(res);
         }
     }
+
+    // ZERO-COST FIX: Reordered Execution (Phase Separation)
+    // pub async fn search_async(
+    //     &self,
+    //     query: &[f32],
+    //     k: usize,
+    //     target_confidence: f32,
+    //     lambda: f32,
+    //     tau: f32,
+    // ) -> io::Result<Vec<SearchResult>> {
+    //     // --- PHASE 1: SNAPSHOT & PRE-CALCULATION ---
+
+    //     // A. Quantizer & LUT
+    //     let lut: Option<Vec<f32>> = {
+    //         let guard = self.quantizer.read();
+    //         guard.as_ref().map(|q| q.precompute_lut(query))
+    //     };
+
+    //     // ⚡ FIX: Search MemTable FIRST (Before yielding/awaiting)
+    //     // This closes the "Hole in the Timeline". If the Janitor runs after this,
+    //     // we already have the results from RAM.
+    //     // We do NOT filter deletes yet (that requires a lock we don't want to hold during await).
+    //     let mem_results = {
+    //         let guard = epoch::pin();
+    //         let active = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+    //         // Search Active
+    //         let mut results = active.search(query, k, self.config.ef_search);
+
+    //         // Search Frozen (if exists)
+    //         let frozen_guard = self.frozen_memtable.read();
+    //         if let Some(frozen) = frozen_guard.as_ref() {
+    //             results.extend(frozen.search(query, k, self.config.ef_search));
+    //         }
+    //         results
+    //     };
+
+    //     // B. Select Buckets (IVF Logic)
+    //     let selected_headers = {
+    //         let guard = epoch::pin();
+    //         let buckets_map =
+    //             unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+    //         if buckets_map.is_empty() {
+    //             Vec::new()
+    //         } else {
+    //             let mut clusters: HashMap<Vec<u32>, Vec<&BucketHeader>> = HashMap::new();
+    //             for header in buckets_map.values() {
+    //                 let key: Vec<u32> = header.centroid.iter().map(|f| f.to_bits()).collect();
+    //                 clusters.entry(key).or_default().push(header);
+    //             }
+
+    //             // 1. Calculate Scores (Probability of finding the neighbor)
+    //             let mut candidates: Vec<(Vec<&BucketHeader>, f32)> = clusters
+    //                 .into_values()
+    //                 .map(|headers| {
+    //                     let centroid = &headers[0].centroid;
+    //                     let total_count: u32 = headers.iter().map(|h| h.count).sum();
+
+    //                     let dist_sq = crate::math::l2_sq(query, centroid);
+    //                     let dist = dist_sq.sqrt();
+    //                     let p_geom = (-lambda * dist).exp();
+    //                     let p_density = 1.0 - (-(total_count as f32) / tau).exp();
+
+    //                     (headers, p_geom * p_density)
+    //                 })
+    //                 .collect();
+
+    //             // Sort by Score (High to Low)
+    //             candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
+
+    //             let mut headers = Vec::new();
+    //             let mut acc_conf = 0.0;
+
+    //             // 2. Select by Confidence
+    //             for (group, score) in candidates {
+    //                 acc_conf += score;
+    //                 for h in group {
+    //                     headers.push((*h).clone());
+    //                 }
+    //                 if acc_conf >= target_confidence {
+    //                     break;
+    //                 }
+    //             }
+
+    //             // 3. ⚡ RECALL GUARDRAIL: Always include the Geometrically Closest bucket
+    //             // This protects small buckets (low density) from being starved by large buckets.
+    //             // If the query lands directly inside a bucket, we MUST scan it.
+    //             if let Some(best) = buckets_map.values().min_by(|a, b| {
+    //                 crate::math::l2_sq(query, &a.centroid)
+    //                     .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
+    //                     .unwrap_or(CmpOrdering::Equal)
+    //             }) {
+    //                 // Only add if not already selected via probability
+    //                 if !headers.iter().any(|h| h.id == best.id) {
+    //                     headers.push((*best).clone());
+    //                 }
+    //             }
+
+    //             for header in &headers {
+    //                 header.touch();
+    //             }
+
+    //             headers
+    //         }
+    //     };
+
+    //     // C. Load Data (THE ASYNC AWAIT)
+    //     // It is now safe to yield. We have captured RAM (mem_results) and requested Disk (selected_headers).
+    //     let mut loaded_data = Vec::with_capacity(selected_headers.len());
+    //     for header in selected_headers {
+    //         match self.cache.get(&header.page_id).await {
+    //             Ok(data) => loaded_data.push(data),
+    //             Err(e) => error!("Failed to load bucket {}: {}", header.id, e),
+    //         }
+    //     }
+
+    //     // --- PHASE 2: SYNCHRONOUS MERGE & FILTER ---
+
+    //     let deleted_guard = self.deleted_ids.read();
+    //     let mut heap = BinaryHeap::with_capacity(k);
+    //     let mut l0_found = HashSet::new(); // Deduplication set
+
+    //     // D. Process MemTable Results (Already computed in Phase 1)
+    //     for (id, dist) in mem_results {
+    //         if deleted_guard.contains(&id) {
+    //             continue;
+    //         }
+
+    //         l0_found.insert(id);
+    //         let res = SearchResult { id, distance: dist };
+    //         Self::push_to_heap(&mut heap, res, k);
+    //     }
+
+    //     // F. Scan Disk Results
+    //     if let Some(lut_vec) = &lut {
+    //         let dim = self.config.dim;
+    //         for data in loaded_data {
+    //             // SIMD Scan
+    //             let hits = Bucket::scan_with_lut(&data, lut_vec, dim);
+
+    //             for res in hits {
+    //                 if deleted_guard.contains(&res.id) {
+    //                     continue;
+    //                 }
+
+    //                 // Dedupe: If we found it in RAM, ignore the Disk version (RAM is newer)
+    //                 if l0_found.contains(&res.id) {
+    //                     continue;
+    //                 }
+
+    //                 Self::push_to_heap(&mut heap, res, k);
+    //             }
+    //         }
+    //     }
+
+    //     let mut sorted = heap.into_vec();
+    //     sorted.sort_by(|a, b| {
+    //         a.distance
+    //             .partial_cmp(&b.distance)
+    //             .unwrap_or(CmpOrdering::Equal)
+    //     });
+    //     Ok(sorted)
+    // }
+
+    // Helper to keep code clean
+    // fn push_to_heap(heap: &mut BinaryHeap<SearchResult>, res: SearchResult, k: usize) {
+    //     if heap.len() < k {
+    //         heap.push(res);
+    //     } else if res.distance <= heap.peek().unwrap().distance {
+    //         heap.pop();
+    //         heap.push(res);
+    //     }
+    // }
 
     pub async fn force_register_bucket_with_ids(
         &self,
@@ -668,9 +835,8 @@ impl VectorIndex {
             return Ok(MaintenanceStatus::SkippedTooSmall);
         }
 
-        // --- DRIFT/VARIANCE CHECK ---
-        // Implement your suggestion: Check if the bucket has enough internal variance to split.
-        // If variance is near zero, it's a Singularity.
+        // --- DRIFT CALCULATION [SDD Section 3.C] ---
+        // Formula: Drift = Distance(Current_Mean, Initial_Centroid)
         let dim = self.config.dim;
         let mut mean = vec![0.0; dim];
         for v in &vecs {
@@ -682,18 +848,20 @@ impl VectorIndex {
             *mean_val /= vecs.len() as f32;
         }
 
-        let mut total_variance = 0.0;
-        for v in &vecs {
-            total_variance += crate::math::l2_sq(v, &mean);
-        }
-        let avg_variance = total_variance / vecs.len() as f32;
+        let drift = crate::math::l2_sq(&mean, &header.centroid).sqrt();
+        let capacity_ratio = vecs.len() as f32 / self.config.max_bucket_capacity as f32;
 
-        // Threshold 0.01 is conservative for SQ8 (which has ~0.5 error).
-        // If real variance is < 0.01, points are identical.
-        if avg_variance < 0.01 {
-            return Ok(MaintenanceStatus::SkippedSingularity);
+        // Trigger Conditions from SDD Section 3.C:
+        // 1. Count > Target * 0.8
+        // 2. Drift > 0.15
+        let capacity_breach = capacity_ratio > 0.8;
+        let drift_breach = drift > 0.15;
+
+        if !capacity_breach && !drift_breach {
+            return Ok(MaintenanceStatus::SkippedTooSmall);
         }
 
+        // Proceed with Split (2-Means)
         let trainer = KMeansTrainer::new(2, self.config.dim, 10);
         let result = trainer.train(&vecs);
 
@@ -716,6 +884,7 @@ impl VectorIndex {
             return Ok(MaintenanceStatus::SkippedSingularity);
         }
 
+        // --- NEIGHBOR STEALING (Budgeted) ---
         let neighbors = {
             let mut candidates: Vec<(u32, f32)> = all_centroids
                 .iter()
@@ -732,9 +901,10 @@ impl VectorIndex {
 
         let mut modified_neighbors = HashMap::new();
         let mut budget = 0;
+        const MAX_STEAL_BUDGET: usize = 200; // SDD Section 3.D
 
         for nid in neighbors {
-            if budget >= 200 {
+            if budget >= MAX_STEAL_BUDGET {
                 break;
             }
             let n_header = {
@@ -883,13 +1053,12 @@ impl VectorIndex {
         let q_arc = self.quantizer.read().as_ref().unwrap().clone();
         let deleted_snapshot: HashSet<u64> = self.deleted_ids.read().clone();
 
-        // 1. Load Zombie Bucket
+        // 1. Load Zombie
         let (z_header, all_centroids) = {
             let guard = epoch::pin();
             let buckets = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
             let centroids =
                 unsafe { self.centroids.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-
             let h = match buckets.get(&zombie_id) {
                 Some(h) => h.clone(),
                 None => return Ok(MaintenanceStatus::SkippedTooSmall),
@@ -915,13 +1084,10 @@ impl VectorIndex {
             }
         }
 
-        // 4. ⚡ STRICT BUDGET ENFORCEMENT
-        // If there are too many survivors, merging is too expensive (Write Amp).
-        // We abort and wait for more deletions.
+        // 4. ⚡ BUDGET ENFORCEMENT
+        // "Max 50 vectors moved per split/merge" to prevent write amp storms.
         if orphans_vec.len() > 50 {
-            // We reuse 'SkippedTooSmall' or add a new variant 'SkippedOverBudget'
-            // For now, SkippedTooSmall effectively means "Not right for maintenance"
-            return Ok(MaintenanceStatus::SkippedTooSmall);
+            return Ok(MaintenanceStatus::SkippedTooSmall); // Wait for more deletes
         }
 
         if orphans_vec.is_empty() {
@@ -935,12 +1101,11 @@ impl VectorIndex {
             .filter(|c| c.active && c.id != zombie_id)
             .map(|c| (c.id, crate::math::l2_sq(&z_header.centroid, &c.vector)))
             .collect();
-
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         let neighbor_ids: Vec<u32> = candidates.into_iter().take(3).map(|(id, _)| id).collect();
 
         if neighbor_ids.is_empty() {
-            // No neighbors? Just re-insert to L0 as fallback (Safety net)
+            // Fallback to L0 if no neighbors
             for (i, vec) in orphans_vec.iter().enumerate() {
                 self.insert(orphans_id[i], vec)?;
             }

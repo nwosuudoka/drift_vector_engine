@@ -24,6 +24,9 @@ mod tombstone_test;
 mod scatter_budget_test;
 
 #[cfg(test)]
+mod s3_integration_test;
+
+#[cfg(test)]
 mod scavenger_test;
 
 #[cfg(test)]
