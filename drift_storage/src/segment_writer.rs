@@ -87,7 +87,7 @@ impl SegmentWriter {
         })
     }
 
-    /// ⚡ PRIMARY WRITE PATH: Writes both Index (SQ8) and Data (ALP).
+    /// PRIMARY WRITE PATH: Writes both Index (SQ8) and Data (ALP).
     /// Used during L0 -> L1 Flush where we have high-fidelity floats.
     pub async fn write_bucket_dual(
         &mut self,

@@ -34,6 +34,16 @@ impl AlignedBytes {
         }
     }
 
+    // Implement this properly
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        let capacity = bytes.len();
+        let mut result = Self::new(capacity);
+        for val in bytes {
+            result.push(*val);
+        }
+        result
+    }
+
     pub fn push(&mut self, byte: u8) {
         if self.len == self.capacity {
             self.grow();

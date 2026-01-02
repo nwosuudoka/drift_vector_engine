@@ -1288,6 +1288,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "bincode 2.0.1",
+ "byteorder",
  "clap",
  "crossbeam-epoch",
  "drift_cache",

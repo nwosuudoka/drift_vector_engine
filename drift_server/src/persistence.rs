@@ -1,13 +1,20 @@
-use drift_core::index::{IndexOptions, VectorIndex};
+use byteorder::{LittleEndian, WriteBytesExt};
+use drift_core::bucket::BucketData;
+use drift_core::index::{IndexOptions, PartitionResult, VectorIndex};
 use drift_core::quantizer::Quantizer;
 use drift_core::tombstone::TombstoneFile;
 use drift_storage::disk_manager::{DiskManager, DriftPageManager};
 use drift_storage::segment_reader::SegmentReader;
 use drift_storage::segment_writer::SegmentWriter;
+use opendal::Entry;
 use opendal::Operator;
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn};
+
+// const MAGIC: u64 = 0x44524946545631; // "DRIFTV1" in hex
+pub const MAGIC_BYTES: &[u8; 8] = b"DRIFT_V1";
 
 #[derive(Clone)]
 pub struct PersistenceManager {
@@ -158,10 +165,9 @@ impl PersistenceManager {
 
     pub async fn hydrate_index(&self, index: &VectorIndex) -> std::io::Result<()> {
         // List files from the Operator
-        let lister = self.op.lister("").await.map_err(std::io::Error::other)?;
+        let _lister = self.op.lister("").await.map_err(std::io::Error::other)?;
         // We need to collect and filter
         // OpenDAL Lister is async stream
-        use opendal::Entry;
         // Basic list loop (simplified for brevity, assume < 1000 files for now)
         // In production use streaming
         let entries: Vec<Entry> = self.op.list("").await.map_err(std::io::Error::other)?;
@@ -208,10 +214,7 @@ impl PersistenceManager {
                             }
                             rec_vecs
                         } else {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                "Missing Quantizer",
-                            ));
+                            return Err(std::io::Error::other("Missing Quantizer"));
                         }
                     }
                 };
@@ -261,5 +264,118 @@ impl PersistenceManager {
             }
         }
         Ok(all_deleted)
+    }
+
+    pub async fn write_segment_file(
+        &self,
+        buckets: &[(u32, BucketData)],
+        dim: usize,
+    ) -> std::io::Result<String> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let file_name = format!("segment_{}.drift", run_id);
+
+        // We buffer the segment in memory before uploading.
+        // In a high-throughput scenario, you would stream this via SegmentWriter,
+        // but for correctness and simplicity now, we pack the buffer manually.
+        let mut buffer = Vec::new();
+
+        // 1. Write Data Blocks (The Buckets)
+        let mut bucket_index = Vec::new(); // (ID, Offset, Length)
+
+        for (id, bucket) in buckets {
+            let start_offset = buffer.len() as u64;
+            // Serialize bucket using existing logic
+            let bytes = bucket.to_bytes(dim)?;
+            buffer.write_all(&bytes)?;
+            let length = buffer.len() as u64 - start_offset;
+
+            bucket_index.push((*id, start_offset, length));
+        }
+
+        // 2. Write Bucket Index
+        let index_start = buffer.len() as u64;
+        buffer.write_u32::<LittleEndian>(bucket_index.len() as u32)?;
+
+        for (id, offset, length) in bucket_index {
+            buffer.write_u32::<LittleEndian>(id)?;
+            buffer.write_u64::<LittleEndian>(offset)?;
+            buffer.write_u64::<LittleEndian>(length)?;
+        }
+
+        // 3. Write Footer (Fixed 64 bytes)
+        // Layout: [Magic(8) | IndexOffset(8) | BloomFilterOffset(8) | Padding...]
+        let footer_start = buffer.len();
+        buffer.write_all(MAGIC_BYTES)?;
+        buffer.write_u64::<LittleEndian>(index_start)?;
+        buffer.write_u64::<LittleEndian>(0)?; // Bloom Filter Offset (0 = None)
+
+        // Pad to 64 bytes
+        while buffer.len() - footer_start < 64 {
+            buffer.write_u8(0)?;
+        }
+
+        // 4. Upload to S3/MinIO
+        self.op
+            .write(&file_name, buffer)
+            .await
+            .map_err(std::io::Error::other)?;
+
+        info!(
+            "Persistence: Wrote segment {} with {} buckets",
+            file_name,
+            buckets.len()
+        );
+
+        // Return the RUN_ID (raw UUID), not the filename.
+        // The Janitor uses this ID to name related files (like tombstones).
+        Ok(run_id)
+    }
+
+    /// Writes multiple partitions into a single Segment File.
+    /// Preserves ALP compression and Dual-Tier layout.
+    pub async fn write_partitioned_segment(
+        &self,
+        partitions: &[PartitionResult],
+        index: &VectorIndex,
+    ) -> std::io::Result<String> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let file_name = format!("segment_{}.drift", run_id);
+
+        let quantizer_arc = index.get_quantizer().ok_or(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Untrained",
+        ))?;
+
+        let q_bytes = bincode::encode_to_vec(&*quantizer_arc, bincode::config::standard())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        // 1. Initialize SegmentWriter
+        let manager = DiskManager::new(self.op.clone(), file_name.clone());
+        let mut writer = SegmentWriter::new(manager, q_bytes).await?;
+
+        // 2. Loop through partitions and write them
+        for p in partitions {
+            // Use the existing Dual-Tier writer!
+            // This handles SQ8 (Hot) + ALP (Cold) + Bloom Filter
+            writer
+                .write_bucket_dual(
+                    p.bucket_id,
+                    &p.ids,
+                    &p.vectors, // Raw floats for ALP
+                    &p.codes,   // SQ8 codes for Index
+                    index.config.dim,
+                )
+                .await?;
+        }
+
+        // 3. Finalize (Writes Index, Bloom, Quantizer, Footer)
+        writer.finalize().await?;
+
+        info!(
+            "Persistence: Wrote segment {} with {} buckets",
+            file_name,
+            partitions.len()
+        );
+        Ok(run_id)
     }
 }

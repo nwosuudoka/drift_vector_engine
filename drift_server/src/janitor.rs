@@ -118,15 +118,13 @@ impl Janitor {
     async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
         let start = std::time::Instant::now();
 
-        // 1. Get Data (Retry logic)
-        // If a frozen memtable exists (retry scenario), use it.
-        // Otherwise, try to rotate.
+        // 1. Extract Data from MemTable
         let memtable_arc = {
             let frozen = self.index.frozen_memtable.read();
             if let Some(m) = frozen.as_ref() {
                 m.clone()
             } else {
-                drop(frozen); // Release lock
+                drop(frozen);
                 match self.index.rotate_and_freeze()? {
                     Some(m) => m,
                     None => return Ok(None),
@@ -136,60 +134,135 @@ impl Janitor {
 
         let data = memtable_arc.extract_all();
         if data.is_empty() {
-            self.index.confirm_flush()?; // Clear empty frozen slot
+            self.index.confirm_flush()?;
             return Ok(None);
         }
 
         let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
         let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
 
-        // 2. Train
+        // 2. Train Index (if needed)
         {
             let q_guard = self.index.get_quantizer();
             if q_guard.is_none() {
                 info!(count = data.len(), "Starting Index Training");
                 self.index.train(&vectors).await?;
-                info!(
-                    duration_ms = start.elapsed().as_millis(),
-                    "Training Complete"
-                );
             }
         }
 
-        // 3. Persist
-        let new_id = self.index.allocate_next_bucket_id();
-        self.index
-            .force_register_bucket_with_ids(new_id, &ids, &vectors)
-            .await?;
+        // 3. ⚡ PARTITION (Calculate, don't write) ⚡
+        let partitions = self.index.calculate_partitions(&ids, &vectors).await?;
 
-        let run_id = uuid::Uuid::new_v4().to_string();
-        let path = self
+        if partitions.is_empty() {
+            self.index.confirm_flush()?;
+            return Ok(None);
+        }
+
+        // 4. ⚡ PERSIST (Write Segment to S3 with Compression) ⚡
+        // This uses SegmentWriter internally, preserving ALP/SQ8 structure.
+        let run_id = self
             .persistence
-            .flush_memtable_to_segment(&data, &self.index, &run_id)
+            .write_partitioned_segment(&partitions, &self.index)
             .await?;
 
-        // 4. Flush Tombstones
-        // We snapshot the entire set. This is safe and robust for now.
-        // Compaction (future) will delete these files when they are no longer needed.
-        let deleted_snapshot: Vec<u64> = self.index.deleted_ids.read().iter().cloned().collect();
+        // 5. ⚡ REGISTER (Update Memory) ⚡
+        self.index.register_partitions(&partitions, &run_id).await?;
 
-        // Cleanup
-        // Only verify flush if persistence succeeded.
+        // 6. Flush Tombstones
+        let deleted_snapshot: Vec<u64> = self.index.deleted_ids.read().iter().cloned().collect();
         if !deleted_snapshot.is_empty() {
             self.persistence
                 .flush_tombstones(&deleted_snapshot, &run_id)
                 .await?;
         }
 
+        // 7. Cleanup
         self.index.confirm_flush()?;
 
         info!(
             vectors = data.len(),
+            buckets = partitions.len(),
             duration_ms = start.elapsed().as_millis(),
             "Flush Complete"
         );
-        Ok(Some(PathBuf::from(path)))
+
+        // Return dummy path for logging, or actual object key
+        Ok(Some(PathBuf::from(format!("segment_{}.drift", run_id))))
     }
+
+    // async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
+    //     let start = std::time::Instant::now();
+
+    //     // 1. Get Data (Retry logic)
+    //     // If a frozen memtable exists (retry scenario), use it.
+    //     // Otherwise, try to rotate.
+    //     let memtable_arc = {
+    //         let frozen = self.index.frozen_memtable.read();
+    //         if let Some(m) = frozen.as_ref() {
+    //             m.clone()
+    //         } else {
+    //             drop(frozen); // Release lock
+    //             match self.index.rotate_and_freeze()? {
+    //                 Some(m) => m,
+    //                 None => return Ok(None),
+    //             }
+    //         }
+    //     };
+
+    //     let data = memtable_arc.extract_all();
+    //     if data.is_empty() {
+    //         self.index.confirm_flush()?; // Clear empty frozen slot
+    //         return Ok(None);
+    //     }
+
+    //     let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
+    //     let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
+
+    //     // 2. Train
+    //     {
+    //         let q_guard = self.index.get_quantizer();
+    //         if q_guard.is_none() {
+    //             info!(count = data.len(), "Starting Index Training");
+    //             self.index.train(&vectors).await?;
+    //             info!(
+    //                 duration_ms = start.elapsed().as_millis(),
+    //                 "Training Complete"
+    //             );
+    //         }
+    //     }
+
+    //     // 3. Persist
+    //     // let new_id = self.index.allocate_next_bucket_id();
+    //     let _new_bucket_ids = self.index.partition_and_flush(&ids, &vectors).await?;
+
+    //     let run_id = uuid::Uuid::new_v4().to_string();
+    //     let path = self
+    //         .persistence
+    //         .flush_memtable_to_segment(&data, &self.index, &run_id)
+    //         .await?;
+
+    //     // 4. Flush Tombstones
+    //     // We snapshot the entire set. This is safe and robust for now.
+    //     // Compaction (future) will delete these files when they are no longer needed.
+    //     let deleted_snapshot: Vec<u64> = self.index.deleted_ids.read().iter().cloned().collect();
+
+    //     // Cleanup
+    //     // Only verify flush if persistence succeeded.
+    //     if !deleted_snapshot.is_empty() {
+    //         self.persistence
+    //             .flush_tombstones(&deleted_snapshot, &run_id)
+    //             .await?;
+    //     }
+
+    //     self.index.confirm_flush()?;
+
+    //     info!(
+    //         vectors = data.len(),
+    //         duration_ms = start.elapsed().as_millis(),
+    //         "Flush Complete"
+    //     );
+    //     Ok(Some(PathBuf::from(path)))
+    // }
 
     // In drift_server/src/janitor.rs
 

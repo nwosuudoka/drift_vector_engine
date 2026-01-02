@@ -78,6 +78,14 @@ pub(crate) struct CentroidEntry {
     pub(crate) active: bool,
 }
 
+pub struct PartitionResult {
+    pub bucket_id: u32,
+    pub ids: Vec<u64>,
+    pub vectors: Vec<Vec<f32>>,
+    pub codes: Vec<u8>,
+    pub centroid: Vec<f32>,
+}
+
 pub struct VectorIndex {
     pub config: IndexOptions,
     pub(crate) centroids: Atomic<Vec<CentroidEntry>>,
@@ -516,180 +524,6 @@ impl VectorIndex {
         }
     }
 
-    // ZERO-COST FIX: Reordered Execution (Phase Separation)
-    // pub async fn search_async(
-    //     &self,
-    //     query: &[f32],
-    //     k: usize,
-    //     target_confidence: f32,
-    //     lambda: f32,
-    //     tau: f32,
-    // ) -> io::Result<Vec<SearchResult>> {
-    //     // --- PHASE 1: SNAPSHOT & PRE-CALCULATION ---
-
-    //     // A. Quantizer & LUT
-    //     let lut: Option<Vec<f32>> = {
-    //         let guard = self.quantizer.read();
-    //         guard.as_ref().map(|q| q.precompute_lut(query))
-    //     };
-
-    //     // ⚡ FIX: Search MemTable FIRST (Before yielding/awaiting)
-    //     // This closes the "Hole in the Timeline". If the Janitor runs after this,
-    //     // we already have the results from RAM.
-    //     // We do NOT filter deletes yet (that requires a lock we don't want to hold during await).
-    //     let mem_results = {
-    //         let guard = epoch::pin();
-    //         let active = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-
-    //         // Search Active
-    //         let mut results = active.search(query, k, self.config.ef_search);
-
-    //         // Search Frozen (if exists)
-    //         let frozen_guard = self.frozen_memtable.read();
-    //         if let Some(frozen) = frozen_guard.as_ref() {
-    //             results.extend(frozen.search(query, k, self.config.ef_search));
-    //         }
-    //         results
-    //     };
-
-    //     // B. Select Buckets (IVF Logic)
-    //     let selected_headers = {
-    //         let guard = epoch::pin();
-    //         let buckets_map =
-    //             unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-
-    //         if buckets_map.is_empty() {
-    //             Vec::new()
-    //         } else {
-    //             let mut clusters: HashMap<Vec<u32>, Vec<&BucketHeader>> = HashMap::new();
-    //             for header in buckets_map.values() {
-    //                 let key: Vec<u32> = header.centroid.iter().map(|f| f.to_bits()).collect();
-    //                 clusters.entry(key).or_default().push(header);
-    //             }
-
-    //             // 1. Calculate Scores (Probability of finding the neighbor)
-    //             let mut candidates: Vec<(Vec<&BucketHeader>, f32)> = clusters
-    //                 .into_values()
-    //                 .map(|headers| {
-    //                     let centroid = &headers[0].centroid;
-    //                     let total_count: u32 = headers.iter().map(|h| h.count).sum();
-
-    //                     let dist_sq = crate::math::l2_sq(query, centroid);
-    //                     let dist = dist_sq.sqrt();
-    //                     let p_geom = (-lambda * dist).exp();
-    //                     let p_density = 1.0 - (-(total_count as f32) / tau).exp();
-
-    //                     (headers, p_geom * p_density)
-    //                 })
-    //                 .collect();
-
-    //             // Sort by Score (High to Low)
-    //             candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
-
-    //             let mut headers = Vec::new();
-    //             let mut acc_conf = 0.0;
-
-    //             // 2. Select by Confidence
-    //             for (group, score) in candidates {
-    //                 acc_conf += score;
-    //                 for h in group {
-    //                     headers.push((*h).clone());
-    //                 }
-    //                 if acc_conf >= target_confidence {
-    //                     break;
-    //                 }
-    //             }
-
-    //             // 3. ⚡ RECALL GUARDRAIL: Always include the Geometrically Closest bucket
-    //             // This protects small buckets (low density) from being starved by large buckets.
-    //             // If the query lands directly inside a bucket, we MUST scan it.
-    //             if let Some(best) = buckets_map.values().min_by(|a, b| {
-    //                 crate::math::l2_sq(query, &a.centroid)
-    //                     .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
-    //                     .unwrap_or(CmpOrdering::Equal)
-    //             }) {
-    //                 // Only add if not already selected via probability
-    //                 if !headers.iter().any(|h| h.id == best.id) {
-    //                     headers.push((*best).clone());
-    //                 }
-    //             }
-
-    //             for header in &headers {
-    //                 header.touch();
-    //             }
-
-    //             headers
-    //         }
-    //     };
-
-    //     // C. Load Data (THE ASYNC AWAIT)
-    //     // It is now safe to yield. We have captured RAM (mem_results) and requested Disk (selected_headers).
-    //     let mut loaded_data = Vec::with_capacity(selected_headers.len());
-    //     for header in selected_headers {
-    //         match self.cache.get(&header.page_id).await {
-    //             Ok(data) => loaded_data.push(data),
-    //             Err(e) => error!("Failed to load bucket {}: {}", header.id, e),
-    //         }
-    //     }
-
-    //     // --- PHASE 2: SYNCHRONOUS MERGE & FILTER ---
-
-    //     let deleted_guard = self.deleted_ids.read();
-    //     let mut heap = BinaryHeap::with_capacity(k);
-    //     let mut l0_found = HashSet::new(); // Deduplication set
-
-    //     // D. Process MemTable Results (Already computed in Phase 1)
-    //     for (id, dist) in mem_results {
-    //         if deleted_guard.contains(&id) {
-    //             continue;
-    //         }
-
-    //         l0_found.insert(id);
-    //         let res = SearchResult { id, distance: dist };
-    //         Self::push_to_heap(&mut heap, res, k);
-    //     }
-
-    //     // F. Scan Disk Results
-    //     if let Some(lut_vec) = &lut {
-    //         let dim = self.config.dim;
-    //         for data in loaded_data {
-    //             // SIMD Scan
-    //             let hits = Bucket::scan_with_lut(&data, lut_vec, dim);
-
-    //             for res in hits {
-    //                 if deleted_guard.contains(&res.id) {
-    //                     continue;
-    //                 }
-
-    //                 // Dedupe: If we found it in RAM, ignore the Disk version (RAM is newer)
-    //                 if l0_found.contains(&res.id) {
-    //                     continue;
-    //                 }
-
-    //                 Self::push_to_heap(&mut heap, res, k);
-    //             }
-    //         }
-    //     }
-
-    //     let mut sorted = heap.into_vec();
-    //     sorted.sort_by(|a, b| {
-    //         a.distance
-    //             .partial_cmp(&b.distance)
-    //             .unwrap_or(CmpOrdering::Equal)
-    //     });
-    //     Ok(sorted)
-    // }
-
-    // Helper to keep code clean
-    // fn push_to_heap(heap: &mut BinaryHeap<SearchResult>, res: SearchResult, k: usize) {
-    //     if heap.len() < k {
-    //         heap.push(res);
-    //     } else if res.distance <= heap.peek().unwrap().distance {
-    //         heap.pop();
-    //         heap.push(res);
-    //     }
-    // }
-
     pub async fn force_register_bucket_with_ids(
         &self,
         id: u32,
@@ -798,6 +632,86 @@ impl VectorIndex {
         }
 
         Ok(())
+    }
+
+    pub async fn partition_and_flush(
+        &self,
+        ids: &[u64],
+        vectors: &[Vec<f32>],
+    ) -> io::Result<Vec<u32>> {
+        if vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 1. Filter Tombstones (Global Check)
+        let deleted_snapshot = self.deleted_ids.read().clone();
+        let (valid_ids, valid_vecs): (Vec<u64>, Vec<Vec<f32>>) = ids
+            .iter()
+            .zip(vectors.iter())
+            .filter(|(id, _)| !deleted_snapshot.contains(id))
+            .map(|(id, vec)| (*id, vec.clone()))
+            .unzip();
+
+        if valid_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 2. Determine K (Number of Buckets)
+        let target_cap = self.config.max_bucket_capacity;
+        let num_vectors = valid_ids.len();
+
+        // If data is small enough, just make one bucket (Fast Path)
+        if num_vectors <= target_cap {
+            let id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+            self.force_register_bucket_with_ids(id, &valid_ids, &valid_vecs)
+                .await?;
+            return Ok(vec![id]);
+        }
+
+        // 3. Run K-Means
+        // We aim for buckets that are ~80% full to allow some breathing room for merges
+        // K = ceil(N / (Target * 0.8))
+        let k = (num_vectors as f32 / (target_cap as f32 * 0.8)).ceil() as usize;
+        let k = k.max(2); // Ensure at least split if we are here
+
+        tracing::info!(
+            "Flush: Partitioning {} vectors into {} buckets",
+            num_vectors,
+            k
+        );
+
+        let trainer = KMeansTrainer::new(k, self.config.dim, 10); // 10 iterations is usually enough for flush
+        let result = trainer.train(&valid_vecs);
+
+        // 4. Group Data by Assignment
+        let mut clusters: Vec<(Vec<u64>, Vec<Vec<f32>>)> = vec![(Vec::new(), Vec::new()); k];
+
+        for (i, &assignment) in result.assignments.iter().enumerate() {
+            if assignment < k {
+                clusters[assignment].0.push(valid_ids[i]);
+                clusters[assignment].1.push(valid_vecs[i].clone());
+            }
+        }
+
+        // 5. Write Buckets
+        let mut created_ids = Vec::new();
+
+        for (cluster_ids, cluster_vecs) in clusters {
+            if cluster_ids.is_empty() {
+                continue;
+            }
+
+            let new_id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+
+            // Re-use existing registration logic for the specific sub-cluster
+            // This handles Quantization, Writing to Disk, and Updating Maps
+            self.force_register_bucket_with_ids(new_id, &cluster_ids, &cluster_vecs)
+                .await?;
+
+            created_ids.push(new_id);
+        }
+
+        Ok(created_ids)
     }
 
     pub async fn split_and_steal(&self, bucket_id: u32) -> io::Result<MaintenanceStatus> {
@@ -1486,5 +1400,157 @@ impl VectorIndex {
         }
 
         Ok(Some(compacted_ids))
+    }
+
+    pub async fn calculate_partitions(
+        &self,
+        ids: &[u64],
+        vectors: &[Vec<f32>],
+    ) -> io::Result<Vec<PartitionResult>> {
+        if vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 1. Filter Tombstones
+        let deleted_snapshot = self.deleted_ids.read().clone();
+        let (valid_ids, valid_vecs): (Vec<u64>, Vec<Vec<f32>>) = ids
+            .iter()
+            .zip(vectors.iter())
+            .filter(|(id, _)| !deleted_snapshot.contains(id))
+            .map(|(id, vec)| (*id, vec.clone()))
+            .unzip();
+
+        if valid_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 2. Determine K (Target 80% capacity)
+        let target_cap = self.config.max_bucket_capacity;
+        let num_vectors = valid_ids.len();
+
+        let k = if num_vectors <= target_cap {
+            1
+        } else {
+            (num_vectors as f32 / (target_cap as f32 * 0.8)).ceil() as usize
+        };
+
+        // 3. Train K-Means
+        tracing::info!(
+            "Flush: Partitioning {} vectors into {} buckets",
+            num_vectors,
+            k
+        );
+        let trainer = KMeansTrainer::new(k, self.config.dim, 10);
+        let result = trainer.train(&valid_vecs);
+
+        // 4. Group Data
+        // We need 3 arrays per cluster: IDs, Vecs, and Centroid
+        let mut clusters: Vec<(Vec<u64>, Vec<Vec<f32>>)> = vec![(Vec::new(), Vec::new()); k];
+
+        for (i, &assignment) in result.assignments.iter().enumerate() {
+            if assignment < k {
+                clusters[assignment].0.push(valid_ids[i]);
+                clusters[assignment].1.push(valid_vecs[i].clone());
+            }
+        }
+
+        // 5. Prepare Results (Quantize here to save CPU later)
+        let q_arc = self
+            .get_quantizer()
+            .expect("Quantizer missing during flush");
+        let mut partitions = Vec::new();
+
+        for (idx, (c_ids, c_vecs)) in clusters.into_iter().enumerate() {
+            if c_ids.is_empty() {
+                continue;
+            }
+
+            // Calculate Centroid
+            let centroid = result.centroids[idx].clone();
+
+            // SQ8 Encode
+            let mut flat_codes = Vec::with_capacity(c_vecs.len() * self.config.dim);
+            for v in &c_vecs {
+                flat_codes.extend_from_slice(&q_arc.encode(v));
+            }
+
+            // Allocate ID
+            let bucket_id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+
+            partitions.push(PartitionResult {
+                bucket_id,
+                ids: c_ids,
+                vectors: c_vecs,
+                codes: flat_codes,
+                centroid,
+            });
+        }
+
+        Ok(partitions)
+    }
+
+    /// ⚡ STEP 3: REGISTER PARTITIONS (State Update)
+    /// Called AFTER the segment is safely on S3.
+    /// Updates in-memory maps to point to the new data.
+    pub async fn register_partitions(
+        &self,
+        partitions: &[PartitionResult],
+        segment_id: &str, // Not strictly used for logic, but good for tracing
+    ) -> io::Result<()> {
+        let dim = self.config.dim;
+
+        for p in partitions {
+            let bucket_data = BucketData {
+                codes: AlignedBytes::from_slice(&p.codes),
+                vids: p.ids.clone(),
+                tombstones: bit_set::BitSet::with_capacity(p.ids.len()),
+            };
+
+            // 2. Write to BlockCache (Local NVMe)
+            // This ensures immediate availability without re-downloading from S3
+            let bytes = bucket_data.to_bytes(dim)?;
+            self.cache
+                .storage()
+                .write_page(p.bucket_id, 0, &bytes)
+                .await?;
+
+            // 3. Update Maps
+            let page_id = PageId {
+                file_id: p.bucket_id,
+                offset: 0,
+                length: bytes.len() as u32,
+            };
+
+            self.update_buckets(|b| {
+                let mut new = b.clone();
+                new.insert(
+                    p.bucket_id,
+                    BucketHeader::new(
+                        p.bucket_id,
+                        p.centroid.clone(),
+                        p.ids.len() as u32,
+                        page_id.clone(),
+                    ),
+                );
+                new
+            });
+
+            self.update_centroids(|c| {
+                let mut new = c.clone();
+                new.push(CentroidEntry {
+                    id: p.bucket_id,
+                    vector: p.centroid.clone(),
+                    active: true,
+                });
+                new
+            });
+
+            // 4. Update KV Index
+            for &vid in &p.ids {
+                let _ = self.kv.put(&vid.to_le_bytes(), &p.bucket_id.to_le_bytes());
+            }
+        }
+
+        Ok(())
     }
 }
