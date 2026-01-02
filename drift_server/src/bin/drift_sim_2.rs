@@ -1,4 +1,5 @@
 use clap::Parser;
+use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{InsertRequest, SearchRequest, TrainRequest, Vector};
 use drift_server::manager::CollectionManager;
@@ -164,10 +165,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Spin up Server
     let dir = tempdir()?;
-    let config = drift_server::config::Config {
+
+    // ⚡ FIX: Use StorageCommand strategy
+    let config = Config {
         port: 50055,
-        storage_uri: format!("file://{}", dir.path().join("storage").to_string_lossy()),
         wal_dir: dir.path().join("wal"),
+
+        // Use File Strategy
+        storage: StorageCommand::File(FileConfig {
+            path: dir.path().join("storage"),
+        }),
+
         default_dim: args.dim,
         max_bucket_capacity: 600, // Small capacity to force frequent Splitting
         ef_construction: 64,

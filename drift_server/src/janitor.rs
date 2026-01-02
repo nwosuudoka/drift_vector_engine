@@ -1,5 +1,6 @@
 use crate::persistence::PersistenceManager;
 use drift_core::index::{MaintenanceStatus, VectorIndex};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{collections::HashSet, sync::atomic::Ordering};
@@ -187,7 +188,7 @@ impl Janitor {
             duration_ms = start.elapsed().as_millis(),
             "Flush Complete"
         );
-        Ok(Some(path))
+        Ok(Some(PathBuf::from(path)))
     }
 
     // In drift_server/src/janitor.rs

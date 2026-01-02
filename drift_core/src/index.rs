@@ -877,29 +877,37 @@ impl VectorIndex {
         Ok(MaintenanceStatus::Completed)
     }
 
+    // drift_core/src/index.rs
+
     pub async fn scatter_merge(&self, zombie_id: u32) -> io::Result<MaintenanceStatus> {
         let q_arc = self.quantizer.read().as_ref().unwrap().clone();
         let deleted_snapshot: HashSet<u64> = self.deleted_ids.read().clone();
 
+        // 1. Load Zombie Bucket
         let (z_header, all_centroids) = {
             let guard = epoch::pin();
             let buckets = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
             let centroids =
                 unsafe { self.centroids.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
             let h = match buckets.get(&zombie_id) {
                 Some(h) => h.clone(),
                 None => return Ok(MaintenanceStatus::SkippedTooSmall),
             };
             (h, centroids.clone())
         };
+
+        // 2. Load Data
         let data_arc = match self.cache.get(&z_header.page_id).await {
             Ok(d) => d,
             Err(_) => return Ok(MaintenanceStatus::SkippedLocked),
         };
-        let (raw_vecs, raw_ids) = data_arc.reconstruct(&q_arc);
 
+        // 3. Reconstruct & Filter Survivors
+        let (raw_vecs, raw_ids) = data_arc.reconstruct(&q_arc);
         let mut orphans_vec = Vec::new();
         let mut orphans_id = Vec::new();
+
         for (v, id) in raw_vecs.into_iter().zip(raw_ids.into_iter()) {
             if !deleted_snapshot.contains(&id) {
                 orphans_vec.push(v);
@@ -907,20 +915,32 @@ impl VectorIndex {
             }
         }
 
+        // 4. ⚡ STRICT BUDGET ENFORCEMENT
+        // If there are too many survivors, merging is too expensive (Write Amp).
+        // We abort and wait for more deletions.
+        if orphans_vec.len() > 50 {
+            // We reuse 'SkippedTooSmall' or add a new variant 'SkippedOverBudget'
+            // For now, SkippedTooSmall effectively means "Not right for maintenance"
+            return Ok(MaintenanceStatus::SkippedTooSmall);
+        }
+
         if orphans_vec.is_empty() {
             self.atomic_remove_bucket(zombie_id);
             return Ok(MaintenanceStatus::Completed);
         }
 
+        // 5. Find Neighbors (Top-3)
         let mut candidates: Vec<(u32, f32)> = all_centroids
             .iter()
             .filter(|c| c.active && c.id != zombie_id)
             .map(|c| (c.id, crate::math::l2_sq(&z_header.centroid, &c.vector)))
             .collect();
+
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         let neighbor_ids: Vec<u32> = candidates.into_iter().take(3).map(|(id, _)| id).collect();
 
         if neighbor_ids.is_empty() {
+            // No neighbors? Just re-insert to L0 as fallback (Safety net)
             for (i, vec) in orphans_vec.iter().enumerate() {
                 self.insert(orphans_id[i], vec)?;
             }
@@ -928,11 +948,15 @@ impl VectorIndex {
             return Ok(MaintenanceStatus::Completed);
         }
 
+        // 6. Assign Orphans to Best Neighbor
         let mut adoption_map: HashMap<u32, Vec<(u64, Vec<f32>)>> = HashMap::new();
+
         for (i, vec) in orphans_vec.iter().enumerate() {
             let mut best_neighbor = None;
             let mut min_dist = f32::MAX;
+
             for &nid in &neighbor_ids {
+                // We re-check existence in case centroids changed
                 if let Some(c) = all_centroids.iter().find(|c| c.id == nid) {
                     let d = crate::math::l2_sq(vec, &c.vector);
                     if d < min_dist {
@@ -941,16 +965,21 @@ impl VectorIndex {
                     }
                 }
             }
+
             if let Some(bid) = best_neighbor {
                 adoption_map
                     .entry(bid)
                     .or_default()
                     .push((orphans_id[i], vec.clone()));
             } else {
+                // Fallback to L0
                 self.insert(orphans_id[i], vec)?;
             }
         }
+
+        // 7. Rewrite Neighbors (The Expensive Part, now strictly limited)
         for (target_id, orphans) in adoption_map {
+            // Load Neighbor Header
             let t_header = {
                 let guard = epoch::pin();
                 let buckets =
@@ -965,6 +994,8 @@ impl VectorIndex {
                     }
                 }
             };
+
+            // Load Neighbor Data
             let t_data = match self.cache.get(&t_header.page_id).await {
                 Ok(d) => d,
                 Err(_) => {
@@ -974,25 +1005,33 @@ impl VectorIndex {
                     continue;
                 }
             };
+
+            // Reconstruct, Merge, Rewrite
             let (raw_t_vecs, raw_t_ids) = t_data.reconstruct(&q_arc);
             let mut vs = Vec::new();
             let mut is = Vec::new();
+
+            // Keep existing live data
             for (v, id) in raw_t_vecs.into_iter().zip(raw_t_ids.into_iter()) {
                 if !deleted_snapshot.contains(&id) {
                     vs.push(v);
                     is.push(id);
                 }
             }
+            // Add orphans
             for (id, v) in &orphans {
                 vs.push(v.clone());
                 is.push(*id);
             }
+
+            // Encode & Write
             let dim = self.config.dim;
             let mut new_data = BucketData {
                 codes: crate::aligned::AlignedBytes::new(vs.len() * dim),
                 vids: Vec::with_capacity(vs.len()),
                 tombstones: bit_set::BitSet::with_capacity(vs.len()),
             };
+
             for (i, v) in vs.iter().enumerate() {
                 let code = q_arc.encode(v);
                 new_data.vids.push(is[i]);
@@ -1000,11 +1039,14 @@ impl VectorIndex {
                     new_data.codes.push(b);
                 }
             }
+
             let bytes = new_data.to_bytes(dim)?;
             self.cache
                 .storage()
                 .write_page(target_id, 0, &bytes)
                 .await?;
+
+            // Update Metadata
             self.update_buckets(|current| {
                 let mut new = current.clone();
                 if let Some(h) = new.get_mut(&target_id) {
@@ -1013,10 +1055,13 @@ impl VectorIndex {
                 }
                 new
             });
+
+            // Update KV Pointers
             for (id, _) in orphans {
                 let _ = self.kv.put(&id.to_le_bytes(), &target_id.to_le_bytes());
             }
         }
+
         self.atomic_remove_bucket(zombie_id);
         Ok(MaintenanceStatus::Completed)
     }

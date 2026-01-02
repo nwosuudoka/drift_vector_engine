@@ -3,6 +3,7 @@ mod tests {
     use crate::persistence::PersistenceManager;
     use drift_cache::local_store::LocalDiskManager;
     use drift_core::index::{IndexOptions, VectorIndex};
+    use opendal::{Operator, services};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -27,7 +28,14 @@ mod tests {
     #[tokio::test]
     async fn test_end_to_end_persistence_lifecycle() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Build the Operator manually for the test
+        let mut builder = services::Fs::default();
+        builder = builder.root(dir.path().to_str().unwrap());
+        let op = Operator::new(builder).unwrap().finish();
+
+        // ⚡ CHANGE: Inject Operator into Manager
+        let persistence = PersistenceManager::new(op, dir.path());
 
         let index_original = create_index_with_storage(dir.path(), "current.wal");
 
@@ -51,9 +59,8 @@ mod tests {
         assert!(!pre_crash.is_empty());
 
         // Snapshot L1 (buckets) to disk
-        // Note: This takes existing L1 buckets (from train) and writes them.
-        // L0 remains in WAL.
-        let segment_path = persistence
+        // ⚡ CHANGE: This returns a String (key) now, not a PathBuf
+        let segment_key = persistence
             .flush_to_segment(&index_original, "run_1")
             .await
             .expect("Flush failed");
@@ -62,8 +69,9 @@ mod tests {
         drop(index_original);
 
         // Recover
+        // ⚡ CHANGE: Pass the key string
         let index_recovered = persistence
-            .load_from_segment(&segment_path)
+            .load_from_segment(&segment_key)
             .await
             .expect("Load failed");
 

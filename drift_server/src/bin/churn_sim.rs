@@ -1,4 +1,5 @@
 use clap::Parser;
+use drift_server::config::{FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{SearchRequest, Vector};
 use drift_server::manager::CollectionManager;
@@ -117,11 +118,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_root = dir.path().join("storage");
     let wal_path = dir.path().join("wal");
 
-    // Config: Low capacity to ensure we have many buckets (easier to empty one)
+    // ⚡ FIX: Use StorageCommand strategy
     let config = drift_server::config::Config {
         port: 50053,
-        storage_uri: format!("file://{}", storage_root.to_string_lossy()),
         wal_dir: wal_path.clone(),
+
+        // Use File Strategy
+        storage: StorageCommand::File(FileConfig {
+            path: storage_root.clone(),
+        }),
+
         default_dim: args.dim,
         max_bucket_capacity: 500, // Small buckets
         ef_construction: 64,
@@ -141,7 +147,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster = StaticCluster::new(&mut rng, args.dim);
 
     // Shadow DB for Ground Truth
-    // Using a HashMap for fast deletes by ID
     let mut shadow_db: Vec<(u64, Vec<f32>)> = Vec::new();
     let mut active_ids: VecDeque<u64> = VecDeque::new();
     let mut next_id = 0;

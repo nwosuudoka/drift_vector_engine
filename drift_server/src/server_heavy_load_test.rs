@@ -1,7 +1,7 @@
 #[cfg(test)]
 #[cfg(feature = "stress-test")]
 mod tests {
-    use crate::config::Config;
+    use crate::config::{Config, FileConfig, StorageCommand};
     use crate::drift_proto::{
         InsertBatchRequest, InsertRequest, SearchRequest, Vector, drift_server::Drift,
     };
@@ -27,10 +27,16 @@ mod tests {
     async fn test_server_heavy_load_performance() {
         let dir = tempdir().unwrap();
 
+        // ⚡ CHANGE: Use the new nested Configuration structure
         let config = Config {
             port: 50051,
-            storage_uri: format!("file://{}", dir.path().join("storage").to_string_lossy()),
             wal_dir: dir.path().join("wal"),
+
+            // New Storage Strategy
+            storage: StorageCommand::File(FileConfig {
+                path: dir.path().join("storage"),
+            }),
+
             default_dim: DIM,
             max_bucket_capacity: 2000,
             // Tuning for 100k Vectors:
@@ -71,14 +77,14 @@ mod tests {
                 .expect("Batch Insert failed");
 
             if batch_idx % 10 == 0 {
-                println!("   Inserted {} vectors...", start_id + BATCH_SIZE as u64);
+                println!("    Inserted {} vectors...", start_id + BATCH_SIZE as u64);
             }
         }
 
         let ingest_duration = start_ingest.elapsed();
         println!("✅ Ingestion Complete in {:.2?}", ingest_duration);
         println!(
-            "   Throughput: {:.0} vec/sec",
+            "    Throughput: {:.0} vec/sec",
             TOTAL_VECTORS as f64 / ingest_duration.as_secs_f64()
         );
 
@@ -158,7 +164,7 @@ mod tests {
 #[cfg(test)]
 #[cfg(feature = "stress-test")]
 mod pretrained_tests {
-    use crate::config::Config;
+    use crate::config::{Config, FileConfig, StorageCommand};
     use crate::drift_proto::{
         InsertBatchRequest, InsertRequest, SearchRequest, Vector, drift_server::Drift,
     };
@@ -193,10 +199,16 @@ mod pretrained_tests {
 
         let dir = tempdir().unwrap();
 
+        // ⚡ CHANGE: Use the new nested Configuration structure
         let config = Config {
             port: 50051,
-            storage_uri: format!("file://{}", dir.path().join("storage").to_string_lossy()),
             wal_dir: dir.path().join("wal"),
+
+            // New Storage Strategy
+            storage: StorageCommand::File(FileConfig {
+                path: dir.path().join("storage"),
+            }),
+
             default_dim: DIM,
             max_bucket_capacity: 2_000, // Trigger flushes often
             ef_construction: 80,

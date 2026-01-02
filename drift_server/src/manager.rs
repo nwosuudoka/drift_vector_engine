@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::janitor::Janitor;
 use crate::persistence::PersistenceManager;
+use crate::storage_factory::StorageFactory;
 use drift_cache::LocalDiskManager;
 use drift_cache::tiered_store::TieredPageManager;
 use drift_core::index::{IndexOptions, VectorIndex};
@@ -72,22 +73,16 @@ impl CollectionManager {
         let wal_path = coll_wal_dir.join("current.wal");
 
         // B. Storage Setup (Tiered)
-        let storage_uri = if self.config.storage_uri.ends_with('/') {
-            format!("{}{}", self.config.storage_uri, name)
-        } else {
-            format!("{}/{}", self.config.storage_uri, name)
-        };
 
-        if storage_uri.starts_with("file://") {
-            let path_str = storage_uri.strip_prefix("file://").unwrap();
-            std::fs::create_dir_all(path_str)?;
-        }
+        let op = StorageFactory::build(&self.config.storage, name)?;
+        let remote_storage = Arc::new(DriftPageManager::new(op.clone()));
 
-        // 1. Remote (Source of Truth)
-        let remote_storage = Arc::new(DriftPageManager::new(&storage_uri).await?);
+        // if storage_uri.starts_with("file://") {
+        //     let path_str = storage_uri.strip_prefix("file://").unwrap();
+        //     std::fs::create_dir_all(path_str)?;
+        // }
 
-        // 2. Local (NVMe Cache)
-        // Located at: ../cache/{collection_name} relative to WAL dir
+        // C. Local Cache (NVMe)
         let cache_dir = self
             .config
             .wal_dir
@@ -97,11 +92,9 @@ impl CollectionManager {
             .join(name);
         std::fs::create_dir_all(&cache_dir)?;
         let local_storage = Arc::new(LocalDiskManager::new(cache_dir));
-
-        // 3. Tiered (The Bridge)
         let storage = Arc::new(TieredPageManager::new(local_storage, remote_storage));
 
-        let persistence = PersistenceManager::new(&coll_wal_dir);
+        let persistence = PersistenceManager::new(op, &coll_wal_dir);
         let dim = dim_hint.unwrap_or(self.config.default_dim);
 
         let options = IndexOptions {
@@ -151,10 +144,7 @@ impl CollectionManager {
         });
 
         map.insert(name.to_string(), collection.clone());
-        info!(
-            "Manager: Collection '{}' ready (dim: {}, uri: {})",
-            name, dim, storage_uri
-        );
+        info!("Manager: Collection '{}' ready (dim: {})", name, dim,);
         Ok(collection)
     }
 

@@ -569,6 +569,7 @@ dependencies = [
  "drift_cache",
  "drift_core",
  "drift_storage",
+ "opendal",
  "prost",
  "rand 0.9.2",
  "rand_distr",

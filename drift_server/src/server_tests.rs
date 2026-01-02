@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::config::Config;
+    use crate::config::{Config, FileConfig, StorageCommand};
     use crate::drift_proto::{
         InsertRequest, SearchRequest, TrainRequest, Vector, drift_server::Drift,
     };
@@ -10,10 +10,14 @@ mod tests {
     use tempfile::tempdir;
     use tonic::Request;
 
+    // Helper to create a configuration with the local file strategy
     fn default_test_config(path: &std::path::Path) -> Config {
         Config {
             port: 50051,
-            storage_uri: format!("file://{}", path.join("storage").to_string_lossy()),
+            // ⚡ CHANGE: Use StorageCommand::File
+            storage: StorageCommand::File(FileConfig {
+                path: path.join("storage"),
+            }),
             wal_dir: path.join("wal"),
             default_dim: 128,
             max_bucket_capacity: 1000,

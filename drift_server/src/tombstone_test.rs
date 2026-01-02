@@ -3,6 +3,7 @@ mod tests {
     use crate::persistence::PersistenceManager;
     use drift_cache::local_store::LocalDiskManager;
     use drift_core::index::{IndexOptions, VectorIndex};
+    use opendal::{Operator, services};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -22,10 +23,20 @@ mod tests {
         Arc::new(VectorIndex::new(options, &wal_path, storage).unwrap())
     }
 
+    // Helper to create a local FS operator
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
     #[tokio::test]
     async fn test_tombstone_persistence_prevents_resurrection() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
 
         // 1. Create Index
         let index = create_index_with_storage(dir.path(), "test.wal");
@@ -68,8 +79,9 @@ mod tests {
         drop(index);
 
         // Load Segment
+        // ⚡ CHANGE: Use relative object key string, not PathBuf
         let index_2 = persistence
-            .load_from_segment(&dir.path().join("segment_l0_run_1.drift"))
+            .load_from_segment("segment_l0_run_1.drift")
             .await
             .unwrap();
 

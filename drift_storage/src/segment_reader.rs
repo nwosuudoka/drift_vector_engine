@@ -3,6 +3,7 @@ use crate::segment_writer::SegmentIndex;
 use crate::{FOOTER_SIZE, MAGIC_BYTES};
 use byteorder::{LittleEndian, ReadBytesExt};
 use fastbloom::BloomFilter;
+use opendal::Operator;
 use std::io::{self, Cursor, Read};
 
 // For the Cold Path (ALP Decompression)
@@ -19,8 +20,8 @@ pub struct SegmentReader {
 
 impl SegmentReader {
     /// Opens a segment via URI (s3:// or file://)
-    pub async fn open(uri: &str) -> io::Result<Self> {
-        let manager = DiskManager::open(uri).await?;
+    pub async fn open_with_op(op: Operator, path: &str) -> io::Result<Self> {
+        let manager = DiskManager::new(op, path.to_string());
 
         // 1. Get Length (Network Call 1)
         let file_len = manager.len().await?;

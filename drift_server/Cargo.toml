@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-chrome = "0.7"                                                     # Visual Profiler
 rand_distr = "0.5.1"
 walkdir = "2.4"
+opendal = "0.55.0"
 
 [build-dependencies]
 tonic-build = "0.14.2"

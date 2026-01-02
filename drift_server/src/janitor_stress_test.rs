@@ -4,6 +4,7 @@ mod stress_tests {
     use crate::persistence::PersistenceManager;
     use drift_cache::local_store::LocalDiskManager;
     use drift_core::index::{IndexOptions, VectorIndex};
+    use opendal::{Operator, services};
 
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -33,6 +34,13 @@ mod stress_tests {
             .collect()
     }
 
+    // Helper to create a local FS operator for tests
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
     async fn eventually<F, Fut>(dur: Duration, mut f: F) -> io::Result<()>
     where
         F: FnMut() -> Fut,
@@ -54,7 +62,11 @@ mod stress_tests {
     #[tokio::test]
     async fn chaos_monkey_with_janitor() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 64,
             num_centroids: 8,
@@ -134,7 +146,11 @@ mod stress_tests {
     #[tokio::test]
     async fn split_storm() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 8,
             num_centroids: 2,
@@ -182,7 +198,11 @@ mod stress_tests {
     #[tokio::test]
     async fn scatter_split_race() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 16,
             num_centroids: 4,
@@ -244,7 +264,11 @@ mod stress_tests {
     #[tokio::test]
     async fn kv_consistency_torture() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 4,
             num_centroids: 2,
@@ -297,7 +321,11 @@ mod stress_tests {
     #[tokio::test]
     async fn duplicate_centroid_buckets() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 3,
             num_centroids: 1,

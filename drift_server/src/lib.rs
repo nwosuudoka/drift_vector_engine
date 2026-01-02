@@ -3,6 +3,7 @@ pub mod janitor;
 pub mod manager;
 pub mod persistence;
 pub mod server;
+pub mod storage_factory;
 
 #[cfg(test)]
 mod janitor_stress_test;
@@ -18,6 +19,9 @@ mod persistence_tests;
 
 #[cfg(test)]
 mod tombstone_test;
+
+#[cfg(test)]
+mod scatter_budget_test;
 
 #[cfg(test)]
 mod scavenger_test;

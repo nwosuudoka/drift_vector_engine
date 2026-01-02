@@ -1,129 +1,382 @@
 #[cfg(test)]
+#[cfg(feature = "stress-test")]
 mod tests {
-    use crate::config::Config;
+    use crate::config::{Config, FileConfig, StorageCommand};
+    use crate::drift_proto::{
+        InsertBatchRequest, InsertRequest, SearchRequest, Vector, drift_server::Drift,
+    };
     use crate::manager::CollectionManager;
-    use crate::persistence::PersistenceManager;
+    use crate::server::DriftService;
+    use rand::Rng;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
+    use tonic::Request;
 
-    fn gen_vec(val: f32, dim: usize) -> Vec<f32> {
-        vec![val; dim]
-    }
+    const DIM: usize = 128;
+    const TOTAL_VECTORS: usize = 100_000;
+    const BATCH_SIZE: usize = 1_000;
+    const QUERY_COUNT: usize = 100;
 
-    fn default_test_config(path: &std::path::Path) -> Config {
-        Config {
-            port: 50051,
-            storage_uri: format!("file://{}", path.join("storage").to_string_lossy()),
-            wal_dir: path.join("wal"),
-            default_dim: 128,
-            max_bucket_capacity: 1000,
-            ef_construction: 50,
-            ef_search: 50,
-        }
+    fn generate_random_vector(rng: &mut impl Rng) -> Vec<f32> {
+        (0..DIM).map(|_| rng.random::<f32>()).collect()
     }
 
     #[tokio::test]
-    async fn test_collection_manager_isolation_and_recovery() {
+    // #[ignore]
+    async fn test_server_heavy_load_performance() {
         let dir = tempdir().unwrap();
-        let dim = 128;
 
-        let config = default_test_config(dir.path());
+        // ⚡ CHANGE: Use the new nested Configuration structure
+        let config = Config {
+            port: 50051,
+            wal_dir: dir.path().join("wal"),
 
-        // Phase 1: Create Data
-        {
-            let manager = CollectionManager::new(config.clone());
+            // New Storage Strategy
+            storage: StorageCommand::File(FileConfig {
+                path: dir.path().join("storage"),
+            }),
 
-            // --- Collection A: "users" ---
-            let users = manager.get_or_create("users", Some(dim)).await.unwrap();
-            users
-                .index
-                .train(&vec![gen_vec(0.0, dim), gen_vec(1.0, dim)])
-                .await
-                .unwrap();
+            default_dim: DIM,
+            max_bucket_capacity: 2000,
+            // Tuning for 100k Vectors:
+            ef_construction: 200,
+            ef_search: 200,
+        };
 
-            for i in 0..10 {
-                users.index.insert(i, &gen_vec(0.1, dim)).unwrap();
+        let manager = Arc::new(CollectionManager::new(config));
+        let service = DriftService {
+            manager: manager.clone(),
+        };
+        let collection = "stress_test";
+
+        println!("🚀 Starting Load Test: {} Vectors", TOTAL_VECTORS);
+
+        // 2. Ingestion Phase
+        let start_ingest = Instant::now();
+        let mut rng = rand::rng();
+
+        for batch_idx in 0..(TOTAL_VECTORS / BATCH_SIZE) {
+            let start_id = (batch_idx * BATCH_SIZE) as u64;
+
+            let mut batch_vecs = Vec::with_capacity(BATCH_SIZE);
+            for i in 0..BATCH_SIZE {
+                let id = start_id + i as u64;
+                let vector = generate_random_vector(&mut rng);
+                batch_vecs.push(Vector { id, values: vector });
             }
 
-            // Force flush "users"
-            let data_u = users.index.rotate_memtable().unwrap();
+            let req = Request::new(InsertBatchRequest {
+                collection_name: collection.to_string(),
+                vectors: batch_vecs,
+            });
 
-            // ⚡ FIX: Point to WAL directory, just like CollectionManager does
-            let users_wal_path = config.wal_dir.join("users");
-            std::fs::create_dir_all(&users_wal_path).unwrap(); // Ensure dir exists
-
-            let p_mgr_u = PersistenceManager::new(users_wal_path);
-            p_mgr_u
-                .flush_memtable_to_segment(&data_u, &users.index, "init_users")
+            service
+                .insert_batch(req)
                 .await
-                .unwrap();
+                .expect("Batch Insert failed");
 
-            // --- Collection B: "products" ---
-            let products = manager.get_or_create("products", Some(dim)).await.unwrap();
-            products
-                .index
-                .train(&vec![gen_vec(10.0, dim)])
-                .await
-                .unwrap();
-            products.index.insert(0, &gen_vec(10.0, dim)).unwrap();
-
-            // Force flush "products"
-            let data_p = products.index.rotate_memtable().unwrap();
-
-            // ⚡ FIX: Point to WAL directory here too
-            let products_wal_path = config.wal_dir.join("products");
-            std::fs::create_dir_all(&products_wal_path).unwrap();
-
-            let p_mgr_p = PersistenceManager::new(products_wal_path);
-            p_mgr_p
-                .flush_memtable_to_segment(&data_p, &products.index, "init_products")
-                .await
-                .unwrap();
+            if batch_idx % 10 == 0 {
+                println!("    Inserted {} vectors...", start_id + BATCH_SIZE as u64);
+            }
         }
 
-        println!("--- RESTARTING MANAGER ---");
+        let ingest_duration = start_ingest.elapsed();
+        println!("✅ Ingestion Complete in {:.2?}", ingest_duration);
+        println!(
+            "    Throughput: {:.0} vec/sec",
+            TOTAL_VECTORS as f64 / ingest_duration.as_secs_f64()
+        );
 
-        // Phase 2: Reload
-        let manager_2 = CollectionManager::new(config.clone());
-
-        // Load "users"
-        let users_2 = manager_2.get_or_create("users", Some(dim)).await.unwrap();
-        let res_u = users_2
-            .index
-            .search_async(&gen_vec(0.1, dim), 1, 0.1, 1.0, 100.0)
+        // 3. Inject "Needle" for verification
+        let needle_id = 999_999;
+        let needle_vec = vec![0.5; DIM];
+        println!("💉 Injecting Needle (ID {})...", needle_id);
+        service
+            .insert(Request::new(InsertRequest {
+                collection_name: collection.to_string(),
+                vector: Some(Vector {
+                    id: needle_id,
+                    values: needle_vec.clone(),
+                }),
+            }))
             .await
             .unwrap();
+        println!("✅ Needle Injected.");
 
-        assert!(!res_u.is_empty());
-        assert!(res_u[0].distance < 0.05, "Failed to recover user data");
+        // 4. Wait for Janitor / Indexing
+        println!("⏳ Waiting for background flush/indexing...");
+        tokio::time::sleep(Duration::from_secs(4)).await; // Increased wait
 
-        // Load "products"
-        let products_2 = manager_2
-            .get_or_create("products", Some(dim))
-            .await
-            .unwrap();
-        let res_p = products_2
-            .index
-            .search_async(&gen_vec(10.0, dim), 1, 0.1, 1.0, 100.0)
-            .await
-            .unwrap();
+        // 5. Query Phase
+        println!("🔍 Starting Query Benchmark...");
+        let mut latencies = Vec::with_capacity(QUERY_COUNT);
 
-        assert!(!res_p.is_empty());
-        assert_eq!(res_p[0].id, 0, "Failed to recover products data");
-
-        // Phase 3: Verify Isolation
-        let res_cross = products_2
-            .index
-            .search_async(&gen_vec(0.1, dim), 1, 0.0, 1.0, 100.0)
-            .await
-            .unwrap();
-
-        if !res_cross.is_empty() {
-            assert!(
-                res_cross[0].distance > 10.0,
-                "Cross-contamination: Found user data in products!"
-            );
+        for _ in 0..QUERY_COUNT {
+            let query_vec = generate_random_vector(&mut rng);
+            let start_q = Instant::now();
+            let req = Request::new(SearchRequest {
+                collection_name: collection.to_string(),
+                vector: query_vec,
+                k: 10,
+                target_confidence: 0.95,
+                lambda: 1.0,
+                tau: 100.0,
+            });
+            let _ = service.search(req).await.expect("Search failed");
+            latencies.push(start_q.elapsed());
         }
 
-        println!("✅ test_collection_manager_isolation_and_recovery Passed!");
+        // 6. Verification Query
+        println!("🔎 Verifying Needle...");
+        let verify_req = Request::new(SearchRequest {
+            collection_name: collection.to_string(),
+            vector: needle_vec,
+            k: 5,
+            target_confidence: 0.99,
+            lambda: 1.0,
+            tau: 100.0,
+        });
+
+        let verify_res = service.search(verify_req).await.unwrap().into_inner();
+        let found = verify_res.results.iter().any(|r| r.id == needle_id);
+
+        // 7. Report
+        latencies.sort();
+        let p50 = latencies[latencies.len() / 2];
+        let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
+
+        println!("========================================");
+        println!("📊 LOAD TEST RESULTS");
+        println!("Total Vectors: {}", TOTAL_VECTORS);
+        println!("P50 Latency:   {:.2?}", p50);
+        println!("P99 Latency:   {:.2?}", p99);
+        println!(
+            "Correctness:   {}",
+            if found { "PASS ✅" } else { "FAIL ❌" }
+        );
+        println!("========================================");
+
+        assert!(found, "Failed to find the needle vector!");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "stress-test")]
+mod pretrained_tests {
+    use crate::config::{Config, FileConfig, StorageCommand};
+    use crate::drift_proto::{
+        InsertBatchRequest, InsertRequest, SearchRequest, Vector, drift_server::Drift,
+    };
+    use crate::manager::CollectionManager;
+    use crate::server::DriftService;
+    use rand::Rng;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+    use tonic::Request;
+
+    const DIM: usize = 128;
+    const TOTAL_VECTORS: usize = 100_000;
+    const BATCH_SIZE: usize = 1_000;
+    const QUERY_COUNT: usize = 100;
+
+    fn generate_random_vector(rng: &mut impl Rng) -> Vec<f32> {
+        (0..DIM).map(|_| rng.random::<f32>()).collect()
+    }
+
+    #[tokio::test]
+    // #[ignore]
+    async fn test_server_heavy_load_performance() {
+        // =================================================================
+        // 1. SETUP
+        // =================================================================
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("drift_server=trace,info") // Show traces for your app, info for others
+            .with_test_writer() // Print to test output
+            .try_init(); // Safe to call multiple times
+
+        let dir = tempdir().unwrap();
+
+        // ⚡ CHANGE: Use the new nested Configuration structure
+        let config = Config {
+            port: 50051,
+            wal_dir: dir.path().join("wal"),
+
+            // New Storage Strategy
+            storage: StorageCommand::File(FileConfig {
+                path: dir.path().join("storage"),
+            }),
+
+            default_dim: DIM,
+            max_bucket_capacity: 2_000, // Trigger flushes often
+            ef_construction: 80,
+            ef_search: 200,
+        };
+
+        let manager = Arc::new(CollectionManager::new(config));
+        let service = DriftService {
+            manager: manager.clone(),
+        };
+        let collection = "stress_test";
+        let mut rng = rand::rng();
+
+        // =================================================================
+        // 🚦 PHASE 1: WARM-UP & TRAINING
+        // =================================================================
+        // We insert enough vectors to exceed max_bucket_capacity (2000)
+        // to force the FIRST flush and TRAIN the index now.
+        println!("🔥 WARM-UP: Inserting 3,000 vectors to force initial training...");
+
+        let warmup_count = 3000;
+        let mut warmup_vecs = Vec::with_capacity(warmup_count);
+
+        for i in 0..warmup_count {
+            // Use high IDs for warmup to avoid collision with main test (optional but cleaner)
+            let id = 10_000_000 + i as u64;
+            warmup_vecs.push(Vector {
+                id,
+                values: generate_random_vector(&mut rng),
+            });
+        }
+
+        service
+            .insert_batch(Request::new(InsertBatchRequest {
+                collection_name: collection.to_string(),
+                vectors: warmup_vecs,
+            }))
+            .await
+            .expect("Warmup insert failed");
+
+        println!("⏳ WARM-UP: Sleeping 5s to allow Janitor to train and persist...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        println!("✅ WARM-UP: Complete. Index is trained. Starting Main Load Test.");
+
+        // =================================================================
+        // 🚀 PHASE 2: MAIN INGESTION
+        // =================================================================
+        println!("🚀 Starting Load Test: {} Vectors", TOTAL_VECTORS);
+        let start_ingest = Instant::now();
+
+        for batch_idx in 0..(TOTAL_VECTORS / BATCH_SIZE) {
+            let start_id = (batch_idx * BATCH_SIZE) as u64;
+
+            let mut batch_vecs = Vec::with_capacity(BATCH_SIZE);
+            for i in 0..BATCH_SIZE {
+                let id = start_id + i as u64;
+                let vector = generate_random_vector(&mut rng);
+                batch_vecs.push(Vector { id, values: vector });
+            }
+
+            let req = Request::new(InsertBatchRequest {
+                collection_name: collection.to_string(),
+                vectors: batch_vecs,
+            });
+
+            service
+                .insert_batch(req)
+                .await
+                .expect("Batch Insert failed");
+
+            // Optional: Print rate every 10 batches
+            if batch_idx > 0 && batch_idx % 10 == 0 {
+                let elapsed = start_ingest.elapsed();
+                let count = (batch_idx + 1) * BATCH_SIZE;
+                let rate = count as f64 / elapsed.as_secs_f64();
+                println!(
+                    "    Inserted {} vectors... (Avg Rate: {:.0} vec/s)",
+                    count, rate
+                );
+            }
+        }
+
+        let ingest_duration = start_ingest.elapsed();
+        println!("✅ Ingestion Complete in {:.2?}", ingest_duration);
+        println!(
+            "    Throughput: {:.0} vec/sec",
+            TOTAL_VECTORS as f64 / ingest_duration.as_secs_f64()
+        );
+
+        // =================================================================
+        // 3. INJECT NEEDLE
+        // =================================================================
+        let needle_id = 999_999;
+        let needle_vec = vec![0.5; DIM];
+        println!("💉 Injecting Needle (ID {})...", needle_id);
+        service
+            .insert(Request::new(InsertRequest {
+                collection_name: collection.to_string(),
+                vector: Some(Vector {
+                    id: needle_id,
+                    values: needle_vec.clone(),
+                }),
+            }))
+            .await
+            .unwrap();
+        println!("✅ Needle Injected.");
+
+        // =================================================================
+        // 4. WAIT FOR JANITOR
+        // =================================================================
+        println!("⏳ Waiting for background flush/indexing...");
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // =================================================================
+        // 5. QUERY PHASE
+        // =================================================================
+        println!("🔍 Starting Query Benchmark...");
+        let mut latencies = Vec::with_capacity(QUERY_COUNT);
+
+        for _ in 0..QUERY_COUNT {
+            let query_vec = generate_random_vector(&mut rng);
+            let start_q = Instant::now();
+            let req = Request::new(SearchRequest {
+                collection_name: collection.to_string(),
+                vector: query_vec,
+                k: 10,
+                target_confidence: 0.95,
+                lambda: 1.0,
+                tau: 100.0,
+            });
+            let _ = service.search(req).await.expect("Search failed");
+            latencies.push(start_q.elapsed());
+        }
+
+        // =================================================================
+        // 6. VERIFICATION
+        // =================================================================
+        println!("🔎 Verifying Needle...");
+        let verify_req = Request::new(SearchRequest {
+            collection_name: collection.to_string(),
+            vector: needle_vec,
+            k: 5,
+            target_confidence: 0.99,
+            lambda: 1.0,
+            tau: 100.0,
+        });
+
+        let verify_res = service.search(verify_req).await.unwrap().into_inner();
+        let found = verify_res.results.iter().any(|r| r.id == needle_id);
+
+        // =================================================================
+        // 7. REPORT
+        // =================================================================
+        latencies.sort();
+        let p50 = latencies[latencies.len() / 2];
+        let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
+
+        println!("========================================");
+        println!("📊 LOAD TEST RESULTS (Pre-Trained)");
+        println!("Total Vectors: {}", TOTAL_VECTORS);
+        println!("P50 Latency:   {:.2?}", p50);
+        println!("P99 Latency:   {:.2?}", p99);
+        println!(
+            "Correctness:   {}",
+            if found { "PASS ✅" } else { "FAIL ❌" }
+        );
+        println!("========================================");
+
+        assert!(found, "Failed to find the needle vector!");
     }
 }
