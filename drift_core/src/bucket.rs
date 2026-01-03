@@ -6,6 +6,7 @@ use atomic_float::AtomicF32;
 use bit_set::BitSet;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use drift_traits::{Cacheable, PageId};
+use parking_lot::RwLock;
 use std::io::{Cursor, Error, ErrorKind, Read, Result, Write};
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 // --- SHARED STATS ---
 #[derive(Debug)]
 pub struct BucketStats {
+    pub vector_sum: RwLock<Vec<f32>>,
     pub tombstone_count: AtomicU32,
     pub temperature: AtomicF32,
 }
@@ -22,9 +24,8 @@ impl Default for BucketStats {
     fn default() -> Self {
         Self {
             tombstone_count: AtomicU32::new(0),
-            // Default temp 0.0 so cold buckets are eager to merge if empty ??
-            // This prevents "Infinite Urgency" on fresh buckets. ??
             temperature: AtomicF32::new(0.5),
+            vector_sum: RwLock::new(Vec::new()),
         }
     }
 }
@@ -70,6 +71,17 @@ impl BucketHeader {
                 });
     }
 
+    /// ⚡ NEW: Decay temperature (Cooling).
+    /// Called by the Janitor to simulate heat dissipation over time.
+    pub fn cool(&self, decay_rate: f32) {
+        let _ =
+            self.stats
+                .temperature
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current * decay_rate)
+                });
+    }
+
     pub fn mark_tombstone(&self) {
         self.stats.tombstone_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -101,6 +113,30 @@ impl BucketHeader {
         const BETA: f32 = 3.0;
 
         (emptiness / (temp + EPSILON)) + (BETA * zombie_ratio)
+    }
+
+    /// ⚡ NEW: Calculate Drift O(1) (Section 3.C)
+    /// Returns distance between Initial Centroid and Current Mean.
+    pub fn calculate_drift(&self) -> f32 {
+        let sum_guard = self.stats.vector_sum.read();
+        if sum_guard.is_empty() || self.count == 0 {
+            return 0.0;
+        }
+
+        // Current Mean = Sum / Count
+        // Drift = Dist(Mean, InitialCentroid)
+
+        // Use squared distance first to avoid sqrt if possible, but the spec says norm.
+        let mut dist_sq = 0.0;
+        let n = self.count as f32;
+
+        for (i, &sum_val) in sum_guard.iter().enumerate() {
+            let mean_val = sum_val / n;
+            let diff = mean_val - self.centroid[i];
+            dist_sq += diff * diff;
+        }
+
+        dist_sq.sqrt()
     }
 }
 

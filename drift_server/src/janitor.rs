@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::{error, info, instrument};
 
+const BUCKET_SPLIT_THRESHOLD: f32 = 0.8;
+const TEMPERATURE_COOL_FACTOR: f32 = 0.98;
+const DRIFT_THRESHOLD: f32 = 0.15;
+
 #[derive(Clone, Copy, Debug)]
 struct IgnoreState {
     retries: u32,
@@ -120,6 +124,8 @@ impl Janitor {
                 }
             }
 
+            header.cool(TEMPERATURE_COOL_FACTOR);
+
             let _ =
                 header
                     .stats
@@ -127,16 +133,25 @@ impl Janitor {
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| Some(t * 0.98));
 
             let urgency = header.calculate_urgency(target_cap as usize);
+            let capacity_ratio = header.count as f32 / target_cap as f32;
+            let drift = header.calculate_drift();
 
             // Make that value configurable
-            if header.count > (target_cap as f32 * 1.5) as u32 {
+            if (capacity_ratio > BUCKET_SPLIT_THRESHOLD) || (drift > DRIFT_THRESHOLD) {
                 info!(
                     "Janitor: ✂️ Splitting Bucket {} (Count {})",
                     header.id, header.count
                 );
 
                 match self.index.split_and_steal(header.id).await {
-                    Ok(MaintenanceStatus::Completed) => ops_budget -= 1,
+                    Ok(MaintenanceStatus::Completed) => {
+                        info!(
+                            "Janitor: ✂️ Split Bucket {} (Ratio {:.2})",
+                            header.id, capacity_ratio
+                        );
+                        ops_budget -= 1;
+                        continue; // Done with this bucket
+                    }
                     Ok(MaintenanceStatus::SkippedSingularity) => {
                         info!("Janitor: Bucket {} is a Singularity. Ignoring.", header.id);
 
@@ -151,7 +166,6 @@ impl Janitor {
                     Ok(_) => {}
                     Err(e) => error!("Split failed: {}", e),
                 }
-            // } else if header.count == 0 || (header.count < 50 && capacity_ratio < 0.1) {
             } else if urgency > 1.5 {
                 info!(
                     "Janitor: 🚑 Scatter Merging Bucket {} (Count {})",
@@ -164,6 +178,7 @@ impl Janitor {
                     Err(e) => error!("Merge failed: {}", e),
                 }
             }
+            // header.temperature()
         }
     }
 

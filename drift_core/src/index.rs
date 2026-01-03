@@ -15,6 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::usize::MIN;
 use tracing::{error, instrument};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -376,19 +377,17 @@ impl VectorIndex {
         &self,
         query: &[f32],
         k: usize,
-        target_confidence: f32, // Parameter from Table 2 [cite: 68]
-        lambda: f32,            // Decay rate [cite: 21]
-        tau: f32,               // Critical Mass
+        target_confidence: f32,
+        lambda: f32,
+        tau: f32,
     ) -> io::Result<Vec<SearchResult>> {
         // --- PHASE 1: SNAPSHOT & PRE-CALCULATION ---
-
-        // A. Quantizer & LUT
         let lut: Option<Vec<f32>> = {
             let guard = self.quantizer.read();
             guard.as_ref().map(|q| q.precompute_lut(query))
         };
 
-        // MemTable Search [Remains same]
+        // MemTable Search
         let mem_results = {
             let guard = epoch::pin();
             let active = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
@@ -415,26 +414,19 @@ impl VectorIndex {
                     clusters.entry(key).or_default().push(header);
                 }
 
-                // ⚡ IMPLEMENTATION OF EQ (3): P_eff = P_geom * R(b)
+                // 1. Probabilistic Scoring
                 let mut candidates: Vec<(Vec<&BucketHeader>, f32)> = clusters
                     .into_values()
                     .map(|headers| {
                         let centroid = &headers[0].centroid;
                         let total_count: u32 = headers.iter().map(|h| h.count).sum();
+                        let dist = crate::math::l2_sq(query, centroid).sqrt();
 
-                        let dist_sq = crate::math::l2_sq(query, centroid);
-                        let dist = dist_sq.sqrt();
-
-                        // P_geom (Eq 1) [cite: 21]
                         let p_geom = (-lambda * dist).exp();
-
-                        // R(b) - Saturating Density (Eq 2) [cite: 29]
                         let reliability = 1.0 - (-(total_count as f32) / tau).exp();
 
-                        // P_eff (Eq 3) [cite: 33]
-                        let p_eff = p_geom * reliability;
-
-                        (headers, p_eff)
+                        // Score = P_geom * R(b)
+                        (headers, p_geom * reliability)
                     })
                     .collect();
 
@@ -442,32 +434,44 @@ impl VectorIndex {
 
                 let mut headers = Vec::new();
                 let mut acc_conf = 0.0;
+                let mut visited_ids = HashSet::new();
+
+                // ⚡ FIX A: Minimum Scan Floor
+                // Ensure we scan at least 5% of buckets or 5 buckets, whichever is larger.
+                // This prevents "early stop" when probabilities are diluted.
+                const MIN_SCAN_FLOOR: usize = 5;
+                let min_scan = (buckets_map.len() / 20).max(MIN_SCAN_FLOOR);
 
                 for (group, score) in candidates {
                     acc_conf += score;
                     for h in group {
-                        headers.push((*h).clone());
+                        if visited_ids.insert(h.id) {
+                            headers.push((*h).clone());
+                        }
                     }
-                    if acc_conf >= target_confidence {
+                    if acc_conf >= target_confidence && headers.len() >= min_scan {
                         break;
                     }
                 }
 
-                // RECALL GUARDRAIL: Always include geometrically closest
-                if let Some(best) = buckets_map.values().min_by(|a, b| {
-                    crate::math::l2_sq(query, &a.centroid)
-                        .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
-                        .unwrap_or(CmpOrdering::Equal)
-                }) && !headers.iter().any(|h| h.id == best.id)
-                {
-                    headers.push((*best).clone());
+                // 2. ⚡ FIX B: Top-5 Geometric Guardrail
+                // Force-include the 5 closest buckets to catch the "Tail" of the drift.
+                let mut all_headers: Vec<&BucketHeader> = buckets_map.values().collect();
+                all_headers.sort_by(|a, b| {
+                    let da = crate::math::l2_sq(query, &a.centroid);
+                    let db = crate::math::l2_sq(query, &b.centroid);
+                    da.partial_cmp(&db).unwrap_or(CmpOrdering::Equal)
+                });
+
+                for h in all_headers.iter().take(5) {
+                    if visited_ids.insert(h.id) {
+                        headers.push((*h).clone());
+                    }
                 }
 
-                // Update "Heat" for Urgency Calculation
                 for header in &headers {
                     header.touch();
                 }
-
                 headers
             }
         };
@@ -500,9 +504,7 @@ impl VectorIndex {
         if let Some(lut_vec) = &lut {
             let dim = self.config.dim;
             for data in loaded_data {
-                // ADC Scan via Bucket Kernel [cite: 41]
                 let hits = Bucket::scan_with_lut(&data, lut_vec, dim);
-
                 for res in hits {
                     if deleted_guard.contains(&res.id) {
                         continue;
@@ -623,17 +625,24 @@ impl VectorIndex {
             new
         });
 
+        let mut vector_sum = vec![0.0; dim];
+        for v in &valid_vecs {
+            for i in 0..dim {
+                vector_sum[i] += v[i];
+            }
+        }
+
         self.update_buckets(|b| {
             let mut new = b.clone();
-            new.insert(
+            let header = BucketHeader::new(
                 id,
-                BucketHeader::new(
-                    id,
-                    centroid.clone(),
-                    valid_ids.len() as u32,
-                    page_id.clone(),
-                ),
+                centroid.clone(),
+                valid_ids.len() as u32,
+                page_id.clone(),
             );
+
+            *header.stats.vector_sum.write() = vector_sum.clone();
+            new.insert(id, header);
             new
         });
 
@@ -1129,6 +1138,17 @@ impl VectorIndex {
                 }
             }
 
+            // ⚡ UPDATE SUM
+            let dim = self.config.dim;
+            let mut new_sum = vec![0.0; dim];
+
+            // Recalculate sum from scratch (Survivors + Orphans) to be precise
+            for v in &vs {
+                for i in 0..dim {
+                    new_sum[i] += v[i];
+                }
+            }
+
             let bytes = new_data.to_bytes(dim)?;
             self.cache
                 .storage()
@@ -1141,6 +1161,9 @@ impl VectorIndex {
                 if let Some(h) = new.get_mut(&target_id) {
                     h.count = vs.len() as u32;
                     h.page_id.length = bytes.len() as u32;
+
+                    // Update sum
+                    *h.stats.vector_sum.write() = new_sum.clone();
                 }
                 new
             });
@@ -1508,7 +1531,7 @@ impl VectorIndex {
         segment_id: &str,
         offsets: &HashMap<u32, (u64, u32)>,
     ) -> io::Result<()> {
-        let _dim = self.config.dim; // Unused now
+        let dim = self.config.dim; // Need dim for reconstruction
         let segment_filename = format!("segment_{}.drift", segment_id);
 
         for p in partitions {
@@ -1517,11 +1540,30 @@ impl VectorIndex {
                 .ok_or(io::Error::other("Missing offset"))?;
 
             // 1. Register the File Mapping
+            // This informs TieredPageManager -> Remote that Bucket X is in Segment Y.
             self.cache
                 .storage()
                 .register_file(p.bucket_id, PathBuf::from(&segment_filename));
 
-            // 2. Update Maps
+            // 2. Cache Warming (Optional but recommended)
+            // Since we have the data in memory right now, we can write it to the Local Cache immediately.
+            // This avoids a read-back from S3 later.
+            // Because we decoupled Local/Remote, this writes to `cache/ID.bin` safely.
+            let bucket_data = BucketData {
+                codes: AlignedBytes::from_slice(&p.codes),
+                vids: p.ids.clone(),
+                tombstones: bit_set::BitSet::with_capacity(p.ids.len()),
+            };
+            let bytes = bucket_data.to_bytes(dim)?;
+
+            // Write to Local Cache (offset 0)
+            self.cache
+                .storage()
+                .write_page(p.bucket_id, 0, &bytes)
+                .await?;
+
+            // 3. Update Maps
+            // PageId points to the REMOTE location (Source of Truth)
             let page_id = PageId {
                 file_id: p.bucket_id,
                 offset: *off,
@@ -1552,12 +1594,10 @@ impl VectorIndex {
                 new
             });
 
-            // 3. Update KV Index
             for &vid in &p.ids {
                 let _ = self.kv.put(&vid.to_le_bytes(), &p.bucket_id.to_le_bytes());
             }
         }
-
         Ok(())
     }
 }

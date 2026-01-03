@@ -13,105 +13,68 @@ use tokio::task;
 /// Uses `pread` to allow true parallel reads on shared file handles.
 pub struct LocalDiskManager {
     base_path: PathBuf,
-    // Map ID -> Path
-    paths: RwLock<HashMap<u32, PathBuf>>,
     // Map ID -> Open File Handle
-    // We use std::fs::File because it is Sync (on Unix) and allows parallel read_at.
-    files: RwLock<HashMap<u32, Arc<File>>>,
+    // files: RwLock<HashMap<u32, Arc<File>>>,
 }
 
 impl LocalDiskManager {
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
         let path = base_path.into();
         std::fs::create_dir_all(&path).ok(); // Ensure dir exists
-        Self {
-            base_path: path,
-            paths: RwLock::new(HashMap::new()),
-            files: RwLock::new(HashMap::new()),
-        }
+        Self { base_path: path }
     }
 
-    fn get_file(&self, file_id: u32) -> Result<Arc<File>> {
-        // 1. Check open handles
-        {
-            let handles = self.files.read();
-            if let Some(f) = handles.get(&file_id) {
-                return Ok(f.clone());
-            }
+    /// Helper to open a file.
+    /// Does NOT cache the handle.
+    fn open_file(&self, file_id: u32, for_write: bool) -> Result<File> {
+        // 1. Resolve Path
+        let path = self.base_path.join(format!("{}.bin", file_id));
+
+        // 2. Configure Options
+        let mut options = OpenOptions::new();
+        options.read(true);
+
+        if for_write {
+            options.write(true).create(true).truncate(false);
+        } else {
+            // Read-only: Fail if not found
+            options.write(false).create(false);
         }
 
-        // 2. Resolve Path
-        let mut paths_guard = self.paths.write();
-        let mut files_guard = self.files.write();
-
-        // Double check (Race condition)
-        if let Some(f) = files_guard.get(&file_id) {
-            return Ok(f.clone());
-        }
-
-        let raw_path = paths_guard.get(&file_id).cloned();
-
-        let path = match raw_path {
-            Some(p) => {
-                if p.is_relative() {
-                    self.base_path.join(p)
-                } else {
-                    p
-                }
-            }
-            None => {
-                let p = self.base_path.join(format!("{}.drift", file_id));
-                paths_guard.insert(file_id, p.clone());
-                p
-            }
-        };
-
-        // Open
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true) // Should allow creating cache files if needed
-            .truncate(false)
-            .open(&path)?;
-
-        let arc_file = Arc::new(file);
-        files_guard.insert(file_id, arc_file.clone());
-
-        Ok(arc_file)
+        // 3. Open
+        options.open(&path)
     }
 }
 
 #[async_trait]
 impl PageManager for LocalDiskManager {
-    fn register_file(&self, file_id: u32, path: PathBuf) {
-        let mut map = self.paths.write();
-        map.insert(file_id, path);
+    fn register_file(&self, _file_id: u32, _path: PathBuf) {
+        // No-op for LocalDiskManager in Decoupled Mode.
+        // It always infers path from ID.
     }
 
     async fn read_page(&self, page_id: PageId) -> Result<Vec<u8>> {
-        let file = self.get_file(page_id.file_id)?;
+        let file = self.open_file(page_id.file_id, false)?;
+
         let offset = page_id.offset;
         let len = page_id.length as usize;
 
-        // Offload blocking I/O to a specialized thread
+        // Offload blocking IO
         task::spawn_blocking(move || {
             let mut buf = vec![0u8; len];
-            // pread: Thread-safe, offset-based read
+            // Read exact bytes
             file.read_exact_at(&mut buf, offset)?;
             Ok(buf)
         })
-        .await? // Handle JoinError
+        .await?
     }
 
     async fn write_page(&self, file_id: u32, offset: u64, data: &[u8]) -> Result<()> {
-        let file = self.get_file(file_id)?;
-        // Clone data to move into thread (overhead is minimal for typical page sizes)
-        // For massive writes, we might want to pass ownership of a Vec.
+        let file = self.open_file(file_id, true)?;
         let data = data.to_vec();
 
         task::spawn_blocking(move || {
             file.write_all_at(&data, offset)?;
-            // Optional: file.sync_data()?; // For strict durability
             Ok(())
         })
         .await?
