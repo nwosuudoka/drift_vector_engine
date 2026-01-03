@@ -1,9 +1,14 @@
+pub mod compactor;
+pub mod compactor_test;
 pub mod config;
 pub mod janitor;
 pub mod manager;
 pub mod persistence;
 pub mod server;
+pub mod storage_factory;
 
+#[cfg(test)]
+pub mod janitor_compaction_test;
 #[cfg(test)]
 mod janitor_stress_test;
 #[cfg(test)]
@@ -12,12 +17,20 @@ mod janitor_tests;
 mod manager_tests; // Add this line
 #[cfg(test)]
 mod server_tests;
+// #[cfg(test)]
+// pub mod wal_integration_test;
 
 #[cfg(test)]
 mod persistence_tests;
 
 #[cfg(test)]
 mod tombstone_test;
+
+#[cfg(test)]
+mod scatter_budget_test;
+
+#[cfg(test)]
+mod s3_integration_test;
 
 #[cfg(test)]
 mod scavenger_test;

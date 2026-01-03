@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+byteorder = "1.5"
 clap = { version = "4.4", features = ["derive", "env"] }
 drift_core = { path = "../drift_core" }
 drift_storage = { path = "../drift_storage" }
@@ -24,6 +25,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-chrome = "0.7"                                                     # Visual Profiler
 rand_distr = "0.5.1"
 walkdir = "2.4"
+opendal = "0.55.0"
+bit-set = "0.8.0"
 
 [build-dependencies]
 tonic-build = "0.14.2"
@@ -32,6 +35,13 @@ tonic-prost-build = "0.14.2"
 
 [features]
 stress-test = []
+integration-test = []
 
 [dev-dependencies]
 crossbeam-epoch = "0.9"
+testcontainers = "0.26.3"
+aws-config = "1.1"
+aws-sdk-s3 = "1.15"
+aws-credential-types = "1.1"
+tokio = { version = "1", features = ["full", "test-util"] }
+rand = "0.9.2"

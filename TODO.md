@@ -92,3 +92,14 @@
 - ✅ **Drift Simulation:** Implemented `drift_sim` harness to inject concept drift (moving clusters).
 - ✅ **Recall Verification:** Verified >90% recall under heavy drift (Speed 5.0).
 - ✅ **Adaptive Indexing Test:** Validated `Split` logic expands capacity and heals recall drops automatically.
+
+#### **Section 9: Garbage Collection (Disk Maintenance)**
+
+**Status:** ✅ **Complete**
+
+- ✅ **Segment Compaction (The Vacuum):**
+  - [x] Implemented `get_physical_path` trait in `PageManager`.
+  - [x] Created `SegmentCompactor` for Mark-and-Sweep GC.
+  - [x] Implemented `vacuum_segments()` with "Safety Belt".
+  - [x] Implemented `compact_tombstones()` to prevent log explosion.
+  - [x] Integrated into `Janitor` loop (Every 100 ticks).

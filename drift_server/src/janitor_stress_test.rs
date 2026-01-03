@@ -4,6 +4,7 @@ mod stress_tests {
     use crate::persistence::PersistenceManager;
     use drift_cache::local_store::LocalDiskManager;
     use drift_core::index::{IndexOptions, VectorIndex};
+    use opendal::{Operator, services};
 
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -33,6 +34,13 @@ mod stress_tests {
             .collect()
     }
 
+    // Helper to create a local FS operator for tests
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
     async fn eventually<F, Fut>(dur: Duration, mut f: F) -> io::Result<()>
     where
         F: FnMut() -> Fut,
@@ -54,7 +62,11 @@ mod stress_tests {
     #[tokio::test]
     async fn chaos_monkey_with_janitor() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 64,
             num_centroids: 8,
@@ -74,7 +86,13 @@ mod stress_tests {
         }
         index.train(&train_data).await.unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 200, Duration::from_millis(50));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            200,
+            Duration::from_millis(50),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
 
         let barrier = Arc::new(Barrier::new(CONCURRENCY + 1));
@@ -134,7 +152,11 @@ mod stress_tests {
     #[tokio::test]
     async fn split_storm() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 8,
             num_centroids: 2,
@@ -149,7 +171,13 @@ mod stress_tests {
         let train = (0..100).map(|i| vec![i as f32; 8]).collect::<Vec<_>>();
         index.train(&train).await.unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 50, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            50,
+            Duration::from_millis(10),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
 
         let mut rng = StdRng::seed_from_u64(0xAAAA);
@@ -182,7 +210,11 @@ mod stress_tests {
     #[tokio::test]
     async fn scatter_split_race() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 16,
             num_centroids: 4,
@@ -210,7 +242,13 @@ mod stress_tests {
             index.delete(i).unwrap();
         }
 
-        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            100,
+            Duration::from_millis(10),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
 
         sleep(Duration::from_millis(300)).await;
@@ -244,7 +282,11 @@ mod stress_tests {
     #[tokio::test]
     async fn kv_consistency_torture() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 4,
             num_centroids: 2,
@@ -260,7 +302,13 @@ mod stress_tests {
             .await
             .unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 60, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            60,
+            Duration::from_millis(10),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
 
         let mut rng = StdRng::seed_from_u64(0xD00D);
@@ -297,7 +345,11 @@ mod stress_tests {
     #[tokio::test]
     async fn duplicate_centroid_buckets() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let opts = IndexOptions {
             dim: 3,
             num_centroids: 1,
@@ -314,7 +366,13 @@ mod stress_tests {
                 .insert(i, &vec![1.0 + i as f32 * 1e-5, 1.0, 1.0])
                 .unwrap();
         }
-        let janitor = Janitor::new(index.clone(), persistence, 80, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            80,
+            Duration::from_millis(10),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
         let q = vec![1.0, 1.0, 1.0];
         eventually(Duration::from_secs(10), || {

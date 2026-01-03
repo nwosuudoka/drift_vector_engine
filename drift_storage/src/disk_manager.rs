@@ -1,60 +1,26 @@
 use async_trait::async_trait;
 use drift_traits::{PageId, PageManager};
-use opendal::{Operator, services};
+use opendal::Operator;
 use std::collections::HashMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use url::Url;
 
-// --- Existing DiskManager (Single File Handle) ---
+// --- DiskManager (Flat File Access) ---
 #[derive(Clone)]
 pub struct DiskManager {
     op: Operator,
-    pub path: String,
+    pub path: String, // Relative path inside the bucket/root
 }
 
 impl DiskManager {
-    pub async fn open(uri: &str) -> io::Result<Self> {
-        let (op, relative_path) = Self::parse_uri(uri)?;
-        Ok(Self {
-            op,
-            path: relative_path,
-        })
+    /// Create a manager using an existing Operator.
+    /// The 'path' is relative to the Operator's root.
+    pub fn new(op: Operator, path: String) -> Self {
+        Self { op, path }
     }
 
-    // Helper to parse URI into Operator + Path
-    fn parse_uri(uri: &str) -> io::Result<(Operator, String)> {
-        let url = Url::parse(uri).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        match url.scheme() {
-            "file" => {
-                let builder = services::Fs::default();
-                let path = Path::new(url.path());
-                let parent = path.parent().unwrap_or(Path::new("/")).to_str().unwrap();
-                let filename = path.file_name().unwrap_or_default().to_str().unwrap();
-                let op = Operator::new(builder.root(parent))
-                    .map_err(io::Error::other)?
-                    .finish();
-                Ok((op, filename.to_string()))
-            }
-            "s3" => {
-                let builder = services::S3::default();
-                let bucket = url.host_str().ok_or(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Missing bucket",
-                ))?;
-                let op = Operator::new(builder.bucket(bucket).region("us-east-1"))
-                    .map_err(io::Error::other)?
-                    .finish();
-                let p = url.path().trim_start_matches('/');
-                Ok((op, p.to_string()))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unsupported scheme",
-            )),
-        }
-    }
+    // Removed: pub async fn open(uri: &str) -> ...
 
     pub async fn read_at(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
         let range = offset..offset + length as u64;
@@ -64,6 +30,7 @@ impl DiskManager {
             .range(range)
             .await
             .map_err(io::Error::other)?;
+
         if data.len() != length {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Short read"));
         }
@@ -84,6 +51,7 @@ impl DiskManager {
     }
 }
 
+// --- DriftPageManager (Page-Based Access) ---
 #[derive(Clone)]
 pub struct DriftPageManager {
     op: Operator,
@@ -92,51 +60,13 @@ pub struct DriftPageManager {
 }
 
 impl DriftPageManager {
-    /// Opens a manager rooted at a specific location (directory/bucket prefix).
-    /// URI Example: file:///data/collection_name/storage/ or s3://bucket/collection/storage/
-    pub async fn new(uri: &str) -> io::Result<Self> {
-        // We use the same parsing logic, but we treat the 'path' as the root.
-        // For 'file://.../storage', we want the Operator root to be '.../storage'.
-
-        let url = Url::parse(uri).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let op = match url.scheme() {
-            "file" => {
-                let builder = services::Fs::default();
-                // Root is the directory itself
-                Operator::new(builder.root(url.path()))
-                    .map_err(io::Error::other)?
-                    .finish()
-            }
-            "s3" => {
-                let bucket = url.host_str().ok_or(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Missing bucket",
-                ))?;
-
-                let builder = {
-                    let builder = services::S3::default().bucket(bucket).region("us-east-1");
-                    let root = url.path().trim_start_matches('/');
-                    match root.is_empty() {
-                        true => builder,
-                        false => builder.root(root),
-                    }
-                };
-
-                // For S3, we might need a root prefix if the URI has a path
-                Operator::new(builder).map_err(io::Error::other)?.finish()
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Unsupported scheme",
-                ));
-            }
-        };
-
-        Ok(Self {
+    /// Creates a new PageManager wrapping an OpenDAL Operator.
+    /// The Operator should already be configured with the correct Root/Bucket.
+    pub fn new(op: Operator) -> Self {
+        Self {
             op,
             files: Arc::new(RwLock::new(HashMap::new())),
-        })
+        }
     }
 }
 
@@ -149,7 +79,6 @@ impl PageManager for DriftPageManager {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown.drift")
             .to_string();
-
         let mut map = self.files.write().unwrap();
         map.insert(file_id, filename);
     }
@@ -179,12 +108,11 @@ impl PageManager for DriftPageManager {
         let filename = {
             let mut map = self.files.write().unwrap();
             map.entry(file_id)
-                .or_insert_with(|| format!("page_{}", file_id)) // e.g. "page_0"
+                .or_insert_with(|| format!("page_{}", file_id))
                 .clone()
         };
 
-        // RMW Strategy
-        // 1. Check/Read existing
+        // RMW Strategy (Simulated for Object Storage)
         let exists = self.op.exists(&filename).await?;
         let mut full_data = if exists {
             self.op.read(&filename).await?.to_vec()
@@ -192,15 +120,18 @@ impl PageManager for DriftPageManager {
             Vec::new()
         };
 
-        // 2. Patch
         let end = offset as usize + data.len();
         if full_data.len() < end {
             full_data.resize(end, 0);
         }
         full_data[offset as usize..end].copy_from_slice(data);
-
-        // 3. Write Full
         self.op.write(&filename, full_data).await?;
         Ok(())
+    }
+
+    /// Used by Compactor to determine liveness.
+    /// Returns None if the ID is not registered or purely in-memory.
+    fn get_physical_path(&self, file_id: u32) -> Option<String> {
+        self.files.read().unwrap().get(&file_id).cloned()
     }
 }

@@ -4,9 +4,18 @@ mod tests {
     use crate::persistence::PersistenceManager;
     use drift_cache::local_store::LocalDiskManager;
     use drift_core::index::{IndexOptions, VectorIndex};
+    use opendal::{Operator, services};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    // --- Helpers ---
+
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
 
     // --- Setup ---
     async fn setup_index(dir: &std::path::Path) -> Arc<VectorIndex> {
@@ -161,7 +170,10 @@ mod tests {
     async fn test_scavenger_ignores_clean_buckets() {
         let dir = tempdir().unwrap();
         let index = setup_index(dir.path()).await;
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject into PersistenceManager
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
 
         // 1. Insert 10 items
         for i in 0..10 {
@@ -175,7 +187,13 @@ mod tests {
         index.delete(0).unwrap();
 
         // 3. Run Janitor Logic
-        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_secs(1));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            100,
+            Duration::from_secs(1),
+            None,
+        );
 
         // Should ignore clean buckets
         janitor.scavenge().await.unwrap();

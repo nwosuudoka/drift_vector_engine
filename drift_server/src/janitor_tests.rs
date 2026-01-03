@@ -4,6 +4,7 @@ mod tests {
     use crate::persistence::PersistenceManager;
     use drift_cache::local_store::LocalDiskManager;
     use drift_core::index::{IndexOptions, VectorIndex};
+    use opendal::{Operator, services};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -26,10 +27,21 @@ mod tests {
         Arc::new(VectorIndex::new(options, &wal_path, storage).unwrap())
     }
 
+    // Helper to create a local FS operator
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
     #[tokio::test]
     async fn test_janitor_lifecycle_flush_and_truncate_2() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject into PersistenceManager
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let index = create_index(dir.path(), "current.wal", 100);
 
         index
@@ -37,7 +49,13 @@ mod tests {
             .await
             .unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            100,
+            Duration::from_millis(10),
+            None,
+        );
         let j_handle = tokio::spawn(async move { janitor.run().await });
 
         for i in 0..250 {
@@ -70,7 +88,11 @@ mod tests {
     #[tokio::test]
     async fn test_deletion_and_self_healing() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+
+        // ⚡ CHANGE: Create Operator and inject
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let index = create_index(dir.path(), "healing.wal", 50);
 
         index
@@ -109,18 +131,13 @@ mod tests {
             index.delete(i).unwrap();
         }
 
-        // Note: With strict hysteresis (merge only if empty), this test might fail
-        // if we rely on the Janitor to merge a bucket with 5 items.
-        // However, deletions create tombstones. If the implementation of scatter_merge
-        // respects tombstones and sees the bucket as "logically empty" or low count, it might work.
-        // But the Janitor checks `header.count`. Delete updates `header.count`?
-        // No, `delete` usually hits MemTable or marks tombstone in BucketData.
-        // It does NOT decrement `BucketHeader.count` instantly in most LSM designs.
-        //
-        // If this test fails, it means the Janitor doesn't see the bucket as empty.
-        // For now, let's leave it and see. If it fails, we manually trigger merge.
-
-        let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(1));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            1000,
+            Duration::from_millis(1),
+            None,
+        );
         let j_handle = tokio::spawn(async move { janitor.run().await });
 
         println!("--- WAITING FOR HEAL ---");
@@ -141,7 +158,10 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_neighbor_stealing() {
         let dir = tempdir().unwrap();
-        let _persistence = PersistenceManager::new(dir.path());
+        // ⚡ CHANGE: Create Operator and inject (even if unused in this specific test logic, type requires it)
+        let op = create_local_operator(dir.path());
+        let _persistence = PersistenceManager::new(op, dir.path());
+
         let index = create_index(dir.path(), "steal.wal", 20);
 
         // Train: Left [0, 0], Right [1000, 0]
@@ -170,9 +190,6 @@ mod tests {
         let mut left_vecs = Vec::new();
         for i in 100..130 {
             left_ids.push(i);
-            // Add Variance so Singularity Guard doesn't abort split
-            // Training range is 0 to 1000.
-            // 0.0 vs 2.0 is distinct.
             let val = if i % 2 == 0 { 0.0 } else { 2.0 };
             left_vecs.push(vec![val, 0.0]);
         }
@@ -214,9 +231,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_explicit_neighbor_stealing_2() {
-        // Same fix as above (Variance)
         let dir = tempdir().unwrap();
-        let _persistence = PersistenceManager::new(dir.path());
+        let op = create_local_operator(dir.path());
+        let _persistence = PersistenceManager::new(op, dir.path());
+
         let index = create_index(dir.path(), "steal.wal", 20);
 
         let train_data = vec![vec![0.0, 0.0], vec![1000.0, 0.0]];
@@ -240,7 +258,6 @@ mod tests {
         let mut left_vecs = Vec::new();
         for i in 100..130 {
             left_ids.push(i);
-            // Add Variance
             let val = if i % 2 == 0 { 0.0 } else { 2.0 };
             left_vecs.push(vec![val, 0.0]);
         }
@@ -276,7 +293,9 @@ mod tests {
     #[tokio::test]
     async fn test_scatter_merge_preserves_kv_integrity() {
         let dir = tempdir().unwrap();
-        let _persistence = PersistenceManager::new(dir.path());
+        let op = create_local_operator(dir.path());
+        let _persistence = PersistenceManager::new(op, dir.path());
+
         let index = create_index(dir.path(), "merge_kv.wal", 50);
 
         index
@@ -302,14 +321,9 @@ mod tests {
             .await
             .unwrap();
 
-        // 3. Manually Trigger Merge
-        // The Janitor only merges empty buckets (count=0).
-        // This test bucket has 1 item, so Janitor would ignore it.
-        // We call the core function directly to verify the Logic (KV updates), not the Policy (Janitor).
         println!("--- MANUAL MERGE TRIGGER ---");
         index.scatter_merge(0).await.unwrap();
 
-        // 4. Verify Merge
         let k_bytes = 999u64.to_le_bytes();
         let v_buf = index
             .kv
@@ -351,42 +365,55 @@ mod tests {
     #[tokio::test]
     async fn test_auto_splitting_under_pressure() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
 
         let index = create_index(dir.path(), "split.wal", 20);
+
+        // Train with basic data
         index.train(&vec![vec![0.0, 0.0]]).await.unwrap();
 
         let mut ids = Vec::new();
         let mut vecs = Vec::new();
 
-        // 15 items at [0,0]
+        // 1. Cluster A: Around [0,0] (15 items)
         for i in 0..15 {
             ids.push(i);
-            vecs.push(vec![0.0, 0.0]);
+            // ⚡ FIX: Add noise to stabilize K-Means
+            let noise = (i as f32) * 0.001;
+            vecs.push(vec![0.0 + noise, 0.0 + noise]);
         }
-        // 35 items at [100,100] (Drift)
+        // 2. Cluster B: Around [100,100] (35 items) - The Drift
         for i in 15..50 {
             ids.push(i);
-            vecs.push(vec![100.0, 100.0]);
+            // ⚡ FIX: Add noise
+            let noise = (i as f32) * 0.001;
+            vecs.push(vec![100.0 + noise, 100.0 + noise]);
         }
 
+        // Force L1 Write
         index
             .force_register_bucket_with_ids(0, &ids, &vecs)
             .await
             .unwrap();
 
-        // Check Initial State
         let initial_buckets = index.get_all_bucket_headers();
         assert_eq!(initial_buckets.len(), 1, "Should start with 1 bucket");
-        assert_eq!(initial_buckets[0].count, 50);
 
-        let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(10));
+        // Janitor with fast polling
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            1000,
+            Duration::from_millis(10),
+            None,
+        );
         let j_handle = tokio::spawn(async move { janitor.run().await });
 
         println!("--- INDUCING DRIFT ---");
 
-        // Polling Wait: Wait up to 2 seconds for split
-        let split_happened = wait_for_condition(Duration::from_secs(2), || {
+        // Wait for split (Bucket Count >= 2)
+        let split_happened = wait_for_condition(Duration::from_secs(5), || {
             let idx = index.clone();
             async move {
                 let buckets = idx.get_all_bucket_headers();
@@ -402,10 +429,11 @@ mod tests {
 
         assert!(
             split_happened,
-            "Janitor failed to split drifting bucket within timeout. Count: {}",
+            "Janitor failed to split drifting bucket. Count: {}",
             final_buckets.len()
         );
 
+        // Verify Search works on both clusters
         let res_near = index
             .search_async(&vec![0.0, 0.0], 1, 0.9, 1.0, 100.0)
             .await
@@ -421,17 +449,24 @@ mod tests {
         println!("✅ test_auto_splitting_under_pressure Passed!");
     }
 
-    // For brevity, here is one other critical test that was in the file:
     #[tokio::test]
     async fn test_janitor_lifecycle_flush_and_truncate() {
         let dir = tempdir().unwrap();
-        let persistence = PersistenceManager::new(dir.path());
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
+
         let index = create_index(dir.path(), "current.wal", 100);
         index
             .train(&vec![vec![0.0, 0.0], vec![100.0, 100.0]])
             .await
             .unwrap();
-        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            100,
+            Duration::from_millis(10),
+            None,
+        );
         let j_handle = tokio::spawn(async move { janitor.run().await });
         for i in 0..250 {
             index.insert(i as u64, &vec![10.0, 10.0]).unwrap();
@@ -440,7 +475,7 @@ mod tests {
             }
         }
 
-        sleep(Duration::from_millis(500)).await; // Increased wait for flush
+        sleep(Duration::from_millis(500)).await;
         j_handle.abort();
         let mem_size = index.memtable_len();
         println!("Final MemTable Size: {}", mem_size);

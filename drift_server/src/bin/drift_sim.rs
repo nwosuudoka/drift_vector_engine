@@ -1,6 +1,7 @@
 use clap::Parser;
+use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
-use drift_server::drift_proto::{InsertRequest, SearchRequest, Vector};
+use drift_server::drift_proto::{InsertRequest, SearchRequest, TrainRequest, Vector};
 use drift_server::manager::CollectionManager;
 use drift_server::server::DriftService;
 use rand::prelude::*;
@@ -160,20 +161,21 @@ struct Args {
     batch_size: usize,
 }
 
-// drift_server/src/bin/drift_sim.rs
-
-// ... (Imports stay the same) ...
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     let dir = tempdir()?;
-    let config = drift_server::config::Config {
+
+    // ⚡ FIX: Use the new Configuration Strategy Pattern
+    let config = Config {
         port: 50052,
-        storage_uri: format!("file://{}", dir.path().join("storage").to_string_lossy()),
         wal_dir: dir.path().join("wal"),
+        // Strategy: File System
+        storage: StorageCommand::File(FileConfig {
+            path: dir.path().join("storage"),
+        }),
         default_dim: args.dim,
         // 600 * 1.5 = 900.
         // Since we insert 1000 items, 1000 > 900, so the Janitor WILL split every bucket.
@@ -188,19 +190,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let collection_name = "sim_world";
 
-    // Speed: 5.0 is aggressive.
+    // Speed: 3.0 is moderate-high.
     let mut world = World::new(args.dim, args.clusters, 3.0, 999);
-    // let mut world = World::new(args.dim, args.clusters, 5.0, 999);
     let mut shadow_db: Vec<(u64, Vec<f32>)> = Vec::new();
     let mut next_id = 0;
 
     println!("🌍 Starting Hard-Mode Drift Simulation");
     println!("   • Clusters: {}", args.clusters);
-    println!("   • Drift Speed: 5.0 (High)");
-    println!("   • Bucket Cap: 900 (Forces flush)");
+    println!("   • Drift Speed: 3.0");
+    println!("   • Bucket Cap: 600 (Forces flush)");
 
-    // ... (Training Phase stays the same) ...
-    // ... Copy the Phase 1 block from previous code ...
+    // ... (Training Phase) ...
     println!("\n📚 Phase 1: Initial Training...");
     let mut train_batch = world.generate_batch(2000, next_id);
 
@@ -214,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shadow_db.push((v.id, v.values.clone()));
     }
 
-    let train_req = Request::new(drift_server::drift_proto::TrainRequest {
+    let train_req = Request::new(TrainRequest {
         collection_name: collection_name.to_string(),
         vectors: train_batch,
     });
@@ -252,8 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             k: k as u32,
             target_confidence: 0.95,
 
-            // FIX 2: Lower Lambda to allow "fuzzier" matching as data drifts away
-            // 0.1 means probability decays slower over distance.
+            // FIX: Lower Lambda to allow "fuzzier" matching as data drifts away
             lambda: 0.1,
 
             tau: 100.0,

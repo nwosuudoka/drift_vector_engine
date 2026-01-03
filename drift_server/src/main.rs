@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("========================================");
     println!("Config Loaded:");
     println!("  • Port:            {}", config.port);
-    println!("  • Storage URI:     {}", config.storage_uri);
+    // println!("  • Storage URI:     {}", config.storage_uri);
     println!("  • WAL Path:        {:?}", config.wal_dir);
     println!("  • Default Dim:     {}", config.default_dim);
     println!("  • Max Bucket Cap:  {}", config.max_bucket_capacity);
