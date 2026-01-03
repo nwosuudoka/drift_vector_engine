@@ -1,5 +1,6 @@
 use clap::Parser;
 use drift_server::config::{Config, FileConfig, StorageCommand};
+use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{InsertRequest, SearchRequest, TrainRequest, Vector};
 use drift_server::manager::CollectionManager;
 use drift_server::server::DriftService;
