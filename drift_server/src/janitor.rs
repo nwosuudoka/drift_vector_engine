@@ -84,6 +84,8 @@ impl Janitor {
         loop {
             interval.tick().await;
 
+            let cycle = self.cycle_count.fetch_add(1, Ordering::Relaxed);
+
             // 1. Flush Logic
             // Check if we need to flush (Threshold met OR pending frozen work from a failed retry)
             let mem_size = self.index.memtable_len();
@@ -106,12 +108,13 @@ impl Janitor {
             self.perform_maintenance().await;
 
             // 4. Garbage Collection (Every 100 cycles)
-            let cycle = self.cycle_count.load(Ordering::Relaxed);
-            if cycle % 100 == 0 {
-                if let Some(c) = &self.compactor {
-                    if let Err(e) = c.run_cycle().await {
-                        error!("Janitor: Compaction cycle failed: {}", e);
-                    }
+            if cycle > 0
+                && cycle.is_multiple_of(10)
+                && let Some(c) = &self.compactor
+            {
+                info!("Janitor: Running Compaction Cycle #{}", cycle);
+                if let Err(e) = c.run_cycle().await {
+                    error!("Janitor: Compaction cycle failed: {}", e);
                 }
             }
         }

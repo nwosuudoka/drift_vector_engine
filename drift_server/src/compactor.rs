@@ -1,6 +1,7 @@
 use drift_core::index::VectorIndex;
 use opendal::Operator;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, instrument};
@@ -22,26 +23,94 @@ impl SegmentCompactor {
         Ok(())
     }
 
+    // /// 🧹 PHASE 1: VACUUM SEGMENTS
+    // /// Deletes "segment_*.drift" files that are no longer referenced by any live bucket.
+    // #[instrument(skip(self), level = "info")]
+    // pub async fn vacuum_segments(&self) -> std::io::Result<()> {
+    //     // 1. Identify Live Files (Mark)
+    //     let mut live_files = HashSet::new();
+
+    //     // Get all headers from the index
+    //     let headers = self.index.get_all_bucket_headers();
+    //     let storage = self.index.cache.storage();
+
+    //     for header in headers {
+    //         let file_id = header.page_id.file_id;
+    //         // Ask storage layer which file this ID maps to
+    //         if let Some(path) = storage.get_physical_path(file_id) {
+    //             live_files.insert(path);
+    //         }
+    //     }
+
+    //     // 2. List All Files (Sweep)
+    //     let entries = self.op.list("").await.map_err(std::io::Error::other)?;
+    //     let mut deleted_count = 0;
+    //     let mut reclaimed_bytes = 0;
+
+    //     for entry in entries {
+    //         let path = entry.path();
+
+    //         // Only touch segment files
+    //         if !path.starts_with("segment_") || !path.ends_with(".drift") {
+    //             continue;
+    //         }
+
+    //         // If it's NOT in our live set, kill it.
+    //         if !live_files.contains(path) {
+    //             // Safety check: Don't delete brand new files created during a race?
+    //             // The Janitor registers files BEFORE they are visible, so live_files
+    //             // should capture them. But we can check mod time if we want to be paranoid.
+
+    //             let meta = self.op.stat(path).await.map_err(std::io::Error::other)?;
+    //             reclaimed_bytes += meta.content_length();
+
+    //             info!("Compactor: 🗑️ Deleting orphan segment: {}", path);
+    //             self.op.delete(path).await.map_err(std::io::Error::other)?;
+    //             deleted_count += 1;
+    //         }
+    //     }
+
+    //     if deleted_count > 0 {
+    //         info!(
+    //             "Compactor: Vacuum complete. Deleted {} segments, freed {} bytes.",
+    //             deleted_count, reclaimed_bytes
+    //         );
+    //     }
+
+    //     Ok(())
+    // }
+
     /// 🧹 PHASE 1: VACUUM SEGMENTS
-    /// Deletes "segment_*.drift" files that are no longer referenced by any live bucket.
     #[instrument(skip(self), level = "info")]
     pub async fn vacuum_segments(&self) -> std::io::Result<()> {
-        // 1. Identify Live Files (Mark)
-        let mut live_files = HashSet::new();
+        // 1. MARK: Identify Live Files
+        // We store just the FILENAME to be path-agnostic
+        let mut live_filenames = HashSet::new();
 
-        // Get all headers from the index
         let headers = self.index.get_all_bucket_headers();
         let storage = self.index.cache.storage();
 
-        for header in headers {
+        for header in &headers {
             let file_id = header.page_id.file_id;
-            // Ask storage layer which file this ID maps to
-            if let Some(path) = storage.get_physical_path(file_id) {
-                live_files.insert(path);
+            if let Some(path_str) = storage.get_physical_path(file_id) {
+                // Extract filename only: "data/segment_123.drift" -> "segment_123.drift"
+                let p = Path::new(&path_str);
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    live_filenames.insert(name.to_string());
+                }
             }
         }
 
-        // 2. List All Files (Sweep)
+        // Abort to prevent deleting the entire database due to a configuration error.
+        if !headers.is_empty() && live_filenames.is_empty() {
+            tracing::error!(
+                "Compactor: 🚨 SAFETY ABORT! Index has {} buckets but mapped 0 physical files. Check PageManager implementation.",
+                headers.len()
+            );
+            return Ok(());
+        }
+
+        // 2. SWEEP: List all files and delete garbage
         let entries = self.op.list("").await.map_err(std::io::Error::other)?;
         let mut deleted_count = 0;
         let mut reclaimed_bytes = 0;
@@ -49,21 +118,33 @@ impl SegmentCompactor {
         for entry in entries {
             let path = entry.path();
 
-            // Only touch segment files
-            if !path.starts_with("segment_") || !path.ends_with(".drift") {
+            // Normalize path to filename for comparison
+            let p = Path::new(path);
+            let filename = match p.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n,
+                None => continue, // Skip odd paths
+            };
+
+            // Filter: Only target Drift Segment files
+            if !filename.starts_with("segment_") || !filename.ends_with(".drift") {
                 continue;
             }
 
-            // If it's NOT in our live set, kill it.
-            if !live_files.contains(path) {
-                // Safety check: Don't delete brand new files created during a race?
-                // The Janitor registers files BEFORE they are visible, so live_files
-                // should capture them. But we can check mod time if we want to be paranoid.
+            // Logic: If filename is NOT in our live set, it is garbage.
+            if !live_filenames.contains(filename) {
+                // Safety check to ensure we aren't deleting a brand new file being written?
+                // The unique run_id UUIDs prevent name collision, so checking "is in index" is sufficient.
 
-                let meta = self.op.stat(path).await.map_err(std::io::Error::other)?;
+                let meta = match self.op.stat(path).await {
+                    Ok(m) => m,
+                    Err(_) => continue, // Already gone?
+                };
                 reclaimed_bytes += meta.content_length();
 
-                info!("Compactor: 🗑️ Deleting orphan segment: {}", path);
+                info!(
+                    "Compactor: 🗑️ Deleting orphan segment: {} (Not in live set: {:?})",
+                    path, live_filenames
+                );
                 self.op.delete(path).await.map_err(std::io::Error::other)?;
                 deleted_count += 1;
             }

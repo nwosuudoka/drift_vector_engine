@@ -81,7 +81,7 @@ mod tests {
             .unwrap();
 
         let seg_path = persistence
-            .flush_to_segment(&index_l1, "test")
+            .flush_memtable_to_segment(&index_l1, "test")
             .await
             .unwrap();
         drop(index_l1);

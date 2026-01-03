@@ -64,4 +64,10 @@ impl PageManager for TieredPageManager {
         // Writes go to Local (Cache Warming / MemTable Flush simulation)
         self.local.write_page(file_id, offset, data).await
     }
+
+    // Forward physical path lookup to remote storage (S3/Disk)
+    // This allows the Compactor to see what files are actually live.
+    fn get_physical_path(&self, file_id: u32) -> Option<String> {
+        self.remote.get_physical_path(file_id)
+    }
 }

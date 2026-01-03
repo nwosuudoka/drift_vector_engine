@@ -95,11 +95,11 @@
 
 #### **Section 9: Garbage Collection (Disk Maintenance)**
 
-**Status:** 🚧 **In Progress**
+**Status:** ✅ **Complete**
 
-- [ ] **Segment Compaction (The Vacuum):**
-  - [ ] Implement `get_physical_path` trait in `PageManager` to map logical IDs to physical files.
-  - [ ] Create `SegmentCompactor` struct to perform Mark-and-Sweep GC on S3/Disk.
-  - [ ] Implement `vacuum_segments()`: Identify and delete `.drift` files no longer referenced by the Index.
-  - [ ] Implement `compact_tombstones()`: Consolidate scattered tombstone logs into a single snapshot.
-  - [ ] Integrate `SegmentCompactor` into the `Janitor` background loop.
+- ✅ **Segment Compaction (The Vacuum):**
+  - [x] Implemented `get_physical_path` trait in `PageManager`.
+  - [x] Created `SegmentCompactor` for Mark-and-Sweep GC.
+  - [x] Implemented `vacuum_segments()` with "Safety Belt".
+  - [x] Implemented `compact_tombstones()` to prevent log explosion.
+  - [x] Integrated into `Janitor` loop (Every 100 ticks).
