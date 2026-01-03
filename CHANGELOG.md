@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.5] - Physical Garbage Collection
+
+**Work in Progress**
+
+### Added
+
+- **Segment Compactor:** A mark-and-sweep garbage collector that deletes obsolete `.drift` segments and consolidates tombstone logs to prevent storage leaks.
+
 ## [0.6.4] - Compaction & Correctness Hardening
 
 **Tag:** `v0.6.4-stable-core`

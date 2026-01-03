@@ -1,3 +1,5 @@
+pub mod compactor;
+pub mod compactor_test;
 pub mod config;
 pub mod janitor;
 pub mod manager;

@@ -1,3 +1,4 @@
+use crate::compactor::SegmentCompactor;
 use crate::config::Config;
 use crate::janitor::Janitor;
 use crate::persistence::PersistenceManager;
@@ -89,7 +90,7 @@ impl CollectionManager {
         let local_storage = Arc::new(LocalDiskManager::new(cache_dir));
         let storage = Arc::new(TieredPageManager::new(local_storage, remote_storage));
 
-        let persistence = PersistenceManager::new(op, &coll_wal_dir);
+        let persistence = PersistenceManager::new(op.clone(), &coll_wal_dir);
         let dim = dim_hint.unwrap_or(self.config.default_dim);
 
         let options = IndexOptions {
@@ -123,12 +124,15 @@ impl CollectionManager {
         let flush_threshold = self.config.max_bucket_capacity;
         let refresh_rate = 100;
 
+        let compactor = SegmentCompactor::new(index.clone(), op.clone());
+
         tokio::spawn(async move {
             let janitor = Janitor::new(
                 j_idx,
                 j_persist,
                 flush_threshold,
                 Duration::from_millis(refresh_rate),
+                Some(compactor),
             );
             janitor.run().await;
         });

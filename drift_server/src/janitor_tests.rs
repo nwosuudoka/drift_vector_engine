@@ -49,7 +49,13 @@ mod tests {
             .await
             .unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            100,
+            Duration::from_millis(10),
+            None,
+        );
         let j_handle = tokio::spawn(async move { janitor.run().await });
 
         for i in 0..250 {
@@ -125,7 +131,13 @@ mod tests {
             index.delete(i).unwrap();
         }
 
-        let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(1));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            1000,
+            Duration::from_millis(1),
+            None,
+        );
         let j_handle = tokio::spawn(async move { janitor.run().await });
 
         println!("--- WAITING FOR HEAL ---");
@@ -389,7 +401,13 @@ mod tests {
         assert_eq!(initial_buckets.len(), 1, "Should start with 1 bucket");
 
         // Janitor with fast polling
-        let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            1000,
+            Duration::from_millis(10),
+            None,
+        );
         let j_handle = tokio::spawn(async move { janitor.run().await });
 
         println!("--- INDUCING DRIFT ---");
@@ -442,7 +460,13 @@ mod tests {
             .train(&vec![vec![0.0, 0.0], vec![100.0, 100.0]])
             .await
             .unwrap();
-        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            100,
+            Duration::from_millis(10),
+            None,
+        );
         let j_handle = tokio::spawn(async move { janitor.run().await });
         for i in 0..250 {
             index.insert(i as u64, &vec![10.0, 10.0]).unwrap();

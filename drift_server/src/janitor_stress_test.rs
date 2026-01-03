@@ -86,7 +86,13 @@ mod stress_tests {
         }
         index.train(&train_data).await.unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 200, Duration::from_millis(50));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            200,
+            Duration::from_millis(50),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
 
         let barrier = Arc::new(Barrier::new(CONCURRENCY + 1));
@@ -165,7 +171,13 @@ mod stress_tests {
         let train = (0..100).map(|i| vec![i as f32; 8]).collect::<Vec<_>>();
         index.train(&train).await.unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 50, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            50,
+            Duration::from_millis(10),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
 
         let mut rng = StdRng::seed_from_u64(0xAAAA);
@@ -230,7 +242,13 @@ mod stress_tests {
             index.delete(i).unwrap();
         }
 
-        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            100,
+            Duration::from_millis(10),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
 
         sleep(Duration::from_millis(300)).await;
@@ -284,7 +302,13 @@ mod stress_tests {
             .await
             .unwrap();
 
-        let janitor = Janitor::new(index.clone(), persistence, 60, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            60,
+            Duration::from_millis(10),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
 
         let mut rng = StdRng::seed_from_u64(0xD00D);
@@ -342,7 +366,13 @@ mod stress_tests {
                 .insert(i, &vec![1.0 + i as f32 * 1e-5, 1.0, 1.0])
                 .unwrap();
         }
-        let janitor = Janitor::new(index.clone(), persistence, 80, Duration::from_millis(10));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            80,
+            Duration::from_millis(10),
+            None,
+        );
         let jh = tokio::spawn(async move { janitor.run().await });
         let q = vec![1.0, 1.0, 1.0];
         eventually(Duration::from_secs(10), || {

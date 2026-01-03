@@ -187,7 +187,13 @@ mod tests {
         index.delete(0).unwrap();
 
         // 3. Run Janitor Logic
-        let janitor = Janitor::new(index.clone(), persistence, 100, Duration::from_secs(1));
+        let janitor = Janitor::new(
+            index.clone(),
+            persistence,
+            100,
+            Duration::from_secs(1),
+            None,
+        );
 
         // Should ignore clean buckets
         janitor.scavenge().await.unwrap();

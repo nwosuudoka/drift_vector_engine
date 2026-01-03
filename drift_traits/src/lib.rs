@@ -23,6 +23,12 @@ pub trait PageManager: Send + Sync {
     /// Writes a blob to storage.
     /// Used during Flush/Compaction.
     async fn write_page(&self, file_id: u32, offset: u64, data: &[u8]) -> Result<()>;
+
+    /// Used by Compactor to determine liveness.
+    /// Returns None if the ID is not registered or purely in-memory.
+    fn get_physical_path(&self, file_id: u32) -> Option<String> {
+        None
+    }
 }
 
 // Trait for object that can be cached (e.g Buckets).

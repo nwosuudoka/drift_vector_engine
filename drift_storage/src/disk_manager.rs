@@ -128,4 +128,10 @@ impl PageManager for DriftPageManager {
         self.op.write(&filename, full_data).await?;
         Ok(())
     }
+
+    /// Used by Compactor to determine liveness.
+    /// Returns None if the ID is not registered or purely in-memory.
+    fn get_physical_path(&self, file_id: u32) -> Option<String> {
+        self.files.read().unwrap().get(&file_id).cloned()
+    }
 }

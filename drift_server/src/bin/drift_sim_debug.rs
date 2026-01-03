@@ -1,17 +1,23 @@
 use clap::Parser;
+use drift_core::math;
 use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
-use drift_server::drift_proto::{InsertRequest, SearchRequest, TrainRequest, Vector};
+use drift_server::drift_proto::{InsertRequest, TrainRequest, Vector};
 use drift_server::manager::CollectionManager;
 use drift_server::server::DriftService;
 use rand::prelude::*;
 use rand_distr::{Distribution, Normal};
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::sleep;
-use tonic::Request;
+use tonic::Request; // Ensure this is available or use crate::math
 
+// ... [DriftingCluster, World, calculate_ground_truth, calculate_recall, force_flush_and_wait remain the same] ...
+// (I will omit them to save space, paste them from previous version)
+
+// Copy DriftingCluster, World, Helpers here...
 // =================================================================
 // 1. DATA GENERATOR (Harder Mode)
 // =================================================================
@@ -86,10 +92,6 @@ impl World {
     }
 }
 
-// =================================================================
-// 2. HELPERS
-// =================================================================
-
 fn calculate_ground_truth(all_vectors: &[(u64, Vec<f32>)], query: &[f32], k: usize) -> Vec<u64> {
     let mut scored: Vec<(u64, f32)> = all_vectors
         .iter()
@@ -121,16 +123,31 @@ async fn force_flush_and_wait(service: &DriftService, collection: &str) {
         .await
         .unwrap();
 
+    // 1. Wait for MemTable drain
     let mut retries = 0;
     while coll.index.memtable_len() > 0 {
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(50)).await;
         retries += 1;
-        if retries > 100 {
-            println!("⚠️ Warning: MemTable flush timeout.");
+        if retries > 200 {
+            break;
+        } // 10s
+    }
+
+    // 2. Wait for Frozen to clear (Persistence complete)
+    let mut frozen_retries = 0;
+    loop {
+        let has_frozen = coll.index.frozen_memtable.read().is_some();
+        if !has_frozen {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+        frozen_retries += 1;
+        if frozen_retries > 200 {
             break;
         }
     }
-    sleep(Duration::from_millis(500)).await;
+
+    sleep(Duration::from_millis(200)).await;
 }
 
 // =================================================================
@@ -153,10 +170,9 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-
     let dir = tempdir()?;
 
-    // ⚡ CONFIGURATION
+    // ⚡ TUNED CONFIGURATION
     let config = Config {
         port: 50055,
         wal_dir: dir.path().join("wal"),
@@ -164,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             path: dir.path().join("storage"),
         }),
         default_dim: args.dim,
-        max_bucket_capacity: 600,
+        max_bucket_capacity: 300,
         ef_construction: 64,
         ef_search: 256,
     };
@@ -179,24 +195,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut shadow_db: Vec<(u64, Vec<f32>)> = Vec::new();
     let mut next_id = 0;
 
-    println!("🌍 Starting Concept Drift Simulation (Instrumented)");
+    println!("🌍 Starting Concept Drift Simulation (Instrumented & Tuned)");
     println!("   • Clusters: {}", args.clusters);
     println!("   • Velocity: 5.0 (High)");
-    println!("   • Buckets:  Splitting enabled at 900 vectors");
+    println!("   • ef_search: 256");
 
+    // ... (Training) ...
     println!("\n📚 Phase 1: Training...");
     let mut train_batch = world.generate_batch(2000, next_id);
     next_id += 2000;
-
     if !train_batch.is_empty() {
         train_batch[0].values = vec![-500.0; args.dim];
         train_batch[1].values = vec![1500.0; args.dim];
     }
-
     for v in &train_batch {
         shadow_db.push((v.id, v.values.clone()));
     }
-
     let train_req = Request::new(TrainRequest {
         collection_name: collection_name.to_string(),
         vectors: train_batch,
@@ -205,13 +219,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Index Trained.");
 
     // Tuning Parameters
-    let lambda = 0.05; // Fuzzier
-    // let tau = 60.0; // Matches bucket cap 600 / 10
-    let tau = 20.0; // Matches bucket cap 600 / 10
+    let lambda = 0.05;
+    let tau = 20.0;
 
     for b in 1..=args.batches {
         world.drift();
-
         let batch = world.generate_batch(args.batch_size, next_id);
         next_id += args.batch_size as u64;
 
@@ -231,50 +243,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let k = 10;
         let ground_truth = calculate_ground_truth(&shadow_db, &query_vec, k);
 
-        let search_req = Request::new(SearchRequest {
-            collection_name: collection_name.to_string(),
-            vector: query_vec,
-            k: k as u32,
-            target_confidence: 0.99,
-            lambda,
-            tau,
-        });
-
-        let start_q = Instant::now();
-        let response = service.search(search_req).await?.into_inner();
-        let q_lat = start_q.elapsed();
-
-        let result_ids: Vec<u64> = response.results.iter().map(|r| r.id).collect();
-        let recall = calculate_recall(&result_ids, &ground_truth);
-
         let coll = manager.get_or_create(collection_name, None).await.unwrap();
-        let headers = coll.index.get_all_bucket_headers();
 
-        // ⚡ INSTRUMENTATION: Bucket Stats
-        let bucket_count = headers.len();
-        let mut counts: Vec<u32> = headers.iter().map(|h| h.count).collect();
-        counts.sort();
-        let min = counts.first().unwrap_or(&0);
-        let max = counts.last().unwrap_or(&0);
-        let p50 = counts.get(counts.len() / 2).unwrap_or(&0);
+        // Use DEBUG Search to track progress
+        let (results, scanned_buckets, forensics) = coll
+            .index
+            .search_debug(
+                &query_vec, k, 0.99, // Target Confidence
+                lambda, tau,
+            )
+            .await
+            .unwrap();
 
-        // Count buckets suppressed by Tau
-        let suppressed = counts.iter().filter(|&&c| (c as f32) < tau).count();
+        let result_ids: HashSet<u64> = results.iter().map(|r| r.id).collect();
+        let hits = ground_truth
+            .iter()
+            .filter(|id| result_ids.contains(id))
+            .count();
+        let recall = hits as f32 / k as f32;
+
+        let bucket_count = coll.index.get_all_bucket_headers().len();
+
+        // Stats
+        let _q_lat = 0; // Removed timing to simplify, debug search is slow anyway
 
         println!(
-            "Tick {:02}: Recall: {:>6.2}% | Buckets: {} | Size (Min/P50/Max): {}/{}/{} | <Tau: {} | Latency: {:>2}ms",
+            "Tick {:02}: Recall: {:>6.2}% | Buckets: {}",
             b,
             recall * 100.0,
-            bucket_count,
-            min,
-            p50,
-            max,
-            suppressed,
-            q_lat.as_millis(),
+            bucket_count
         );
 
-        if recall < 0.8 {
-            println!("   ⚠️  Recall Drop Detected! Index might be lagging behind drift.");
+        if recall < 0.9 {
+            println!("\n🚨 RECALL FAILURE DETECTED ({}%)", recall * 100.0);
+            println!(
+                "   Scanned {} buckets: {:?}",
+                scanned_buckets.len(),
+                scanned_buckets
+            );
+
+            for &gt_id in &ground_truth {
+                if !result_ids.contains(&gt_id) {
+                    match coll.index.locate_vector(gt_id) {
+                        Some(bucket_id) => {
+                            let was_scanned = scanned_buckets.contains(&bucket_id);
+
+                            // Get Bucket Stats
+                            let headers = coll.index.get_all_bucket_headers();
+                            let header = headers.iter().find(|h| h.id == bucket_id).unwrap();
+                            let dist = crate::math::l2_sq(&query_vec, &header.centroid).sqrt();
+
+                            // Check Forensic Data
+                            let trace = forensics
+                                .get(&gt_id.to_string())
+                                .map(|s| s.as_str())
+                                .unwrap_or("NOT_SCANNED");
+
+                            println!(
+                                "   ❌ Missed ID {}: Bucket {}. Scanned? {} | Dist={:.2} | Trace: {}",
+                                gt_id, bucket_id, was_scanned, dist, trace
+                            );
+                        }
+                        None => println!("   ❌ Missed ID {}: LOST!", gt_id),
+                    }
+                }
+            }
         }
     }
 

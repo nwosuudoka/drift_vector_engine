@@ -115,24 +115,26 @@ impl BucketHeader {
         (emptiness / (temp + EPSILON)) + (BETA * zombie_ratio)
     }
 
-    /// ⚡ NEW: Calculate Drift O(1) (Section 3.C)
-    /// Returns distance between Initial Centroid and Current Mean.
+    /// ⚡ NEW: Calculate Drift O(1)
+    /// Drift = Distance(Current_Mean, Initial_Centroid)
     pub fn calculate_drift(&self) -> f32 {
         let sum_guard = self.stats.vector_sum.read();
         if sum_guard.is_empty() || self.count == 0 {
             return 0.0;
         }
 
-        // Current Mean = Sum / Count
-        // Drift = Dist(Mean, InitialCentroid)
+        let dim = self.centroid.len();
+        // Safety check if dims match
+        if sum_guard.len() != dim {
+            return 0.0;
+        }
 
-        // Use squared distance first to avoid sqrt if possible, but the spec says norm.
-        let mut dist_sq = 0.0;
         let n = self.count as f32;
+        let mut dist_sq = 0.0;
 
-        for (i, &sum_val) in sum_guard.iter().enumerate() {
-            let mean_val = sum_val / n;
-            let diff = mean_val - self.centroid[i];
+        for i in 0..dim {
+            let current_mean = sum_guard[i] / n;
+            let diff = current_mean - self.centroid[i];
             dist_sq += diff * diff;
         }
 
@@ -306,7 +308,11 @@ impl Bucket {
 
 /// ⚡ CORE ADC KERNEL
 #[inline(always)]
-unsafe fn compute_distance_lut(mut code_ptr: *const u8, lut_ptr: *const f32, dim: usize) -> f32 {
+pub unsafe fn compute_distance_lut(
+    mut code_ptr: *const u8,
+    lut_ptr: *const f32,
+    dim: usize,
+) -> f32 {
     let mut sum = 0.0;
     let mut i = 0;
     // 4x Loop Unrolling

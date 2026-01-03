@@ -1,9 +1,10 @@
+use crate::compactor::SegmentCompactor;
 use crate::persistence::PersistenceManager;
 use drift_core::index::{MaintenanceStatus, VectorIndex};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::{error, info, instrument};
@@ -55,6 +56,8 @@ pub struct Janitor {
     flush_threshold: usize,
     check_interval: Duration,
     ignore_map: std::sync::Mutex<HashMap<u32, IgnoreState>>,
+    compactor: Option<SegmentCompactor>,
+    cycle_count: AtomicU64,
 }
 
 impl Janitor {
@@ -63,6 +66,7 @@ impl Janitor {
         persistence: PersistenceManager,
         flush_threshold: usize,
         check_interval: Duration,
+        compactor: Option<SegmentCompactor>,
     ) -> Self {
         Self {
             index,
@@ -70,6 +74,8 @@ impl Janitor {
             flush_threshold,
             check_interval,
             ignore_map: std::sync::Mutex::new(HashMap::new()),
+            cycle_count: AtomicU64::new(0),
+            compactor,
         }
     }
 
@@ -98,6 +104,16 @@ impl Janitor {
 
             // 3. Maintenance
             self.perform_maintenance().await;
+
+            // 4. Garbage Collection (Every 100 cycles)
+            let cycle = self.cycle_count.load(Ordering::Relaxed);
+            if cycle % 100 == 0 {
+                if let Some(c) = &self.compactor {
+                    if let Err(e) = c.run_cycle().await {
+                        error!("Janitor: Compaction cycle failed: {}", e);
+                    }
+                }
+            }
         }
     }
 

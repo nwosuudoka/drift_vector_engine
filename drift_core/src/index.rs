@@ -1,5 +1,5 @@
 use crate::aligned::AlignedBytes;
-use crate::bucket::{Bucket, BucketData, BucketHeader};
+use crate::bucket::{Bucket, BucketData, BucketHeader, compute_distance_lut};
 use crate::kmeans::KMeansTrainer;
 use crate::memtable::MemTable;
 use crate::quantizer::Quantizer;
@@ -421,34 +421,41 @@ impl VectorIndex {
                         let centroid = &headers[0].centroid;
                         let total_count: u32 = headers.iter().map(|h| h.count).sum();
                         let dist = crate::math::l2_sq(query, centroid).sqrt();
-
                         let p_geom = (-lambda * dist).exp();
                         let reliability = 1.0 - (-(total_count as f32) / tau).exp();
-
-                        // Score = P_geom * R(b)
                         (headers, p_geom * reliability)
                     })
                     .collect();
 
                 candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
 
+                // ⚡ FIX: Calculate Total Probability Mass
+                let total_score: f32 = candidates.iter().map(|(_, p)| p).sum();
+
                 let mut headers = Vec::new();
                 let mut acc_conf = 0.0;
                 let mut visited_ids = HashSet::new();
 
-                // ⚡ FIX A: Minimum Scan Floor
-                // Ensure we scan at least 5% of buckets or 5 buckets, whichever is larger.
-                // This prevents "early stop" when probabilities are diluted.
-                const MIN_SCAN_FLOOR: usize = 5;
-                let min_scan = (buckets_map.len() / 20).max(MIN_SCAN_FLOOR);
+                // ⚡ FIX: Stronger Floor (Scan at least 10% of buckets)
+                const MIN_SCAN_FLOOR: usize = 10;
+                let min_scan = (buckets_map.len() / 10).max(MIN_SCAN_FLOOR);
 
                 for (group, score) in candidates {
-                    acc_conf += score;
+                    // ⚡ FIX: Normalize Score
+                    // If total_score is 0 (all buckets far/empty), norm_score is 0.
+                    let norm_score = if total_score > 1e-6 {
+                        score / total_score
+                    } else {
+                        0.0
+                    };
+
+                    acc_conf += norm_score;
                     for h in group {
                         if visited_ids.insert(h.id) {
                             headers.push((*h).clone());
                         }
                     }
+
                     if acc_conf >= target_confidence && headers.len() >= min_scan {
                         break;
                     }
@@ -487,7 +494,8 @@ impl VectorIndex {
 
         // --- PHASE 2: SYNCHRONOUS MERGE & FILTER ---
         let deleted_guard = self.deleted_ids.read();
-        let mut heap = BinaryHeap::with_capacity(k);
+        let search_buffer_size = self.config.ef_search.max(k);
+        let mut heap = BinaryHeap::with_capacity(search_buffer_size);
         let mut l0_found = HashSet::new();
 
         // Process MemTable
@@ -497,7 +505,7 @@ impl VectorIndex {
             }
             l0_found.insert(id);
             let res = SearchResult { id, distance: dist };
-            Self::push_to_heap(&mut heap, res, k);
+            Self::push_to_heap(&mut heap, res, search_buffer_size);
         }
 
         // Process Disk (Using ADC)
@@ -512,7 +520,7 @@ impl VectorIndex {
                     if l0_found.contains(&res.id) {
                         continue;
                     }
-                    Self::push_to_heap(&mut heap, res, k);
+                    Self::push_to_heap(&mut heap, res, search_buffer_size);
                 }
             }
         }
@@ -523,6 +531,9 @@ impl VectorIndex {
                 .partial_cmp(&b.distance)
                 .unwrap_or(CmpOrdering::Equal)
         });
+        if sorted.len() > k {
+            sorted.truncate(k);
+        }
         Ok(sorted)
     }
 
@@ -559,13 +570,20 @@ impl VectorIndex {
             return Ok(());
         }
 
+        let dim = self.config.dim;
+        let mut vector_sum = vec![0.0; dim];
+        for v in &valid_vecs {
+            for i in 0..dim {
+                vector_sum[i] += v[i];
+            }
+        }
+
         let q_arc = self
             .quantizer
             .read()
             .as_ref()
             .expect("Quantizer missing")
             .clone();
-        let dim = self.config.dim;
 
         let mut centroid = vec![0.0; dim];
         for v in &valid_vecs {
@@ -625,13 +643,6 @@ impl VectorIndex {
             new
         });
 
-        let mut vector_sum = vec![0.0; dim];
-        for v in &valid_vecs {
-            for i in 0..dim {
-                vector_sum[i] += v[i];
-            }
-        }
-
         self.update_buckets(|b| {
             let mut new = b.clone();
             let header = BucketHeader::new(
@@ -653,6 +664,8 @@ impl VectorIndex {
         Ok(())
     }
 
+    // drift_core/src/index.rs
+
     pub async fn partition_and_flush(
         &self,
         ids: &[u64],
@@ -662,7 +675,7 @@ impl VectorIndex {
             return Ok(Vec::new());
         }
 
-        // 1. Filter Tombstones (Global Check)
+        // 1. Filter Tombstones
         let deleted_snapshot = self.deleted_ids.read().clone();
         let (valid_ids, valid_vecs): (Vec<u64>, Vec<Vec<f32>>) = ids
             .iter()
@@ -679,30 +692,40 @@ impl VectorIndex {
         let target_cap = self.config.max_bucket_capacity;
         let num_vectors = valid_ids.len();
 
-        // If data is small enough, just make one bucket (Fast Path)
-        if num_vectors <= target_cap {
+        // ⚡ FIX 2: Hardened Partition Logic
+        // Old logic: ceil(N / (Target * 0.8)) -> caused under-partitioning (3 buckets for 5 clusters)
+
+        // Strategy A: Conservative Capacity (aim for 60% fill, not 80%)
+        let count_based_k = (num_vectors as f32 / (target_cap as f32 * 0.6)).ceil() as usize;
+
+        // Strategy B: Structural Heuristic
+        // Assume latent clusters are rarely larger than 200 items in this workload.
+        // This prevents cramming 1000 items into 2 buckets just because capacity allows it.
+        let heuristic_k = (num_vectors / 200).max(1);
+
+        // Take the maximum to be safe
+        let k = count_based_k.max(heuristic_k).max(2);
+
+        // Fast Path for tiny data
+        if num_vectors <= target_cap && k == 1 {
             let id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
             self.force_register_bucket_with_ids(id, &valid_ids, &valid_vecs)
                 .await?;
             return Ok(vec![id]);
         }
 
-        // 3. Run K-Means
-        // We aim for buckets that are ~80% full to allow some breathing room for merges
-        // K = ceil(N / (Target * 0.8))
-        let k = (num_vectors as f32 / (target_cap as f32 * 0.8)).ceil() as usize;
-        let k = k.max(2); // Ensure at least split if we are here
-
         tracing::info!(
-            "Flush: Partitioning {} vectors into {} buckets",
+            "Flush: Partitioning {} vectors into {} buckets (Target Cap: {})",
             num_vectors,
-            k
+            k,
+            target_cap
         );
 
-        let trainer = KMeansTrainer::new(k, self.config.dim, 10); // 10 iterations is usually enough for flush
+        // 3. Train K-Means
+        let trainer = KMeansTrainer::new(k, self.config.dim, 10);
         let result = trainer.train(&valid_vecs);
 
-        // 4. Group Data by Assignment
+        // 4. Group Data
         let mut clusters: Vec<(Vec<u64>, Vec<Vec<f32>>)> = vec![(Vec::new(), Vec::new()); k];
 
         for (i, &assignment) in result.assignments.iter().enumerate() {
@@ -712,22 +735,88 @@ impl VectorIndex {
             }
         }
 
-        // 5. Write Buckets
+        // 5. Prepare Results
+        let q_arc = self
+            .get_quantizer()
+            .expect("Quantizer missing during flush");
         let mut created_ids = Vec::new();
 
-        for (cluster_ids, cluster_vecs) in clusters {
-            if cluster_ids.is_empty() {
+        for (idx, (c_ids, c_vecs)) in clusters.into_iter().enumerate() {
+            if c_ids.is_empty() {
                 continue;
             }
 
-            let new_id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+            // Calculate Centroid
+            let centroid = result.centroids[idx].clone();
 
-            // Re-use existing registration logic for the specific sub-cluster
-            // This handles Quantization, Writing to Disk, and Updating Maps
-            self.force_register_bucket_with_ids(new_id, &cluster_ids, &cluster_vecs)
+            // SQ8 Encode
+            let mut flat_codes = Vec::with_capacity(c_vecs.len() * self.config.dim);
+            for v in &c_vecs {
+                flat_codes.extend_from_slice(&q_arc.encode(v));
+            }
+
+            // ⚡ Calculate Vector Sum for Drift Tracking (O(1))
+            let mut vector_sum = vec![0.0; self.config.dim];
+            for v in &c_vecs {
+                for i in 0..self.config.dim {
+                    vector_sum[i] += v[i];
+                }
+            }
+
+            // Allocate ID
+            let bucket_id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+
+            // Register (using internal logic to set vector_sum correctly)
+            // Note: We can't reuse force_register easily here without refactoring because
+            // force_register calculates its own centroid. We want to use the K-Means centroid.
+
+            // Manual Registration Pattern:
+            let bucket_data = BucketData {
+                codes: AlignedBytes::from_slice(&flat_codes),
+                vids: c_ids.clone(),
+                tombstones: bit_set::BitSet::with_capacity(c_ids.len()),
+            };
+
+            let bytes = bucket_data.to_bytes(self.config.dim)?;
+            self.cache
+                .storage()
+                .write_page(bucket_id, 0, &bytes)
                 .await?;
+            let page_id = PageId {
+                file_id: bucket_id,
+                offset: 0,
+                length: bytes.len() as u32,
+            };
 
-            created_ids.push(new_id);
+            self.update_buckets(|b| {
+                let mut new = b.clone();
+                let header = BucketHeader::new(
+                    bucket_id,
+                    centroid.clone(),
+                    c_ids.len() as u32,
+                    page_id.clone(),
+                );
+                // ⚡ IMPORTANT: Set the sum
+                *header.stats.vector_sum.write() = vector_sum.clone();
+                new.insert(bucket_id, header);
+                new
+            });
+
+            self.update_centroids(|c| {
+                let mut new = c.clone();
+                new.push(CentroidEntry {
+                    id: bucket_id,
+                    vector: centroid.clone(),
+                    active: true,
+                });
+                new
+            });
+
+            for &vid in &c_ids {
+                let _ = self.kv.put(&vid.to_le_bytes(), &bucket_id.to_le_bytes());
+            }
+
+            created_ids.push(bucket_id);
         }
 
         Ok(created_ids)
@@ -737,6 +826,7 @@ impl VectorIndex {
         let q_arc = self.quantizer.read().as_ref().unwrap().clone();
         let deleted_snapshot: HashSet<u64> = self.deleted_ids.read().clone();
 
+        // 1. Load Target Bucket Header & Global Centroids
         let (header, all_centroids) = {
             let guard = epoch::pin();
             let buckets = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
@@ -749,6 +839,7 @@ impl VectorIndex {
             (h, centroids.clone())
         };
 
+        // 2. Load Data
         let data_arc = match self.cache.get(&header.page_id).await {
             Ok(d) => d,
             Err(_) => return Ok(MaintenanceStatus::SkippedLocked),
@@ -768,8 +859,7 @@ impl VectorIndex {
             return Ok(MaintenanceStatus::SkippedTooSmall);
         }
 
-        // --- DRIFT CALCULATION [SDD Section 3.C] ---
-        // Formula: Drift = Distance(Current_Mean, Initial_Centroid)
+        // 3. Drift Check
         let dim = self.config.dim;
         let mut mean = vec![0.0; dim];
         for v in &vecs {
@@ -784,9 +874,6 @@ impl VectorIndex {
         let drift = crate::math::l2_sq(&mean, &header.centroid).sqrt();
         let capacity_ratio = vecs.len() as f32 / self.config.max_bucket_capacity as f32;
 
-        // Trigger Conditions from SDD Section 3.C:
-        // 1. Count > Target * 0.8
-        // 2. Drift > 0.15
         let capacity_breach = capacity_ratio > 0.8;
         let drift_breach = drift > 0.15;
 
@@ -794,7 +881,7 @@ impl VectorIndex {
             return Ok(MaintenanceStatus::SkippedTooSmall);
         }
 
-        // Proceed with Split (2-Means)
+        // 4. K-Means Split (2-Means)
         let trainer = KMeansTrainer::new(2, self.config.dim, 10);
         let result = trainer.train(&vecs);
 
@@ -817,7 +904,7 @@ impl VectorIndex {
             return Ok(MaintenanceStatus::SkippedSingularity);
         }
 
-        // --- NEIGHBOR STEALING (Budgeted) ---
+        // 5. Neighbor Stealing (Budgeted)
         let neighbors = {
             let mut candidates: Vec<(u32, f32)> = all_centroids
                 .iter()
@@ -834,12 +921,14 @@ impl VectorIndex {
 
         let mut modified_neighbors = HashMap::new();
         let mut budget = 0;
-        const MAX_STEAL_BUDGET: usize = 200; // SDD Section 3.D
+        const MAX_STEAL_BUDGET: usize = 200;
 
         for nid in neighbors {
             if budget >= MAX_STEAL_BUDGET {
                 break;
             }
+
+            // Load Neighbor Header
             let n_header = {
                 let guard = epoch::pin();
                 let buckets =
@@ -849,41 +938,54 @@ impl VectorIndex {
                     None => continue,
                 }
             };
+
+            // Load Neighbor Data
             let n_data = match self.cache.get(&n_header.page_id).await {
                 Ok(d) => d,
                 Err(_) => continue,
             };
+
             let (raw_n_vecs, raw_n_ids) = n_data.reconstruct(&q_arc);
             let mut n_vecs = Vec::new();
             let mut n_ids = Vec::new();
+
             for (v, id) in raw_n_vecs.into_iter().zip(raw_n_ids.into_iter()) {
                 if !deleted_snapshot.contains(&id) {
                     n_vecs.push(v);
                     n_ids.push(id);
                 }
             }
+
+            // Check for defectors
             let mut steal_indices = Vec::new();
             let mut stolen_items = Vec::new();
+
             for (i, vec) in n_vecs.iter().enumerate() {
-                if budget >= 200 {
+                if budget >= MAX_STEAL_BUDGET {
                     break;
                 }
-                budget += 1;
+
                 let d_curr = crate::math::l2_sq(vec, &n_header.centroid);
                 let d_a = crate::math::l2_sq(vec, &result.centroids[0]);
                 let d_b = crate::math::l2_sq(vec, &result.centroids[1]);
+
+                // If point is significantly closer to A or B than current parent
                 if d_a.min(d_b) < (d_curr - 0.025) {
+                    budget += 1;
                     steal_indices.push(i);
                     stolen_items.push((vec.clone(), n_ids[i], d_a < d_b));
                 }
             }
+
             if !steal_indices.is_empty() {
-                steal_indices.sort_unstable_by(|a, b| b.cmp(a));
+                // Remove stolen items from neighbor vectors
+                steal_indices.sort_unstable_by(|a, b| b.cmp(a)); // Descending order
                 for idx in steal_indices {
                     n_vecs.swap_remove(idx);
                     n_ids.swap_remove(idx);
                 }
-                modified_neighbors.insert(nid, (n_vecs, n_ids));
+
+                // Add stolen items to A or B
                 for (vec, id, is_a) in stolen_items {
                     if is_a {
                         vecs_a.push(vec);
@@ -893,12 +995,50 @@ impl VectorIndex {
                         ids_b.push(id);
                     }
                 }
+
+                // Queue neighbor for rewrite
+                modified_neighbors.insert(nid, (n_vecs, n_ids));
             }
         }
 
+        // 6. Write New Buckets & Updates
+
+        let calc_centroid = |vecs: &[Vec<f32>], dim: usize| -> Vec<f32> {
+            let mut c = vec![0.0; dim];
+            if vecs.is_empty() {
+                return c;
+            }
+            for v in vecs {
+                for i in 0..dim {
+                    c[i] += v[i];
+                }
+            }
+            for x in c.iter_mut() {
+                *x /= vecs.len() as f32;
+            }
+            c
+        };
+
+        let calc_sum = |vecs: &[Vec<f32>], dim: usize| -> Vec<f32> {
+            let mut s = vec![0.0; dim];
+            for v in vecs {
+                for i in 0..dim {
+                    s[i] += v[i];
+                }
+            }
+            s
+        };
+
+        // ⚡ CRITICAL FIX: Recalculate Centroids for A & B (Post-Steal)
+        // Since we added stolen vectors, the K-Means centroids are stale.
+        let centroid_a = calc_centroid(&vecs_a, dim);
+        let centroid_b = calc_centroid(&vecs_b, dim);
+        let sum_a = calc_sum(&vecs_a, dim);
+        let sum_b = calc_sum(&vecs_b, dim);
+
+        // Helper to write a page
         let write_page =
             async |bid: u32, vs: &[Vec<f32>], is: &[u64]| -> io::Result<(PageId, u32)> {
-                let dim = self.config.dim;
                 let mut data = BucketData {
                     codes: crate::aligned::AlignedBytes::new(vs.len() * dim),
                     vids: Vec::with_capacity(vs.len()),
@@ -925,50 +1065,74 @@ impl VectorIndex {
 
         let id_a = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
         let id_b = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+
         let (page_a, count_a) = write_page(id_a, &vecs_a, &ids_a).await?;
         let (page_b, count_b) = write_page(id_b, &vecs_b, &ids_b).await?;
+
+        // Process Modified Neighbors
         let mut neighbor_updates = Vec::new();
         for (nid, (vs, is)) in modified_neighbors {
             let (p, c) = write_page(nid, &vs, &is).await?;
-            neighbor_updates.push((nid, p, c));
+            // ⚡ CRITICAL FIX: Recalculate Neighbor Centroids (Post-Theft)
+            let new_c = calc_centroid(&vs, dim);
+            let new_s = calc_sum(&vs, dim);
+            neighbor_updates.push((nid, p, c, new_c, new_s));
         }
 
+        // 7. Atomic Metadata Update
+
+        // Update Centroids List
         self.update_centroids(|c| {
             let mut new = c.clone();
-            if let Some(x) = new.iter_mut().find(|x| x.id == bucket_id) {
-                x.active = false;
+            if let Some(pos) = new.iter().position(|x| x.id == bucket_id) {
+                new.remove(pos);
             }
+            // Add new split buckets
             new.push(CentroidEntry {
                 id: id_a,
-                vector: result.centroids[0].clone(),
+                vector: centroid_a.clone(),
                 active: true,
             });
             new.push(CentroidEntry {
                 id: id_b,
-                vector: result.centroids[1].clone(),
+                vector: centroid_b.clone(),
                 active: true,
             });
-            new
-        });
-        self.update_buckets(|b| {
-            let mut new = b.clone();
-            new.remove(&bucket_id);
-            new.insert(
-                id_a,
-                BucketHeader::new(id_a, result.centroids[0].clone(), count_a, page_a.clone()),
-            );
-            new.insert(
-                id_b,
-                BucketHeader::new(id_b, result.centroids[1].clone(), count_b, page_b.clone()),
-            );
-            for (nid, p, c) in &neighbor_updates {
-                if let Some(h) = new.get_mut(nid) {
-                    h.count = *c;
-                    h.page_id = p.clone();
+
+            // Update modified neighbors
+            for (nid, _, _, new_c, _) in &neighbor_updates {
+                if let Some(entry) = new.iter_mut().find(|x| x.id == *nid) {
+                    entry.vector = new_c.clone();
                 }
             }
             new
         });
+
+        // Update Buckets Map
+        self.update_buckets(|b| {
+            let mut new = b.clone();
+            new.remove(&bucket_id);
+
+            let header_a = BucketHeader::new(id_a, centroid_a.clone(), count_a, page_a.clone());
+            *header_a.stats.vector_sum.write() = sum_a.clone();
+            new.insert(id_a, header_a);
+
+            let header_b = BucketHeader::new(id_b, centroid_b.clone(), count_b, page_b.clone());
+            *header_b.stats.vector_sum.write() = sum_b.clone();
+            new.insert(id_b, header_b);
+
+            for (nid, p, c, new_c, new_s) in &neighbor_updates {
+                if let Some(h) = new.get_mut(nid) {
+                    h.count = *c;
+                    h.page_id = p.clone();
+                    h.centroid = new_c.clone(); // ⚡ Update Centroid
+                    *h.stats.vector_sum.write() = new_s.clone(); // ⚡ Update Sum
+                }
+            }
+            new
+        });
+
+        // Update KV Pointers
         let update_kv = |ids: &[u64], bid: u32| {
             for id in ids {
                 let _ = self.kv.put(&id.to_le_bytes(), &bid.to_le_bytes());
@@ -980,18 +1144,17 @@ impl VectorIndex {
         Ok(MaintenanceStatus::Completed)
     }
 
-    // drift_core/src/index.rs
-
     pub async fn scatter_merge(&self, zombie_id: u32) -> io::Result<MaintenanceStatus> {
         let q_arc = self.quantizer.read().as_ref().unwrap().clone();
         let deleted_snapshot: HashSet<u64> = self.deleted_ids.read().clone();
 
-        // 1. Load Zombie
+        // 1. Load Zombie Header
         let (z_header, all_centroids) = {
             let guard = epoch::pin();
             let buckets = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
             let centroids =
                 unsafe { self.centroids.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
             let h = match buckets.get(&zombie_id) {
                 Some(h) => h.clone(),
                 None => return Ok(MaintenanceStatus::SkippedTooSmall),
@@ -999,7 +1162,7 @@ impl VectorIndex {
             (h, centroids.clone())
         };
 
-        // 2. Load Data
+        // 2. Load Zombie Data
         let data_arc = match self.cache.get(&z_header.page_id).await {
             Ok(d) => d,
             Err(_) => return Ok(MaintenanceStatus::SkippedLocked),
@@ -1017,10 +1180,9 @@ impl VectorIndex {
             }
         }
 
-        // 4. ⚡ BUDGET ENFORCEMENT
-        // "Max 50 vectors moved per split/merge" to prevent write amp storms.
+        // 4. Budget Enforcement
         if orphans_vec.len() > 50 {
-            return Ok(MaintenanceStatus::SkippedTooSmall); // Wait for more deletes
+            return Ok(MaintenanceStatus::SkippedTooSmall);
         }
 
         if orphans_vec.is_empty() {
@@ -1034,11 +1196,12 @@ impl VectorIndex {
             .filter(|c| c.active && c.id != zombie_id)
             .map(|c| (c.id, crate::math::l2_sq(&z_header.centroid, &c.vector)))
             .collect();
+
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         let neighbor_ids: Vec<u32> = candidates.into_iter().take(3).map(|(id, _)| id).collect();
 
         if neighbor_ids.is_empty() {
-            // Fallback to L0 if no neighbors
+            // Fallback to L0 if no neighbors exist
             for (i, vec) in orphans_vec.iter().enumerate() {
                 self.insert(orphans_id[i], vec)?;
             }
@@ -1046,15 +1209,16 @@ impl VectorIndex {
             return Ok(MaintenanceStatus::Completed);
         }
 
-        // 6. Assign Orphans to Best Neighbor
+        // 6. Assign Orphans
         let mut adoption_map: HashMap<u32, Vec<(u64, Vec<f32>)>> = HashMap::new();
+        // ⚡ SAFETY THRESHOLD: Prevent merging into distant clusters (~70 units squared)
+        const MAX_MERGE_DIST_SQ: f32 = 5000.0;
 
         for (i, vec) in orphans_vec.iter().enumerate() {
             let mut best_neighbor = None;
             let mut min_dist = f32::MAX;
 
             for &nid in &neighbor_ids {
-                // We re-check existence in case centroids changed
                 if let Some(c) = all_centroids.iter().find(|c| c.id == nid) {
                     let d = crate::math::l2_sq(vec, &c.vector);
                     if d < min_dist {
@@ -1064,20 +1228,22 @@ impl VectorIndex {
                 }
             }
 
-            if let Some(bid) = best_neighbor {
+            if let Some(bid) = best_neighbor
+                && min_dist < MAX_MERGE_DIST_SQ
+            {
                 adoption_map
                     .entry(bid)
                     .or_default()
                     .push((orphans_id[i], vec.clone()));
             } else {
-                // Fallback to L0
+                // Too far from neighbors -> Send back to L0 for re-clustering
                 self.insert(orphans_id[i], vec)?;
             }
         }
 
-        // 7. Rewrite Neighbors (The Expensive Part, now strictly limited)
+        // 7. Rewrite Neighbors
         for (target_id, orphans) in adoption_map {
-            // Load Neighbor Header
+            // A. Load Neighbor
             let t_header = {
                 let guard = epoch::pin();
                 let buckets =
@@ -1093,7 +1259,7 @@ impl VectorIndex {
                 }
             };
 
-            // Load Neighbor Data
+            // B. Load Data
             let t_data = match self.cache.get(&t_header.page_id).await {
                 Ok(d) => d,
                 Err(_) => {
@@ -1104,32 +1270,29 @@ impl VectorIndex {
                 }
             };
 
-            // Reconstruct, Merge, Rewrite
+            // C. Merge
             let (raw_t_vecs, raw_t_ids) = t_data.reconstruct(&q_arc);
             let mut vs = Vec::new();
             let mut is = Vec::new();
 
-            // Keep existing live data
             for (v, id) in raw_t_vecs.into_iter().zip(raw_t_ids.into_iter()) {
                 if !deleted_snapshot.contains(&id) {
                     vs.push(v);
                     is.push(id);
                 }
             }
-            // Add orphans
             for (id, v) in &orphans {
                 vs.push(v.clone());
                 is.push(*id);
             }
 
-            // Encode & Write
+            // D. Encode
             let dim = self.config.dim;
             let mut new_data = BucketData {
                 codes: crate::aligned::AlignedBytes::new(vs.len() * dim),
                 vids: Vec::with_capacity(vs.len()),
                 tombstones: bit_set::BitSet::with_capacity(vs.len()),
             };
-
             for (i, v) in vs.iter().enumerate() {
                 let code = q_arc.encode(v);
                 new_data.vids.push(is[i]);
@@ -1138,14 +1301,18 @@ impl VectorIndex {
                 }
             }
 
-            // ⚡ UPDATE SUM
-            let dim = self.config.dim;
+            // ⚡ FIX: Recalculate Sum & Centroid
             let mut new_sum = vec![0.0; dim];
-
-            // Recalculate sum from scratch (Survivors + Orphans) to be precise
             for v in &vs {
                 for i in 0..dim {
                     new_sum[i] += v[i];
+                }
+            }
+            let new_count = vs.len() as f32;
+            let mut new_centroid = vec![0.0; dim];
+            if new_count > 0.0 {
+                for i in 0..dim {
+                    new_centroid[i] = new_sum[i] / new_count;
                 }
             }
 
@@ -1155,20 +1322,29 @@ impl VectorIndex {
                 .write_page(target_id, 0, &bytes)
                 .await?;
 
-            // Update Metadata
+            // E. Update Metadata
             self.update_buckets(|current| {
                 let mut new = current.clone();
                 if let Some(h) = new.get_mut(&target_id) {
                     h.count = vs.len() as u32;
                     h.page_id.length = bytes.len() as u32;
-
-                    // Update sum
+                    // ⚡ UPDATE
+                    h.centroid = new_centroid.clone();
                     *h.stats.vector_sum.write() = new_sum.clone();
                 }
                 new
             });
 
-            // Update KV Pointers
+            self.update_centroids(|c| {
+                let mut new = c.clone();
+                if let Some(entry) = new.iter_mut().find(|x| x.id == target_id) {
+                    // ⚡ UPDATE
+                    entry.vector = new_centroid.clone();
+                }
+                new
+            });
+
+            // F. Update KV
             for (id, _) in orphans {
                 let _ = self.kv.put(&id.to_le_bytes(), &target_id.to_le_bytes());
             }
@@ -1599,5 +1775,183 @@ impl VectorIndex {
             }
         }
         Ok(())
+    }
+
+    // Helper to find WHERE a specific vector ID lives
+    pub fn locate_vector(&self, id: u64) -> Option<u32> {
+        let id_bytes = id.to_le_bytes();
+        if let Ok(Some(val)) = self.kv.get(&id_bytes) {
+            return Some(u32::from_le_bytes(val.try_into().unwrap()));
+        }
+        // Check MemTable
+        // ...
+        None
+    }
+
+    // ⚡ DEBUG: Search with Trace
+    // Returns: (Results, List of Scanned Bucket IDs, Debug Info Map)
+    pub async fn search_debug(
+        &self,
+        query: &[f32],
+        k: usize,
+        target_confidence: f32,
+        lambda: f32,
+        tau: f32,
+    ) -> io::Result<(Vec<SearchResult>, Vec<u32>, HashMap<String, String>)> {
+        // --- PHASE 1: SNAPSHOT ---
+        let lut = self
+            .quantizer
+            .read()
+            .as_ref()
+            .map(|q| q.precompute_lut(query));
+        let quantizer = self.quantizer.read().as_ref().unwrap().clone();
+
+        let guard = epoch::pin();
+        let buckets_map = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+        // 1. Calculate Scores for ALL buckets (for debug info)
+        let mut debug_scores = Vec::new();
+        for header in buckets_map.values() {
+            let centroid = &header.centroid;
+            let count = header.count;
+            let dist = crate::math::l2_sq(query, centroid).sqrt();
+            let p_geom = (-lambda * dist).exp();
+            let reliability = 1.0 - (-(count as f32) / tau).exp();
+            let p_eff = p_geom * reliability;
+
+            debug_scores.push((header.id, dist, count, p_eff));
+        }
+
+        // 2. Selection Logic (Cluster & Probabilistic + Guardrail)
+        let mut clusters: HashMap<Vec<u32>, Vec<&BucketHeader>> = HashMap::new();
+        for header in buckets_map.values() {
+            let key = header.centroid.iter().map(|f| f.to_bits()).collect();
+            clusters.entry(key).or_default().push(header);
+        }
+        let mut candidates: Vec<(Vec<&BucketHeader>, f32)> = clusters
+            .into_values()
+            .map(|h| {
+                let c = &h[0].centroid;
+                let count: u32 = h.iter().map(|b| b.count).sum();
+                let d = crate::math::l2_sq(query, c).sqrt();
+                let p = (-lambda * d).exp() * (1.0 - (-(count as f32) / tau).exp());
+                (h, p)
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
+
+        let mut selected_headers = Vec::new();
+        let mut acc = 0.0;
+        let mut visited = HashSet::new();
+        let min_scan = (buckets_map.len() / 20).max(5);
+        for (group, score) in candidates {
+            acc += score;
+            for h in group {
+                if visited.insert(h.id) {
+                    selected_headers.push(h);
+                }
+            }
+            if acc >= target_confidence && selected_headers.len() >= min_scan {
+                break;
+            }
+        }
+        let mut all = buckets_map.values().collect::<Vec<_>>();
+        all.sort_by(|a, b| {
+            crate::math::l2_sq(query, &a.centroid)
+                .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
+                .unwrap()
+        });
+        for h in all.iter().take(5) {
+            if visited.insert(h.id) {
+                selected_headers.push(h);
+            }
+        }
+        // --- ROUTING LOGIC END ---
+
+        let scanned_ids: Vec<u32> = selected_headers.iter().map(|h| h.id).collect();
+
+        // 3. FORENSIC SCAN
+        let search_buffer_size = self.config.ef_search.max(k);
+        let mut sq8_heap = BinaryHeap::new();
+        let mut float_heap = BinaryHeap::new();
+
+        // Tracking specific missing ID details requires knowing the ground truth,
+        // but search_debug doesn't know it. We return a map of "ID -> (SQ8_Dist, Float_Dist)".
+        let mut forensics = HashMap::new();
+
+        for h in &selected_headers {
+            if let Ok(d) = self.cache.get(&h.page_id).await {
+                // A. SQ8 Scan
+                if let Some(l) = &lut {
+                    for r in Bucket::scan_with_lut(&d, l, self.config.dim) {
+                        Self::push_to_heap(&mut sq8_heap, r, search_buffer_size); // Buffer
+                    }
+                }
+
+                // B. ⚡ FLOAT RECONSTRUCTION SCAN (The Truth)
+                // We reconstruct the whole bucket to floats and check exact distances
+                let (vecs, ids) = d.reconstruct(&quantizer);
+                for (i, vec) in vecs.iter().enumerate() {
+                    let id = ids[i];
+                    let true_dist_sq = crate::math::l2_sq(query, vec);
+
+                    // We can re-calculate SQ8 distance for this specific vector to verify LUT
+                    // (Optional, expensive)
+
+                    let r = SearchResult {
+                        id,
+                        distance: true_dist_sq,
+                    };
+                    Self::push_to_heap(&mut float_heap, r, search_buffer_size);
+
+                    // Store detailed trace for every vector found
+                    let sq8_dist = if let Some(l) = &lut {
+                        // Re-run LUT for this single item
+                        let start = i * self.config.dim;
+                        let code_ptr = d.codes.as_ptr();
+                        unsafe {
+                            compute_distance_lut(code_ptr.add(start), l.as_ptr(), self.config.dim)
+                        }
+                    } else {
+                        0.0
+                    };
+
+                    forensics.insert(
+                        id.to_string(),
+                        format!("SQ8={:.2} Float={:.2}", sq8_dist, true_dist_sq),
+                    );
+                }
+            }
+        }
+
+        let mut results = sq8_heap.into_vec();
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(CmpOrdering::Equal)
+        });
+        if results.len() > k {
+            results.truncate(k);
+        }
+
+        let mut debug_info = HashMap::new();
+        debug_info.insert("total_buckets".to_string(), buckets_map.len().to_string());
+
+        // 4. Debug Report
+        let mut debug_info = HashMap::new();
+        debug_info.insert("total_buckets".to_string(), buckets_map.len().to_string());
+        debug_info.insert("scanned_count".to_string(), scanned_ids.len().to_string());
+
+        // Serialize top 5 bucket scores for context
+        debug_scores.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap()); // Sort by P_eff desc
+        let top_scores = debug_scores
+            .iter()
+            .take(5)
+            .map(|(id, d, c, p)| format!("B{}: D={:.2} C={} P={:.4}", id, d, c, p))
+            .collect::<Vec<_>>()
+            .join(", ");
+        debug_info.insert("top_candidates".to_string(), top_scores);
+
+        Ok((results, scanned_ids, debug_info))
     }
 }
