@@ -9,14 +9,14 @@ use drift_cache::block_cache::BlockCache;
 use drift_kv::bitstore::BitStore;
 use drift_traits::{PageId, PageManager};
 use parking_lot::{Mutex, RwLock};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::usize::MIN;
-use tracing::{error, instrument};
+use tracing::{error, info, instrument};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MaintenanceStatus {
@@ -219,55 +219,175 @@ impl VectorIndex {
         }
     }
 
-    pub async fn train(&self, samples: &[Vec<f32>]) -> io::Result<()> {
+    // pub async fn train(&self, samples: &[Vec<f32>]) -> io::Result<()> {
+    //     assert!(!samples.is_empty(), "Empty training set");
+    //     let dim = self.config.dim;
+
+    //     let q = Arc::new(Quantizer::train(samples));
+    //     *self.quantizer.write() = Some(q.clone());
+
+    //     let trainer = KMeansTrainer::new(self.config.num_centroids, dim, 20);
+    //     let result = trainer.train(samples);
+
+    //     self.next_bucket_id.store(0, Ordering::Relaxed);
+    //     let mut new_centroids = Vec::new();
+    //     let mut new_buckets = HashMap::new();
+    //     let mut cluster_data = vec![vec![]; self.config.num_centroids];
+
+    //     for (i, &assignment) in result.assignments.iter().enumerate() {
+    //         cluster_data[assignment].push(i);
+    //     }
+
+    //     for (cluster_idx, sample_indices) in cluster_data.into_iter().enumerate() {
+    //         let id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+    //         let center = result.centroids[cluster_idx].clone();
+
+    //         let mut bucket_data = BucketData {
+    //             codes: crate::aligned::AlignedBytes::new(sample_indices.len() * dim),
+    //             vids: Vec::with_capacity(sample_indices.len()),
+    //             tombstones: bit_set::BitSet::with_capacity(sample_indices.len()),
+    //         };
+
+    //         for &sample_idx in &sample_indices {
+    //             let vec = &samples[sample_idx];
+    //             let code = q.encode(vec);
+    //             bucket_data.vids.push(sample_idx as u64);
+    //             for b in code {
+    //                 bucket_data.codes.push(b);
+    //             }
+    //         }
+
+    //         let bytes = bucket_data.to_bytes(dim)?;
+    //         self.cache.storage().write_page(id, 0, &bytes).await?;
+    //         let page_id = PageId {
+    //             file_id: id,
+    //             offset: 0,
+    //             length: bytes.len() as u32,
+    //         };
+
+    //         new_buckets.insert(
+    //             id,
+    //             BucketHeader::new(id, center.clone(), sample_indices.len() as u32, page_id),
+    //         );
+    //         new_centroids.push(CentroidEntry {
+    //             id,
+    //             vector: center,
+    //             active: true,
+    //         });
+
+    //         for &sample_idx in &sample_indices {
+    //             let _ = self
+    //                 .kv
+    //                 .put(&(sample_idx as u64).to_le_bytes(), &id.to_le_bytes());
+    //         }
+    //     }
+
+    //     let _guard = epoch::pin();
+    //     self.centroids
+    //         .store(Owned::new(new_centroids), Ordering::Release);
+    //     self.buckets
+    //         .store(Owned::new(new_buckets), Ordering::Release);
+    //     Ok(())
+    // }
+
+    pub async fn train(&self, samples: &[Vec<f32>]) -> std::io::Result<()> {
+        info!("Janitor: Starting Training - Phase 1: CPU Heavy Math");
         assert!(!samples.is_empty(), "Empty training set");
+
         let dim = self.config.dim;
+        let n_centroids = self.config.num_centroids;
 
-        let q = Arc::new(Quantizer::train(samples));
-        *self.quantizer.write() = Some(q.clone());
+        // 1. DATA OWNERSHIP
+        // Clone the samples into owned memory to satisfy the 'static lifetime
+        // requirement for tokio::task::spawn_blocking.
+        let samples_owned = samples.to_vec();
 
-        let trainer = KMeansTrainer::new(self.config.num_centroids, dim, 20);
-        let result = trainer.train(samples);
+        // 2. OFFLOAD TO BLOCKING THREAD POOL
+        // We perform K-Means and Quantizer training in a separate thread pool.
+        // This avoids deadlocking the Tokio executor while the CPU grinds.
+        // println!("before training");
+        let (q, result) = tokio::task::spawn_blocking(move || {
+            // A. Fast Quantizer Training (Sampled)
+            // 10k items provide enough statistical variance for 1-99% clipping [cite: 1313, 1320]
+            let sample_limit = 10_000.min(samples_owned.len());
+            let q = Quantizer::train(&samples_owned[..sample_limit]);
 
-        self.next_bucket_id.store(0, Ordering::Relaxed);
-        let mut new_centroids = Vec::new();
-        let mut new_buckets = HashMap::new();
-        let mut cluster_data = vec![vec![]; self.config.num_centroids];
+            // B. Mini-Batch K-Means
+            // Uses the optimized trainer to reduce O(N) complexity [cite: 1125, 1141]
+            let batch_size = 1024.min(samples_owned.len());
+            let trainer = KMeansTrainer::new(n_centroids, dim, 20).with_mini_batch(batch_size);
 
-        for (i, &assignment) in result.assignments.iter().enumerate() {
-            cluster_data[assignment].push(i);
+            info!("Janitor: Executing K-Means on background thread...");
+            let res = trainer.train(&samples_owned);
+
+            (q, res)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("Training Task Failed: {}", e)))?;
+
+        // println!("after training");
+
+        // 3. ATOMIC STATE UPDATE
+        // Update the internal quantizer state while holding the lock for the shortest time possible.
+        let q_arc = Arc::new(q);
+        {
+            let mut q_guard = self.quantizer.write();
+            *q_guard = Some(q_arc.clone());
         }
 
+        info!("Janitor: Math Complete - Phase 2: Parallel Encoding and Async I/O");
+
+        // 4. PARALLEL PARTITIONING
+        let mut cluster_data = vec![vec![]; n_centroids];
+        for (i, &assignment) in result.assignments.iter().enumerate() {
+            if assignment < n_centroids {
+                cluster_data[assignment].push(i);
+            }
+        }
+
+        let mut new_centroids = Vec::with_capacity(n_centroids);
+        let mut new_buckets = HashMap::with_capacity(n_centroids);
+
+        // Reset bucket ID counter for the fresh training run
+        self.next_bucket_id
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // 5. BATCH ENCODING & STORAGE
         for (cluster_idx, sample_indices) in cluster_data.into_iter().enumerate() {
-            let id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
-            let center = result.centroids[cluster_idx].clone();
-
-            let mut bucket_data = BucketData {
-                codes: crate::aligned::AlignedBytes::new(sample_indices.len() * dim),
-                vids: Vec::with_capacity(sample_indices.len()),
-                tombstones: bit_set::BitSet::with_capacity(sample_indices.len()),
-            };
-
-            for &sample_idx in &sample_indices {
-                let vec = &samples[sample_idx];
-                let code = q.encode(vec);
-                bucket_data.vids.push(sample_idx as u64);
-                for b in code {
-                    bucket_data.codes.push(b);
-                }
+            if sample_indices.is_empty() {
+                continue;
             }
 
+            let id = self
+                .next_bucket_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let center = result.centroids[cluster_idx].clone();
+
+            // Use Rayon for parallel vector encoding within the async function [cite: 1269, 1281]
+            let flat_codes: Vec<u8> = sample_indices
+                .par_iter()
+                .flat_map(|&idx| q_arc.encode(&samples[idx]))
+                .collect();
+
+            let vids: Vec<u64> = sample_indices.iter().map(|&idx| idx as u64).collect();
+            let bucket_data = BucketData::from(
+                crate::aligned::AlignedBytes::from_slice(&flat_codes), // SIMD-aligned buffer [cite: 442, 577]
+                vids.clone(),
+                bit_set::BitSet::with_capacity(sample_indices.len()),
+            );
+
+            // Async Disk Write [cite: 69, 189]
             let bytes = bucket_data.to_bytes(dim)?;
             self.cache.storage().write_page(id, 0, &bytes).await?;
+
             let page_id = PageId {
                 file_id: id,
                 offset: 0,
                 length: bytes.len() as u32,
             };
-
             new_buckets.insert(
                 id,
-                BucketHeader::new(id, center.clone(), sample_indices.len() as u32, page_id),
+                BucketHeader::new(id, center.clone(), vids.len() as u32, page_id),
             );
             new_centroids.push(CentroidEntry {
                 id,
@@ -275,18 +395,25 @@ impl VectorIndex {
                 active: true,
             });
 
-            for &sample_idx in &sample_indices {
-                let _ = self
-                    .kv
-                    .put(&(sample_idx as u64).to_le_bytes(), &id.to_le_bytes());
+            // Update global mapping for O(1) lookups [cite: 72, 131]
+            for &vid in &vids {
+                let _ = self.kv.put(&vid.to_le_bytes(), &id.to_le_bytes());
             }
         }
 
-        let _guard = epoch::pin();
-        self.centroids
-            .store(Owned::new(new_centroids), Ordering::Release);
-        self.buckets
-            .store(Owned::new(new_buckets), Ordering::Release);
+        // 6. FINAL ATOMIC COMMIT
+        // Use crossbeam-epoch for lock-free swap of the global bucket/centroid maps [cite: 429, 647]
+        let _guard = crossbeam_epoch::pin();
+        self.centroids.store(
+            crossbeam_epoch::Owned::new(new_centroids),
+            std::sync::atomic::Ordering::Release,
+        );
+        self.buckets.store(
+            crossbeam_epoch::Owned::new(new_buckets),
+            std::sync::atomic::Ordering::Release,
+        );
+
+        info!("Janitor: Training and Flush Complete.");
         Ok(())
     }
 
@@ -381,162 +508,229 @@ impl VectorIndex {
         lambda: f32,
         tau: f32,
     ) -> io::Result<Vec<SearchResult>> {
-        // --- PHASE 1: SNAPSHOT & PRE-CALCULATION ---
+        // --- PHASE 1: SNAPSHOT & PRE-CALCULATION (Synchronous) ---
+        // We capture state from RAM first to avoid holding RwLock guards across await points.
+
+        // 1. Internal Oversampling:
+        // We keep 2x candidates to ensure actual matches survive quantization noise.
+        let internal_k = k * 2;
+
+        // 2. ADC Look-Up Table:
+        // Precompute squared distances for the query against all 256 possible byte values. [cite: 18-19, 125]
         let lut: Option<Vec<f32>> = {
             let guard = self.quantizer.read();
             guard.as_ref().map(|q| q.precompute_lut(query))
         };
 
-        // MemTable Search
+        // 3. Delete Snapshot:
+        // Clone the tombstone set to filter results without holding the deleted_ids lock. [cite: 8, 122]
+        let deleted_snapshot = {
+            let guard = self.deleted_ids.read();
+            guard.clone()
+        };
+
+        // 4. L0 MemTable Scan:
+        // Perform high-fidelity f32 search on the most recent data. [cite: 5, 123]
         let mem_results = {
             let guard = epoch::pin();
             let active = unsafe { self.memtable.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-            let mut results = active.search(query, k, self.config.ef_search);
+            let mut results = active.search(query, internal_k, self.config.ef_search);
             let frozen_guard = self.frozen_memtable.read();
             if let Some(frozen) = frozen_guard.as_ref() {
-                results.extend(frozen.search(query, k, self.config.ef_search));
+                results.extend(frozen.search(query, internal_k, self.config.ef_search));
             }
             results
         };
 
-        // B. Select Buckets (Saturating Density-Awareness)
-        let selected_headers = {
-            let guard = epoch::pin();
-            let buckets_map =
-                unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+        // 5. Centroid Routing:
+        // Select which L1 buckets to scan based on the Saturating Density model. [cite: 60, 70, 120]
+        let selected_headers = self.get_selected_headers(query, target_confidence, lambda, tau);
 
-            if buckets_map.is_empty() {
-                Vec::new()
-            } else {
-                let mut clusters: HashMap<Vec<u32>, Vec<&BucketHeader>> = HashMap::new();
-                for header in buckets_map.values() {
-                    let key: Vec<u32> = header.centroid.iter().map(|f| f.to_bits()).collect();
-                    clusters.entry(key).or_default().push(header);
-                }
+        // --- PHASE 2: ASYNCHRONOUS DISK I/O ---
+        // Now performing I/O. Results here are approximate due to SQ8 quantization. [cite: 13, 79, 127]
 
-                // 1. Probabilistic Scoring
-                let mut candidates: Vec<(Vec<&BucketHeader>, f32)> = clusters
-                    .into_values()
-                    .map(|headers| {
-                        let centroid = &headers[0].centroid;
-                        let total_count: u32 = headers.iter().map(|h| h.count).sum();
-                        let dist = crate::math::l2_sq(query, centroid).sqrt();
-                        let p_geom = (-lambda * dist).exp();
-                        let reliability = 1.0 - (-(total_count as f32) / tau).exp();
-                        (headers, p_geom * reliability)
-                    })
-                    .collect();
-
-                candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
-
-                // ⚡ FIX: Calculate Total Probability Mass
-                let total_score: f32 = candidates.iter().map(|(_, p)| p).sum();
-
-                let mut headers = Vec::new();
-                let mut acc_conf = 0.0;
-                let mut visited_ids = HashSet::new();
-
-                // ⚡ FIX: Stronger Floor (Scan at least 10% of buckets)
-                const MIN_SCAN_FLOOR: usize = 10;
-                let min_scan = (buckets_map.len() / 10).max(MIN_SCAN_FLOOR);
-
-                for (group, score) in candidates {
-                    // ⚡ FIX: Normalize Score
-                    // If total_score is 0 (all buckets far/empty), norm_score is 0.
-                    let norm_score = if total_score > 1e-6 {
-                        score / total_score
-                    } else {
-                        0.0
-                    };
-
-                    acc_conf += norm_score;
-                    for h in group {
-                        if visited_ids.insert(h.id) {
-                            headers.push((*h).clone());
-                        }
-                    }
-
-                    if acc_conf >= target_confidence && headers.len() >= min_scan {
-                        break;
-                    }
-                }
-
-                // 2. ⚡ FIX B: Top-5 Geometric Guardrail
-                // Force-include the 5 closest buckets to catch the "Tail" of the drift.
-                let mut all_headers: Vec<&BucketHeader> = buckets_map.values().collect();
-                all_headers.sort_by(|a, b| {
-                    let da = crate::math::l2_sq(query, &a.centroid);
-                    let db = crate::math::l2_sq(query, &b.centroid);
-                    da.partial_cmp(&db).unwrap_or(CmpOrdering::Equal)
-                });
-
-                for h in all_headers.iter().take(5) {
-                    if visited_ids.insert(h.id) {
-                        headers.push((*h).clone());
-                    }
-                }
-
-                for header in &headers {
-                    header.touch();
-                }
-                headers
-            }
-        };
-
-        // C. Load Data
-        let mut loaded_data = Vec::with_capacity(selected_headers.len());
-        for header in selected_headers {
-            match self.cache.get(&header.page_id).await {
-                Ok(data) => loaded_data.push(data),
-                Err(e) => error!("Failed to load bucket {}: {}", header.id, e),
-            }
-        }
-
-        // --- PHASE 2: SYNCHRONOUS MERGE & FILTER ---
-        let deleted_guard = self.deleted_ids.read();
-        let search_buffer_size = self.config.ef_search.max(k);
-        let mut heap = BinaryHeap::with_capacity(search_buffer_size);
+        let mut disk_candidates = Vec::new();
         let mut l0_found = HashSet::new();
-
-        // Process MemTable
-        for (id, dist) in mem_results {
-            if deleted_guard.contains(&id) {
-                continue;
-            }
-            l0_found.insert(id);
-            let res = SearchResult { id, distance: dist };
-            Self::push_to_heap(&mut heap, res, search_buffer_size);
+        for (id, _) in &mem_results {
+            l0_found.insert(*id);
         }
 
-        // Process Disk (Using ADC)
         if let Some(lut_vec) = &lut {
             let dim = self.config.dim;
-            for data in loaded_data {
-                let hits = Bucket::scan_with_lut(&data, lut_vec, dim);
-                for res in hits {
-                    if deleted_guard.contains(&res.id) {
-                        continue;
+            for header in &selected_headers {
+                // Fetch quantized data from the tiered BlockCache. [cite: 10, 149, 150]
+                if let Ok(data) = self.cache.get(&header.page_id).await {
+                    let hits = Bucket::scan_with_lut(&data, lut_vec, dim); // SIMD ADC [cite: 82, 573]
+                    for res in hits {
+                        if !deleted_snapshot.contains(&res.id) && !l0_found.contains(&res.id) {
+                            disk_candidates.push((header.id, res));
+                        }
                     }
-                    if l0_found.contains(&res.id) {
-                        continue;
-                    }
-                    Self::push_to_heap(&mut heap, res, search_buffer_size);
                 }
             }
         }
 
-        let mut sorted = heap.into_vec();
+        // Sort approximate candidates and keep internal_k for refinement.
+        disk_candidates.sort_by(|a, b| {
+            a.1.distance
+                .partial_cmp(&b.1.distance)
+                .unwrap_or(CmpOrdering::Equal)
+        });
+        if disk_candidates.len() > internal_k {
+            disk_candidates.truncate(internal_k);
+        }
+
+        // --- PHASE 3: HIGH-FIDELITY RE-RANKING (ALP Refinement) ---
+        // Use Cold Blobs (ALP) to verify the top approximate candidates. [cite: 13, 107, 128]
+
+        let mut final_heap = BinaryHeap::with_capacity(k);
+
+        // A. Add MemTable results (already 100% precise).
+        for (id, dist) in mem_results {
+            if !deleted_snapshot.contains(&id) {
+                Self::push_to_heap(&mut final_heap, SearchResult { id, distance: dist }, k);
+            }
+        }
+
+        // B. Refine Disk Candidates by fetching raw vectors.
+        let mut buckets_to_refine: HashMap<u32, Vec<u64>> = HashMap::new();
+        for (bid, res) in &disk_candidates {
+            buckets_to_refine.entry(*bid).or_default().push(res.id);
+        }
+
+        for (bid, target_ids) in buckets_to_refine {
+            // Resolve the latest page_id in case the Janitor split the bucket during I/O.
+            let page_id_opt = self.get_bucket_page_id(bid);
+            if page_id_opt.is_none() {
+                continue;
+            }
+
+            let page_id = page_id_opt.unwrap();
+
+            // Fetch raw floats (ALP) and current hot metadata (VIDs). [cite: 13, 106]
+            let bucket_vecs_res = self.cache.storage().read_high_fidelity(bid).await;
+            let hot_data_res = self.cache.get(&page_id).await;
+
+            if let (Ok(bucket_vecs), Ok(hot_data)) = (bucket_vecs_res, hot_data_res) {
+                // Safety Guard: Handle race conditions where bucket changed under our feet.
+                let safe_limit = bucket_vecs.len().min(hot_data.vids.len());
+
+                for i in 0..safe_limit {
+                    let id = hot_data.vids[i];
+                    if target_ids.contains(&id) {
+                        let vec = &bucket_vecs[i];
+                        // Final high-fidelity L2 calculation. [cite: 35, 1262]
+                        let true_dist = crate::math::l2_sq(query, vec);
+                        Self::push_to_heap(
+                            &mut final_heap,
+                            SearchResult {
+                                id,
+                                distance: true_dist,
+                            },
+                            k,
+                        );
+                    }
+                }
+            } else {
+                // Fallback: If ALP read fails, retain the approximate ADC result. [cite: 14]
+                for (_, res) in disk_candidates.iter().filter(|(b, _)| *b == bid) {
+                    Self::push_to_heap(&mut final_heap, res.clone(), k);
+                }
+            }
+        }
+
+        // Finalize results.
+        let mut sorted = final_heap.into_vec();
         sorted.sort_by(|a, b| {
             a.distance
                 .partial_cmp(&b.distance)
                 .unwrap_or(CmpOrdering::Equal)
         });
-        if sorted.len() > k {
-            sorted.truncate(k);
-        }
         Ok(sorted)
     }
 
+    /// Internal helper for bucket selection (Saturating Density Model). [cite: 70, 120]
+    fn get_selected_headers(
+        &self,
+        query: &[f32],
+        target_confidence: f32,
+        lambda: f32,
+        tau: f32,
+    ) -> Vec<BucketHeader> {
+        let guard = epoch::pin();
+        let buckets_map = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+
+        if buckets_map.is_empty() {
+            return Vec::new();
+        }
+
+        let mut clusters: HashMap<Vec<u32>, Vec<&BucketHeader>> = HashMap::new();
+        for header in buckets_map.values() {
+            let key: Vec<u32> = header.centroid.iter().map(|f| f.to_bits()).collect();
+            clusters.entry(key).or_default().push(header);
+        }
+
+        let mut candidates: Vec<(Vec<&BucketHeader>, f32)> = clusters
+            .into_values()
+            .map(|headers| {
+                let centroid = &headers[0].centroid;
+                let total_count: u32 = headers.iter().map(|h| h.count).sum();
+                let dist = crate::math::l2_sq(query, centroid).sqrt();
+                let p_geom = (-lambda * dist).exp();
+                let reliability = 1.0 - (-(total_count as f32) / tau).exp();
+                (headers, p_geom * reliability)
+            })
+            .collect();
+
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
+        let total_score: f32 = candidates.iter().map(|(_, p)| p).sum();
+        let mut headers = Vec::new();
+        let mut acc_conf = 0.0;
+        let mut visited_ids = HashSet::new();
+
+        let min_scan = (buckets_map.len() / 10).max(10);
+
+        for (group, score) in candidates {
+            let norm_score = if total_score > 1e-6 {
+                score / total_score
+            } else {
+                0.0
+            };
+            acc_conf += norm_score;
+            for h in group {
+                if visited_ids.insert(h.id) {
+                    headers.push((*h).clone());
+                }
+            }
+            if acc_conf >= target_confidence && headers.len() >= min_scan {
+                break;
+            }
+        }
+
+        // Geometric Guardrail: Force 5 closest buckets to catch drift tails. [cite: 3, 124]
+        let mut all_headers: Vec<&BucketHeader> = buckets_map.values().collect();
+        all_headers.sort_by(|a, b| {
+            crate::math::l2_sq(query, &a.centroid)
+                .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
+                .unwrap_or(CmpOrdering::Equal)
+        });
+        for h in all_headers.iter().take(5) {
+            if visited_ids.insert(h.id) {
+                headers.push((*h).clone());
+            }
+        }
+
+        for h in &headers {
+            h.touch();
+        } // EWMA Heat tracking [cite: 80, 521]
+        headers
+    }
+
+    fn get_bucket_page_id(&self, bucket_id: u32) -> Option<drift_traits::PageId> {
+        let guard = epoch::pin();
+        let buckets = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+        buckets.get(&bucket_id).map(|h| h.page_id.clone())
+    }
     // Helper for Heap
     fn push_to_heap(heap: &mut BinaryHeap<SearchResult>, res: SearchResult, k: usize) {
         if heap.len() < k {
@@ -702,6 +896,7 @@ impl VectorIndex {
         // Assume latent clusters are rarely larger than 200 items in this workload.
         // This prevents cramming 1000 items into 2 buckets just because capacity allows it.
         let heuristic_k = (num_vectors / 200).max(1);
+        // let heuristic_k = (num_vectors / 2000).max(1);
 
         // Take the maximum to be safe
         let k = count_based_k.max(heuristic_k).max(2);
@@ -722,7 +917,25 @@ impl VectorIndex {
         );
 
         // 3. Train K-Means
-        let trainer = KMeansTrainer::new(k, self.config.dim, 10);
+
+        let batch_size = (num_vectors / 10).clamp(1000, 5000);
+        info!(
+            "Flush: Partitioning {} vectors into {} buckets (Mini-Batch: {})",
+            num_vectors, k, batch_size
+        );
+
+        let trainer = KMeansTrainer::new(k, self.config.dim, 15).with_mini_batch(batch_size); // Enable optimization
+
+        // Wrap this call to catch K-Means panics
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| trainer.train(&valid_vecs)))
+                .map_err(|_| io::Error::other("K-Means Panicked!"))?;
+
+        println!(
+            "DEBUG: K-Means Complete. Centroids: {}",
+            result.centroids.len()
+        );
+
         let result = trainer.train(&valid_vecs);
 
         // 4. Group Data

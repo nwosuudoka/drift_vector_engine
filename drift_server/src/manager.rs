@@ -26,8 +26,6 @@ pub struct CollectionManager {
 
 impl CollectionManager {
     pub fn new(config: Config) -> Self {
-        // let path = base_path.into();
-        // std::fs::create_dir_all(&path).expect("Failed to create data root");
         std::fs::create_dir_all(&config.wal_dir).expect("Failed to create WAL root");
 
         Self {
@@ -93,10 +91,15 @@ impl CollectionManager {
         let persistence = PersistenceManager::new(op.clone(), &coll_wal_dir);
         let dim = dim_hint.unwrap_or(self.config.default_dim);
 
+        const DEFAULT_CENTRIODS: usize = 16;
+        const DEFAULT_TRAINING_SAMPLES: usize = 1000;
+        // num_centroids: 512,
+        // training_sample_size: 10_000,
+
         let options = IndexOptions {
             dim,
-            num_centroids: 16,
-            training_sample_size: 1000,
+            num_centroids: DEFAULT_CENTRIODS,
+            training_sample_size: DEFAULT_TRAINING_SAMPLES,
             max_bucket_capacity: self.config.max_bucket_capacity,
             ef_construction: self.config.ef_construction,
             ef_search: self.config.ef_search,
@@ -126,6 +129,7 @@ impl CollectionManager {
 
         let compactor = SegmentCompactor::new(index.clone(), op.clone());
 
+        let cloned_name = name.to_string();
         tokio::spawn(async move {
             let janitor = Janitor::new(
                 j_idx,
@@ -135,6 +139,10 @@ impl CollectionManager {
                 Some(compactor),
             );
             janitor.run().await;
+
+            // If we reach here, the Janitor loop exited (unexpectedly)
+            tracing::error!("🚨 JANITOR DIED for collection '{}'", cloned_name);
+            println!("🚨 JANITOR DIED for collection '{}'", cloned_name); // Force stdout
         });
 
         let collection = Arc::new(Collection {

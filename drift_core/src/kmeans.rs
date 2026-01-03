@@ -1,6 +1,5 @@
 use rand::Rng;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct KMeansResult {
     pub centroids: Vec<Vec<f32>>,
@@ -12,6 +11,7 @@ pub struct KMeansTrainer {
     max_iter: usize,
     tolerance: f32,
     dim: usize,
+    batch_size: Option<usize>,
 }
 
 impl KMeansTrainer {
@@ -21,169 +21,193 @@ impl KMeansTrainer {
             dim,
             max_iter,
             tolerance: 1e-4,
+            batch_size: None,
         }
+    }
+
+    pub fn with_mini_batch(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
+        self
     }
 
     pub fn train(&self, data: &[Vec<f32>]) -> KMeansResult {
         assert!(!data.is_empty(), "Cannot train on empty data");
         assert_eq!(data[0].len(), self.dim, "Dimension mismatch");
 
-        // 1. Robust Initialization (K-Means++)
-        // TODO(production): random sample is usually sufficient if data is shuffled
+        // 1. Initialization (Optimized)
         let mut centroids = self.init_kmeans_plus_plus(data);
-        let mut assignments = vec![usize::MAX; data.len()];
+
+        let mut cluster_history_counts = vec![0usize; self.k];
+        let mut rng = rand::rng();
 
         for _iter in 0..self.max_iter {
-            // 2. Assignment Step (Parallel)
-            let changes = AtomicUsize::new(0);
+            // A. Select Batch
+            let batch_indices: Vec<usize> = if let Some(bs) = self.batch_size {
+                if bs >= data.len() {
+                    (0..data.len()).collect()
+                } else {
+                    (0..bs).map(|_| rng.random_range(0..data.len())).collect()
+                }
+            } else {
+                (0..data.len()).collect()
+            };
 
-            // Note: We compute squared errors for rescue strategy later
-            assignments
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(i, assign)| {
-                    let vec = &data[i];
-                    let (best_idx, _) = Self::nearest_centroid(vec, &centroids);
+            // B. Parallel Assignment
+            let batch_results: Vec<(usize, Vec<f32>, usize)> = batch_indices
+                .par_iter()
+                .fold(
+                    || vec![(0, vec![0.0; self.dim], 0); self.k],
+                    |mut acc, &data_idx| {
+                        let vec = &data[data_idx];
+                        let (best_idx, _) = Self::nearest_centroid(vec, &centroids);
 
-                    if *assign != best_idx {
-                        *assign = best_idx;
-                        changes.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
+                        let (_, sum_vec, count) = &mut acc[best_idx];
+                        for i in 0..self.dim {
+                            sum_vec[i] += vec[i];
+                        }
+                        *count += 1;
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![(0, vec![0.0; self.dim], 0); self.k],
+                    |mut a, b| {
+                        for i in 0..self.k {
+                            a[i].2 += b[i].2;
+                            for d in 0..self.dim {
+                                a[i].1[d] += b[i].1[d];
+                            }
+                        }
+                        a
+                    },
+                );
 
-            let changed_count = changes.load(Ordering::Relaxed);
-            let change_pct = changed_count as f32 / data.len() as f32;
+            // C. Update Centroids
+            let mut max_shift = 0.0f32;
 
-            if change_pct < self.tolerance {
-                break;
+            for (cluster_idx, (_, batch_sum, batch_count)) in batch_results.into_iter().enumerate()
+            {
+                if batch_count == 0 {
+                    continue;
+                }
+
+                let old_count = cluster_history_counts[cluster_idx];
+                let new_count = old_count + batch_count;
+                cluster_history_counts[cluster_idx] = new_count;
+
+                // Weighted update: Move centroid towards new batch mean
+                // Alpha (Learning Rate) = BatchCount / TotalHistory
+                // This simulates "streaming mean" updates.
+                let lr = batch_count as f32 / new_count as f32;
+                let momentum = 1.0 - lr;
+
+                let mut current_shift_sq = 0.0;
+                for d in 0..self.dim {
+                    let old_val = centroids[cluster_idx][d];
+                    let batch_avg = batch_sum[d] / batch_count as f32;
+
+                    let new_val = (old_val * momentum) + (batch_avg * lr);
+
+                    centroids[cluster_idx][d] = new_val;
+                    let diff = new_val - old_val;
+                    current_shift_sq += diff * diff;
+                }
+
+                if current_shift_sq > max_shift {
+                    max_shift = current_shift_sq;
+                }
             }
 
-            // 3. Update Step with Empty Cluster Rescue
-            centroids = self.compute_new_centroids_robust(data, &assignments, &centroids);
+            if max_shift < self.tolerance {
+                break;
+            }
         }
+
+        // 4. Final Assignment (Must be over ALL data for correct partitioning)
+        let final_assignments = data
+            .par_iter()
+            .map(|vec| Self::nearest_centroid(vec, &centroids).0)
+            .collect();
 
         KMeansResult {
             centroids,
-            assignments,
+            assignments: final_assignments,
         }
     }
 
-    /// K-Means++ Initialization
-    /// Picks centroids that are far away from each other to prevent collapse.
     fn init_kmeans_plus_plus(&self, data: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let mut rng = rand::rng();
         let mut centroids = Vec::with_capacity(self.k);
         let n = data.len();
+        if n == 0 {
+            return centroids;
+        }
 
-        // 1. Choose first centroid uniformly at random
-        centroids.push(data[rng.random_range(0..n)].clone());
+        // ⚡ OPTIMIZATION: Subsample for Initialization
+        // If we are in mini-batch mode, or data is huge, we only look at a subset
+        // to pick initial centroids. Scanning 100M items for init is too slow.
+        let pool_limit = if let Some(bs) = self.batch_size {
+            (bs * 10).clamp(1000, 20_000).min(n)
+        } else {
+            // For full mode, limit to 50k to be safe
+            50_000.min(n)
+        };
 
-        // 2. Choose remaining K-1 centroids
+        // Create the pool indices
+        let indices: Vec<usize> = if pool_limit < n {
+            (0..pool_limit).map(|_| rng.random_range(0..n)).collect()
+        } else {
+            (0..n).collect()
+        };
+
+        // 1. Pick first random
+        centroids.push(data[indices[rng.random_range(0..pool_limit)]].clone());
+
+        // 2. K-Means++ on the POOL (not full data)
         for _ in 1..self.k {
-            // Calculate distance squared to nearest existing centroid for all points
-            let mut dists = vec![0.0; n];
+            let mut dists = vec![0.0; pool_limit];
             let mut total_dist_sq = 0.0;
 
-            for (i, vec) in data.iter().enumerate() {
+            for (i, &data_idx) in indices.iter().enumerate() {
+                let vec = &data[data_idx];
                 let (_, d_sq) = Self::nearest_centroid(vec, &centroids);
                 dists[i] = d_sq;
                 total_dist_sq += d_sq;
             }
 
-            // Roulette Wheel Selection (Weighted Probability)
-            // If all points are identical (total_dist_sq == 0), pick random to avoid infinite loop
             if total_dist_sq <= 0.0 {
-                centroids.push(data[rng.random_range(0..n)].clone());
+                centroids.push(data[indices[rng.random_range(0..pool_limit)]].clone());
                 continue;
             }
 
             let target = rng.random_range(0.0..total_dist_sq);
             let mut cumulative = 0.0;
-            let mut selected_idx = 0;
-
             for (i, &d) in dists.iter().enumerate() {
                 cumulative += d;
                 if cumulative >= target {
-                    selected_idx = i;
+                    centroids.push(data[indices[i]].clone());
                     break;
                 }
             }
-            centroids.push(data[selected_idx].clone());
         }
-
         centroids
     }
 
+    #[inline]
     fn nearest_centroid(vec: &[f32], centroids: &[Vec<f32>]) -> (usize, f32) {
         let mut min_dist = f32::MAX;
         let mut best_idx = 0;
 
         for (i, c) in centroids.iter().enumerate() {
-            let dist = distance_sq(vec, c);
-            if dist < min_dist {
-                min_dist = dist;
+            let dist_sq: f32 = vec.iter().zip(c.iter()).map(|(a, b)| (a - b).powi(2)).sum();
+
+            if dist_sq < min_dist {
+                min_dist = dist_sq;
                 best_idx = i;
             }
         }
         (best_idx, min_dist)
     }
-
-    /// Robust Update: Handles empty clusters by respawning them
-    fn compute_new_centroids_robust(
-        &self,
-        data: &[Vec<f32>],
-        assignments: &[usize],
-        _old_centroids: &[Vec<f32>],
-    ) -> Vec<Vec<f32>> {
-        let mut sums = vec![vec![0.0; self.dim]; self.k];
-        let mut counts = vec![0; self.k];
-
-        // 1. Accumulate
-        for (i, &cluster_idx) in assignments.iter().enumerate() {
-            if cluster_idx >= self.k {
-                continue;
-            }
-            let vec = &data[i];
-            let sum_vec = &mut sums[cluster_idx];
-            for d in 0..self.dim {
-                sum_vec[d] += vec[d];
-            }
-            counts[cluster_idx] += 1;
-        }
-
-        // 2. Average & Rescue
-        let mut new_centroids = Vec::with_capacity(self.k);
-
-        // Find the point with the highest error (worst fit) to respawn empty clusters there
-        // This is a simplified "Rescue" strategy: Just pick a random point for V1 robustness
-        // or (better) keep the old centroid if it had history.
-        let mut rng = rand::rng();
-
-        for i in 0..self.k {
-            if counts[i] == 0 {
-                // RESCUE STRATEGY: Empty Cluster
-                // If we zero it out, it dies.
-                // Instead, we respawn it at a random data point to give it a new life.
-                let rescue_idx = rng.random_range(0..data.len());
-                new_centroids.push(data[rescue_idx].clone());
-            } else {
-                let count = counts[i] as f32;
-                let mut c = Vec::with_capacity(self.dim);
-                #[allow(clippy::needless_range_loop)]
-                for d in 0..self.dim {
-                    c.push(sums[i][d] / count);
-                }
-                new_centroids.push(c);
-            }
-        }
-        new_centroids
-    }
-}
-
-// TODO (production): use simd here
-#[inline]
-fn distance_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
 }
 
 #[cfg(test)]
@@ -339,5 +363,69 @@ mod tests {
         let data = vec![vec![1.0, 2.0]]; // 2D data
         let trainer = KMeansTrainer::new(2, 128, 10); // Trainer expects 128D
         trainer.train(&data);
+    }
+
+    #[test]
+    fn test_mini_batch_speed_vs_full_2() {
+        let dim = 128;
+        let n_samples = 50_000; // Increased to 50k to ensure computation dominates overhead
+        let k = 10;
+
+        let mut data = Vec::with_capacity(n_samples);
+        let mut rng = rand::rng();
+
+        // Generate Clusters
+        let gt_centroids: Vec<Vec<f32>> = (0..k).map(|i| vec![(i * 50) as f32; dim]).collect();
+
+        for _ in 0..n_samples {
+            let cluster_idx = rng.random_range(0..k);
+            let center = &gt_centroids[cluster_idx];
+            let point: Vec<f32> = center.iter().map(|&c| c + rng.random::<f32>()).collect();
+            data.push(point);
+        }
+
+        // A. Standard (Full)
+        let start_full = std::time::Instant::now();
+        let trainer_full = KMeansTrainer::new(k, dim, 10);
+        let result_full = trainer_full.train(&data);
+        let duration_full = start_full.elapsed();
+
+        // B. Mini-Batch (Batch=500)
+        let batch_size = 500;
+        let start_mini = std::time::Instant::now();
+        let trainer_mini = KMeansTrainer::new(k, dim, 10).with_mini_batch(batch_size);
+        let result_mini = trainer_mini.train(&data);
+        let duration_mini = start_mini.elapsed();
+
+        println!("--- Performance Report ---");
+        println!("Dataset: {} vectors, {} dim", n_samples, dim);
+        println!("Full K-Means Time:       {:.2?}", duration_full);
+        println!("Mini-Batch K-Means Time: {:.2?}", duration_mini);
+
+        let speedup = duration_full.as_secs_f64() / duration_mini.as_secs_f64();
+        println!("Speedup Factor:          {:.2}x", speedup);
+
+        assert!(
+            speedup > 3.0,
+            "Mini-Batch should be significantly faster (>3x)"
+        );
+
+        // Correctness Check
+        let mut mini_sums: Vec<f32> = result_mini.centroids.iter().map(|c| c[0]).collect();
+        mini_sums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let mut full_sums: Vec<f32> = result_full.centroids.iter().map(|c| c[0]).collect();
+        full_sums.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // Centroids should be roughly at 0, 50, 100, 150...
+        // We verify that Mini-Batch found similar centers to Full.
+        for (m, f) in mini_sums.iter().zip(full_sums.iter()) {
+            assert!(
+                (m - f).abs() < 10.0,
+                "Centroids diverged! Mini: {}, Full: {}",
+                m,
+                f
+            );
+        }
     }
 }

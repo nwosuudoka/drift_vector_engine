@@ -24,8 +24,6 @@ message Vector {
 }
 
 message InsertRequest {
-  // Optional: support multiple collections later. 
-  // For now, clients can leave this empty for "default".
   string collection_name = 1; 
   Vector vector = 2;
 }

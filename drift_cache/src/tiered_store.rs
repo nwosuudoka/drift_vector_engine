@@ -70,4 +70,8 @@ impl PageManager for TieredPageManager {
     fn get_physical_path(&self, file_id: u32) -> Option<String> {
         self.remote.get_physical_path(file_id)
     }
+
+    async fn read_high_fidelity(&self, file_id: u32) -> Result<Vec<Vec<f32>>> {
+        self.remote.read_high_fidelity(file_id).await
+    }
 }
