@@ -1288,6 +1288,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "bincode 2.0.1",
+ "bit-set",
  "byteorder",
  "clap",
  "crossbeam-epoch",
@@ -1321,6 +1322,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bincode 2.0.1",
+ "bit-set",
  "byteorder",
  "bytes",
  "crc32fast",

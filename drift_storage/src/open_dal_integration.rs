@@ -3,6 +3,9 @@ mod tests {
     use crate::disk_manager::DiskManager;
     use crate::segment_reader::SegmentReader;
     use crate::segment_writer::SegmentWriter;
+    use bit_set::BitSet;
+    use drift_core::aligned::AlignedBytes; // ⚡ Need these
+    use drift_core::bucket::BucketData; // ⚡ Need these
     use opendal::{Operator, services};
     use rand::Rng;
     use tempfile::tempdir;
@@ -15,12 +18,22 @@ mod tests {
             .collect()
     }
 
-    /// Helper to generate dummy SQ8 codes for testing storage integrity
+    /// Helper to generate dummy SQ8 codes
     fn generate_sq8_blob(count: usize, dim: usize, pattern: u8) -> Vec<u8> {
         vec![pattern; count * dim]
     }
 
-    // ⚡ HELPER: Create local filesystem operator
+    /// ⚡ HELPER: Wraps raw data into a valid BucketData struct
+    /// This is required because SegmentWriter::write_partition expects this structure.
+    fn wrap_in_bucket(ids: &[u64], codes: &[u8]) -> BucketData {
+        BucketData {
+            codes: AlignedBytes::from_slice(codes),
+            vids: ids.to_vec(),
+            tombstones: BitSet::new(),
+        }
+    }
+
+    // Create local filesystem operator
     fn create_local_operator(path: &std::path::Path) -> Operator {
         let mut builder = services::Fs::default();
         builder = builder.root(path.to_str().unwrap());
@@ -30,7 +43,6 @@ mod tests {
     #[tokio::test]
     async fn test_opendal_local_fs_flow() {
         let dir = tempdir().unwrap();
-        // ⚡ CHANGE: Create Operator + Filename
         let op = create_local_operator(dir.path());
         let filename = "test_seg.drift";
 
@@ -40,14 +52,17 @@ mod tests {
         let vecs = vec![vec![1.0, 1.0], vec![2.0, 2.0]];
         let codes = vec![0x10, 0x10, 0x20, 0x20]; // Mock SQ8 codes
 
-        // 1. Write (using Dual-Tier to persist both index and data)
+        // 1. Write
         let manager = DiskManager::new(op.clone(), filename.to_string());
         let mut writer = SegmentWriter::new(manager, vec![0x01, 0x02]).await.unwrap();
 
+        // ⚡ FIX: Use write_partition with BucketData
+        let bucket = wrap_in_bucket(&ids, &codes);
         writer
-            .write_bucket_dual(1, &ids, &vecs, &codes, dim)
+            .write_partition(1, &bucket, &vecs, dim)
             .await
             .unwrap();
+
         writer.finalize().await.unwrap();
 
         // 2. Read
@@ -66,6 +81,7 @@ mod tests {
         // B. Verify Cold Path (High Fidelity Floats)
         let read_vecs = reader.read_bucket_high_fidelity(1).await.unwrap();
         assert_eq!(read_vecs.len(), 2);
+
         // Check lossless roundtrip (ALP should match exactly for simple integers)
         assert_eq!(read_vecs[0][0], 1.0);
         assert_eq!(read_vecs[1][0], 2.0);
@@ -79,7 +95,7 @@ mod tests {
 
         // Setup Data
         let dim = 128;
-        let quantizer_config = vec![1, 2, 3, 4, 5]; // Mock quantizer data
+        let quantizer_config = vec![1, 2, 3, 4, 5];
 
         // Bucket 1: Small, sequential IDs
         let b1_id = 10;
@@ -106,16 +122,22 @@ mod tests {
                 .await
                 .unwrap();
 
+            // ⚡ FIX: Wrap all in BucketData and use write_partition
+            let b1 = wrap_in_bucket(&b1_ids, &b1_codes);
             writer
-                .write_bucket_dual(b1_id, &b1_ids, &b1_vecs, &b1_codes, dim)
+                .write_partition(b1_id, &b1, &b1_vecs, dim)
                 .await
                 .unwrap();
+
+            let b2 = wrap_in_bucket(&b2_ids, &b2_codes);
             writer
-                .write_bucket_dual(b2_id, &b2_ids, &b2_vecs, &b2_codes, dim)
+                .write_partition(b2_id, &b2, &b2_vecs, dim)
                 .await
                 .unwrap();
+
+            let b3 = wrap_in_bucket(&b3_ids, &b3_codes);
             writer
-                .write_bucket_dual(b3_id, &b3_ids, &b3_vecs, &b3_codes, dim)
+                .write_partition(b3_id, &b3, &b3_vecs, dim)
                 .await
                 .unwrap();
 
@@ -134,7 +156,7 @@ mod tests {
             "Quantizer config corrupted"
         );
 
-        // 2. Verify Bloom Filter (Probabilistic check)
+        // 2. Verify Bloom Filter
         assert!(reader.might_contain(100));
         assert!(reader.might_contain(2500));
         assert!(reader.might_contain(99999));
@@ -149,7 +171,7 @@ mod tests {
         // 4. Verify Bucket 2 (Cold Path - High Fidelity)
         let vecs = reader.read_bucket_high_fidelity(b2_id).await.unwrap();
         assert_eq!(vecs.len(), 1000);
-        // Spot check data integrity
+        // Spot check
         for i in 0..dim {
             assert!(
                 (vecs[0][i] - b2_vecs[0][i]).abs() < 1e-5,
@@ -162,7 +184,7 @@ mod tests {
         assert_eq!(ids, b3_ids);
         assert_eq!(codes, b3_codes);
 
-        // 6. Verify Error Handling (Missing Bucket)
+        // 6. Verify Error Handling
         let err = reader.read_bucket(999).await;
         assert!(err.is_err());
         assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::NotFound);
@@ -177,7 +199,7 @@ mod tests {
         // Write a segment with NO buckets
         {
             let manager = DiskManager::new(op.clone(), filename.to_string());
-            let writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+            let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
             writer.finalize().await.unwrap();
         }
 

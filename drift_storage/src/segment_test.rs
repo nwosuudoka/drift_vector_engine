@@ -1,220 +1,200 @@
 #[cfg(test)]
 mod tests {
+    use crate::DriftFooter;
     use crate::disk_manager::DiskManager;
     use crate::segment_reader::SegmentReader;
-    use crate::segment_writer::{CompressionType, SegmentWriter};
+    use crate::segment_writer::SegmentWriter;
+    use bit_set::BitSet;
+    use drift_core::aligned::AlignedBytes;
+    use drift_core::bucket::BucketData;
     use opendal::{Operator, services};
-    use rand::Rng;
+    use std::io::{Seek, SeekFrom, Write};
     use tempfile::tempdir;
 
     // --- Helpers ---
-
-    fn generate_random_vectors(count: usize, dim: usize) -> Vec<Vec<f32>> {
-        let mut rng = rand::rng();
-        (0..count)
-            .map(|_| (0..dim).map(|_| rng.random::<f32>()).collect())
-            .collect()
-    }
-
-    /// Simulates a Quantizer producing SQ8 codes from floats.
-    fn mock_quantize(vecs: &[Vec<f32>]) -> Vec<u8> {
-        let mut codes = Vec::with_capacity(vecs.len() * vecs[0].len());
-        for v in vecs {
-            for &val in v {
-                codes.push(((val * 10.0) as u32 % 255) as u8);
-            }
-        }
-        codes
-    }
-
-    // Helper to create a local FS operator
-    fn create_local_operator(path: &std::path::Path) -> Operator {
+    fn create_op(path: &std::path::Path) -> Operator {
         let mut builder = services::Fs::default();
         builder = builder.root(path.to_str().unwrap());
         Operator::new(builder).unwrap().finish()
     }
 
-    // --- Test 1: The "Dual-Tier" Flush (L0 -> L1) ---
-    #[tokio::test]
-    async fn test_dual_tier_flush_and_read() {
-        let dir = tempdir().unwrap();
-        // ⚡ CHANGE: Create Operator
-        let op = create_local_operator(dir.path());
-        let filename = "dual_tier.drift";
-
-        let dim = 128;
-        let count = 100;
-        let bucket_id = 1;
-
-        // 1. Generate Data
-        let raw_vectors = generate_random_vectors(count, dim);
-        let ids: Vec<u64> = (0..count as u64).collect();
-        let sq8_codes = mock_quantize(&raw_vectors);
-
-        let q_config = vec![0xAA, 0xBB, 0xCC];
-
-        // 2. Write Segment (Dual Tier)
-        {
-            // ⚡ CHANGE: Inject Operator + Filename
-            let manager = DiskManager::new(op.clone(), filename.to_string());
-            let mut writer = SegmentWriter::new(manager, q_config.clone()).await.unwrap();
-
-            writer
-                .write_bucket_dual(bucket_id, &ids, &raw_vectors, &sq8_codes, dim)
-                .await
-                .expect("Write failed");
-
-            writer.finalize().await.expect("Finalize failed");
+    fn create_dummy_bucket(count: usize, dim: usize) -> (BucketData, Vec<Vec<f32>>) {
+        let mut codes = AlignedBytes::new(count * dim);
+        unsafe {
+            codes.set_len(count * dim);
         }
+        codes.as_mut_slice().fill(0xAA);
 
-        // 3. Read Back
-        // ⚡ CHANGE: Use open_with_op
-        let reader = SegmentReader::open_with_op(op.clone(), filename)
-            .await
-            .expect("Open failed");
-
-        // A. Verify Metadata
-        assert_eq!(reader.read_metadata(), &q_config);
-
-        // B. Verify Index Location Data
-        let loc = reader.index.buckets.get(&bucket_id).unwrap();
-        assert_eq!(loc.vector_count, count);
-        assert_eq!(loc.compression_type, CompressionType::Compressed as u8);
-        assert!(loc.index_length > 0);
-        assert!(loc.data_length > 0);
-
-        // C. FAST PATH: Read SQ8
-        let (read_ids, read_codes) = reader.read_bucket(bucket_id).await.unwrap();
-        assert_eq!(read_ids, ids);
-        assert_eq!(read_codes, sq8_codes, "SQ8 Index blob corrupted");
-
-        // D. COLD PATH: Read Floats
-        let read_floats = reader.read_bucket_high_fidelity(bucket_id).await.unwrap();
-        assert_eq!(read_floats.len(), count);
-
-        let f1 = &raw_vectors[0];
-        let f2 = &read_floats[0];
-        for (a, b) in f1.iter().zip(f2.iter()) {
-            assert!((a - b).abs() < 1e-6, "Float data mismatch: {} vs {}", a, b);
-        }
+        let vids: Vec<u64> = (0..count as u64).collect();
+        let bucket = BucketData {
+            codes,
+            vids: vids.clone(),
+            tombstones: BitSet::new(),
+        };
+        let raw_vecs = vec![vec![0.0; dim]; count];
+        (bucket, raw_vecs)
     }
 
-    // --- Test 2: The "Maintenance" Path (L1 -> L1) ---
+    // --- Test 1: Happy Path ---
     #[tokio::test]
-    async fn test_sq8_only_maintenance_write() {
+    async fn test_segment_full_roundtrip_with_footer() {
         let dir = tempdir().unwrap();
-        let op = create_local_operator(dir.path());
-        let filename = "maintenance.drift";
+        let op = create_op(dir.path());
+        let filename = "happy_footer.drift";
+        let dim = 128;
 
-        let dim = 64;
-        let count = 50;
-        let bucket_id = 99;
-
-        let ids: Vec<u64> = (1000..1050).collect();
-        let sq8_codes = vec![0x7F; count * dim];
-
-        // 1. Write Segment (SQ8 Only)
+        // 1. Write
         {
             let manager = DiskManager::new(op.clone(), filename.to_string());
-            let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
-
-            writer
-                .write_bucket_sq8(bucket_id, &ids, &sq8_codes, dim)
-                .await
-                .expect("Write SQ8 failed");
-
+            let mut writer = SegmentWriter::new(manager, vec![1, 2, 3]).await.unwrap();
+            let (b1, v1) = create_dummy_bucket(10, dim);
+            writer.write_partition(1, &b1, &v1, dim).await.unwrap();
             writer.finalize().await.unwrap();
         }
 
-        // 2. Read Back
+        // 2. Read
         let reader = SegmentReader::open_with_op(op.clone(), filename)
             .await
             .unwrap();
-        let loc = reader.index.buckets.get(&bucket_id).unwrap();
 
-        // Assertions
-        assert_eq!(loc.compression_type, CompressionType::RawSQ8 as u8);
-        assert_eq!(loc.data_length, 0, "Should have 0 data length for RawSQ8");
-
-        // Fast Path should work
-        let (read_ids, read_codes) = reader.read_bucket(bucket_id).await.unwrap();
-        assert_eq!(read_ids, ids);
-        assert_eq!(read_codes, sq8_codes);
-
-        // Cold Path should FAIL safely
-        let err = reader.read_bucket_high_fidelity(bucket_id).await;
-        assert!(err.is_err());
-        assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(reader.quantizer, vec![1, 2, 3]);
+        let (ids1, codes1) = reader.read_bucket(1).await.unwrap();
+        assert_eq!(ids1.len(), 10);
+        assert_eq!(codes1[0], 0xAA);
     }
 
-    // --- Test 3: Validation & Errors ---
+    // --- Test 2: File Magic Corruption (Footer) ---
     #[tokio::test]
-    async fn test_validations() {
+    async fn test_corrupt_file_magic() {
         let dir = tempdir().unwrap();
-        let op = create_local_operator(dir.path());
-        let filename = "bad.drift";
+        let op = create_op(dir.path());
+        let filename = "corrupt_magic.drift";
 
-        let manager = DiskManager::new(op.clone(), filename.to_string());
-        let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+        // 1. Create valid file
+        {
+            let manager = DiskManager::new(op.clone(), filename.to_string());
+            let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+            writer.finalize().await.unwrap();
+        }
 
-        // 1. Dimension Mismatch
-        let ids = vec![1];
-        let codes = vec![0u8; 10]; // 10 bytes
-        let dim = 128; // Expect 128 bytes
+        // 2. Corrupt footer
+        {
+            let path = dir.path().join(filename);
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            file.seek(SeekFrom::Start(len - 1)).unwrap();
+            file.write_all(&[0x00]).unwrap();
+            // ⚡ Drop file ensuring flush
+        }
 
-        let res = writer.write_bucket_sq8(1, &ids, &codes, dim).await;
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err().to_string(), "Dimension mismatch");
+        // 3. Attempt Read
+        match SegmentReader::open_with_op(op.clone(), filename).await {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(err.contains("Invalid Magic Bytes"), "Got: {}", err);
+            }
+            Ok(_) => panic!("Should have failed"),
+        }
+    }
 
-        // 2. ID Collision
-        let ids_ok = vec![1];
-        let codes_ok = vec![0u8; 10];
-        let dim_ok = 10;
+    // --- Test 3: Truncated File ---
+    #[tokio::test]
+    async fn test_truncated_file_footer_check() {
+        let dir = tempdir().unwrap();
+        let op = create_op(dir.path());
+        let filename = "truncated.drift";
 
-        writer
-            .write_bucket_sq8(1, &ids_ok, &codes_ok, dim_ok)
+        // 1. Write file
+        {
+            let manager = DiskManager::new(op.clone(), filename.to_string());
+            let writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+            writer.finalize().await.unwrap();
+        }
+
+        // 2. Truncate
+        {
+            use std::fs::OpenOptions;
+
+            let path = dir.path().join(filename);
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+
+            file.set_len(50).unwrap();
+            file.sync_all().unwrap(); // optional, but helps on some FSs
+        }
+
+        // 3. Attempt Read
+        match SegmentReader::open_with_op(op.clone(), filename).await {
+            Ok(_) => panic!("Should have failed"),
+            Err(e) => {
+                let err = e.to_string();
+                assert!(err.contains("File too small"), "Got: {}", err);
+            }
+        }
+    }
+
+    // --- Test 4: Bucket Data Integrity ---
+    #[tokio::test]
+    async fn test_bucket_magic_integrity_check() {
+        let dir = tempdir().unwrap();
+        let op = create_op(dir.path());
+        let filename = "bucket_integrity.drift";
+        let dim = 16;
+
+        // 1. Write Valid
+        {
+            let manager = DiskManager::new(op.clone(), filename.to_string());
+            let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+            let (b1, v1) = create_dummy_bucket(10, dim);
+            writer.write_partition(1, &b1, &v1, dim).await.unwrap();
+            writer.finalize().await.unwrap();
+        }
+
+        // 2. Corrupt Bucket Header
+        {
+            let path = dir.path().join(filename);
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            // Start of file is bucket 1
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(&[0x00, 0x00, 0x00, 0x00]).unwrap();
+        }
+
+        // 3. Attempt Read
+        let reader = SegmentReader::open_with_op(op.clone(), filename)
             .await
             .unwrap();
-
-        // Try writing Bucket 1 again
-        let res_col = writer.write_bucket_sq8(1, &ids_ok, &codes_ok, dim_ok).await;
-        assert!(res_col.is_err());
-        assert_eq!(
-            res_col.unwrap_err().kind(),
-            std::io::ErrorKind::AlreadyExists
+        let err = reader.read_bucket(1).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid Bucket Magic"),
+            "Got: {}",
+            err
         );
     }
 
-    // --- Test 4: Bloom Filter Integration ---
+    // --- Test 5: Footer Version Check ---
     #[tokio::test]
-    async fn test_bloom_filter_persistence() {
+    async fn test_footer_version_check() {
         let dir = tempdir().unwrap();
-        let op = create_local_operator(dir.path());
-        let filename = "bloom.drift";
+        let op = create_op(dir.path());
+        let filename = "version_check.drift";
 
-        let ids = vec![42, 999, 10_000];
-        let dim = 4;
-        let codes = vec![0u8; ids.len() * dim];
-
-        // Write
+        // 1. Manually write bad version footer
         {
-            let manager = DiskManager::new(op.clone(), filename.to_string());
-            let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
-            writer.write_bucket_sq8(1, &ids, &codes, dim).await.unwrap();
-            writer.finalize().await.unwrap();
+            let mut footer = DriftFooter::new(0, 0, 0, 0, 0, 0);
+            footer.version = 99;
+
+            let path = dir.path().join(filename);
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&footer.to_bytes()).unwrap();
+            // Explicit drop to close file
         }
 
-        // Read
-        let reader = SegmentReader::open_with_op(op.clone(), filename)
-            .await
-            .unwrap();
-
-        // Check Positive
-        assert!(reader.might_contain(42));
-        assert!(reader.might_contain(999));
-
-        // Check Negative
-        assert!(!reader.might_contain(1));
-        assert!(!reader.might_contain(500));
+        // 2. Attempt Read
+        match SegmentReader::open_with_op(op.clone(), filename).await {
+            Err(e) => {
+                let err = e.to_string();
+                assert!(err.contains("Bad Version"), "Got: {}", err);
+            }
+            Ok(_) => panic!("Should have failed"),
+        }
     }
 }

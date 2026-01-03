@@ -31,9 +31,8 @@ impl LocalDiskManager {
         }
     }
 
-    /// Helper to get or open a file handle. Auto-registers if missing.
     fn get_file(&self, file_id: u32) -> Result<Arc<File>> {
-        // 1. Check if already open (Fast Read Lock)
+        // 1. Check open handles
         {
             let handles = self.files.read();
             if let Some(f) = handles.get(&file_id) {
@@ -41,26 +40,38 @@ impl LocalDiskManager {
             }
         }
 
-        // 2. Check if path registered, if not, AUTO-REGISTER (Write Lock)
+        // 2. Resolve Path
         let mut paths_guard = self.paths.write();
         let mut files_guard = self.files.write();
 
-        // Double check after lock
+        // Double check (Race condition)
         if let Some(f) = files_guard.get(&file_id) {
             return Ok(f.clone());
         }
 
-        // Resolve Path
-        let path = paths_guard
-            .entry(file_id)
-            .or_insert_with(|| self.base_path.join(format!("{}.drift", file_id)))
-            .clone();
+        let raw_path = paths_guard.get(&file_id).cloned();
 
-        // Open File
+        let path = match raw_path {
+            Some(p) => {
+                if p.is_relative() {
+                    self.base_path.join(p)
+                } else {
+                    p
+                }
+            }
+            None => {
+                let p = self.base_path.join(format!("{}.drift", file_id));
+                paths_guard.insert(file_id, p.clone());
+                p
+            }
+        };
+
+        // Open
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(true) // Should allow creating cache files if needed
+            .truncate(false)
             .open(&path)?;
 
         let arc_file = Arc::new(file);

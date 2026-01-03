@@ -22,8 +22,9 @@ impl Default for BucketStats {
     fn default() -> Self {
         Self {
             tombstone_count: AtomicU32::new(0),
-            // Default temp 0.0 so cold buckets are eager to merge if empty
-            temperature: AtomicF32::new(0.0),
+            // Default temp 0.0 so cold buckets are eager to merge if empty ??
+            // This prevents "Infinite Urgency" on fresh buckets. ??
+            temperature: AtomicF32::new(0.5),
         }
     }
 }
@@ -110,6 +111,16 @@ pub struct BucketData {
     pub tombstones: BitSet,
 }
 
+impl BucketData {
+    pub fn from(codes: AlignedBytes, vids: Vec<u64>, tombstones: BitSet) -> Self {
+        Self {
+            codes,
+            vids,
+            tombstones,
+        }
+    }
+}
+
 impl Cacheable for BucketData {
     fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(data);
@@ -117,7 +128,10 @@ impl Cacheable for BucketData {
         // Validation Magic
         let magic = cursor.read_u32::<LittleEndian>()?;
         if magic != 0xBD47001 {
-            return Err(Error::new(ErrorKind::InvalidData, "Invalid Bucket Magic"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid Bucket Magic {} != {}", magic, 0xBD47001),
+            ));
         }
 
         // Read Metadata

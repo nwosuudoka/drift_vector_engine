@@ -1,18 +1,56 @@
 use crate::persistence::PersistenceManager;
 use drift_core::index::{MaintenanceStatus, VectorIndex};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
-use std::{collections::HashSet, sync::atomic::Ordering};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use tokio::time;
 use tracing::{error, info, instrument};
+
+#[derive(Clone, Copy, Debug)]
+struct IgnoreState {
+    retries: u32,
+    next_retry_at: Instant,
+}
+
+impl IgnoreState {
+    /// Create a fresh ignore state (first time we see a singularity).
+    fn first(now: Instant) -> Self {
+        let retries = 1;
+        Self {
+            retries,
+            next_retry_at: now + Self::backoff_for(retries),
+        }
+    }
+
+    /// Whether we should skip maintenance for this bucket right now.
+    fn should_skip(&self, now: Instant) -> bool {
+        now < self.next_retry_at
+    }
+
+    /// Record another singularity and push out the next retry time.
+    fn on_singularity(mut self, now: Instant) -> Self {
+        self.retries = self.retries.saturating_add(1);
+        self.next_retry_at = now + Self::backoff_for(self.retries);
+        self
+    }
+
+    /// Exponential backoff with a cap (tune to taste).
+    fn backoff_for(retries: u32) -> Duration {
+        // 50ms, 100ms, 200ms, 400ms, ... capped
+        let exp = retries.min(6); // caps growth
+        let ms = 50u64.saturating_mul(1u64 << exp);
+        Duration::from_millis(ms).min(Duration::from_secs(2))
+    }
+}
 
 pub struct Janitor {
     index: Arc<VectorIndex>,
     persistence: PersistenceManager,
     flush_threshold: usize,
     check_interval: Duration,
-    ignore_set: std::sync::Mutex<HashSet<u32>>,
+    ignore_map: std::sync::Mutex<HashMap<u32, IgnoreState>>,
 }
 
 impl Janitor {
@@ -27,7 +65,7 @@ impl Janitor {
             persistence,
             flush_threshold,
             check_interval,
-            ignore_set: std::sync::Mutex::new(HashSet::new()),
+            ignore_map: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -63,15 +101,22 @@ impl Janitor {
         let buckets = self.index.get_all_bucket_headers();
         let target_cap = self.index.config.max_bucket_capacity as u32;
         let mut ops_budget = 1;
+        let now = Instant::now();
 
         for header in buckets {
             if ops_budget == 0 {
                 break;
             }
             {
-                let guard = self.ignore_set.lock().unwrap();
-                if guard.contains(&header.id) {
-                    continue;
+                let mut guard = self.ignore_map.lock().unwrap();
+                if let Some(state) = guard.get(&header.id)
+                    && state.should_skip(now)
+                {
+                    if state.should_skip(now) {
+                        continue;
+                    } else {
+                        guard.remove(&header.id);
+                    }
                 }
             }
 
@@ -89,11 +134,19 @@ impl Janitor {
                     "Janitor: ✂️ Splitting Bucket {} (Count {})",
                     header.id, header.count
                 );
+
                 match self.index.split_and_steal(header.id).await {
                     Ok(MaintenanceStatus::Completed) => ops_budget -= 1,
                     Ok(MaintenanceStatus::SkippedSingularity) => {
                         info!("Janitor: Bucket {} is a Singularity. Ignoring.", header.id);
-                        self.ignore_set.lock().unwrap().insert(header.id);
+
+                        let now = Instant::now();
+                        let mut guard = self.ignore_map.lock().unwrap();
+
+                        guard
+                            .entry(header.id)
+                            .and_modify(|s| *s = s.on_singularity(now))
+                            .or_insert_with(|| IgnoreState::first(now));
                     }
                     Ok(_) => {}
                     Err(e) => error!("Split failed: {}", e),
@@ -104,7 +157,7 @@ impl Janitor {
                     "Janitor: 🚑 Scatter Merging Bucket {} (Count {})",
                     header.id, header.count
                 );
-                self.ignore_set.lock().unwrap().remove(&header.id);
+                self.ignore_map.lock().unwrap().remove(&header.id);
                 match self.index.scatter_merge(header.id).await {
                     Ok(MaintenanceStatus::Completed) => ops_budget -= 1,
                     Ok(_) => {}
@@ -118,7 +171,7 @@ impl Janitor {
     async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
         let start = std::time::Instant::now();
 
-        // 1. Extract Data from MemTable
+        // 1. Extract Data
         let memtable_arc = {
             let frozen = self.index.frozen_memtable.read();
             if let Some(m) = frozen.as_ref() {
@@ -141,42 +194,45 @@ impl Janitor {
         let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
         let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
 
-        // 2. Train Index (if needed)
-        {
-            let q_guard = self.index.get_quantizer();
-            if q_guard.is_none() {
-                info!(count = data.len(), "Starting Index Training");
-                self.index.train(&vectors).await?;
-            }
+        // 2. Train (if needed)
+        if self.index.get_quantizer().is_none() {
+            self.index.train(&vectors).await?;
         }
 
-        // 3. ⚡ PARTITION (Calculate, don't write) ⚡
+        // 3. Partition
         let partitions = self.index.calculate_partitions(&ids, &vectors).await?;
-
         if partitions.is_empty() {
             self.index.confirm_flush()?;
             return Ok(None);
         }
 
-        // 4. ⚡ PERSIST (Write Segment to S3 with Compression) ⚡
-        // This uses SegmentWriter internally, preserving ALP/SQ8 structure.
-        let run_id = self
+        info!("calculated {} partitions", partitions.len());
+
+        // 4. ⚡ PERSIST (Get Offsets) ⚡
+        let (run_id, locations) = self
             .persistence
             .write_partitioned_segment(&partitions, &self.index)
             .await?;
 
-        // 5. ⚡ REGISTER (Update Memory) ⚡
-        self.index.register_partitions(&partitions, &run_id).await?;
+        // Extract just the (offset, len) for the Index Blob (SQ8) needed by BlockCache
+        // BucketLocation has many fields, we need 'index_offset' and 'index_length'
+        let offsets_map: HashMap<u32, (u64, u32)> = locations
+            .into_iter()
+            .map(|(id, loc)| (id, (loc.index_offset, loc.index_length as u32)))
+            .collect();
 
-        // 6. Flush Tombstones
+        // 5. ⚡ REGISTER (Pass Offsets) ⚡
+        self.index
+            .register_partitions(&partitions, &run_id, &offsets_map)
+            .await?;
+
+        // 6. Cleanup
         let deleted_snapshot: Vec<u64> = self.index.deleted_ids.read().iter().cloned().collect();
         if !deleted_snapshot.is_empty() {
             self.persistence
                 .flush_tombstones(&deleted_snapshot, &run_id)
                 .await?;
         }
-
-        // 7. Cleanup
         self.index.confirm_flush()?;
 
         info!(
@@ -185,86 +241,8 @@ impl Janitor {
             duration_ms = start.elapsed().as_millis(),
             "Flush Complete"
         );
-
-        // Return dummy path for logging, or actual object key
         Ok(Some(PathBuf::from(format!("segment_{}.drift", run_id))))
     }
-
-    // async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
-    //     let start = std::time::Instant::now();
-
-    //     // 1. Get Data (Retry logic)
-    //     // If a frozen memtable exists (retry scenario), use it.
-    //     // Otherwise, try to rotate.
-    //     let memtable_arc = {
-    //         let frozen = self.index.frozen_memtable.read();
-    //         if let Some(m) = frozen.as_ref() {
-    //             m.clone()
-    //         } else {
-    //             drop(frozen); // Release lock
-    //             match self.index.rotate_and_freeze()? {
-    //                 Some(m) => m,
-    //                 None => return Ok(None),
-    //             }
-    //         }
-    //     };
-
-    //     let data = memtable_arc.extract_all();
-    //     if data.is_empty() {
-    //         self.index.confirm_flush()?; // Clear empty frozen slot
-    //         return Ok(None);
-    //     }
-
-    //     let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
-    //     let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
-
-    //     // 2. Train
-    //     {
-    //         let q_guard = self.index.get_quantizer();
-    //         if q_guard.is_none() {
-    //             info!(count = data.len(), "Starting Index Training");
-    //             self.index.train(&vectors).await?;
-    //             info!(
-    //                 duration_ms = start.elapsed().as_millis(),
-    //                 "Training Complete"
-    //             );
-    //         }
-    //     }
-
-    //     // 3. Persist
-    //     // let new_id = self.index.allocate_next_bucket_id();
-    //     let _new_bucket_ids = self.index.partition_and_flush(&ids, &vectors).await?;
-
-    //     let run_id = uuid::Uuid::new_v4().to_string();
-    //     let path = self
-    //         .persistence
-    //         .flush_memtable_to_segment(&data, &self.index, &run_id)
-    //         .await?;
-
-    //     // 4. Flush Tombstones
-    //     // We snapshot the entire set. This is safe and robust for now.
-    //     // Compaction (future) will delete these files when they are no longer needed.
-    //     let deleted_snapshot: Vec<u64> = self.index.deleted_ids.read().iter().cloned().collect();
-
-    //     // Cleanup
-    //     // Only verify flush if persistence succeeded.
-    //     if !deleted_snapshot.is_empty() {
-    //         self.persistence
-    //             .flush_tombstones(&deleted_snapshot, &run_id)
-    //             .await?;
-    //     }
-
-    //     self.index.confirm_flush()?;
-
-    //     info!(
-    //         vectors = data.len(),
-    //         duration_ms = start.elapsed().as_millis(),
-    //         "Flush Complete"
-    //     );
-    //     Ok(Some(PathBuf::from(path)))
-    // }
-
-    // In drift_server/src/janitor.rs
 
     pub async fn scavenge(&self) -> std::io::Result<()> {
         // Optimization: If global deleted set is small, don't bother scanning.
@@ -283,7 +261,7 @@ impl Janitor {
                 continue;
             }
 
-            // SAFETY: This load is atomic and safe.
+            // This load is atomic and safe.
             // It reflects the current count updated by delete() calls.
             let dead = header
                 .stats

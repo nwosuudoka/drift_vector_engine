@@ -69,6 +69,13 @@ mod tests {
             original.tombstones.len(),
             "Tombstone count mismatch"
         );
+
+        // 6. Verify Bitpacking (Tombstones)
+        assert_eq!(
+            decoded.tombstones, original.tombstones,
+            "Tombstone count mismatch"
+        );
+
         assert!(decoded.tombstones.contains(0));
         assert!(decoded.tombstones.contains(10));
         assert!(decoded.tombstones.contains(999));

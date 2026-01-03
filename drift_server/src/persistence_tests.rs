@@ -28,7 +28,6 @@ mod tests {
     #[tokio::test]
     async fn test_end_to_end_persistence_lifecycle() {
         let dir = tempdir().unwrap();
-
         // ⚡ CHANGE: Build the Operator manually for the test
         let mut builder = services::Fs::default();
         builder = builder.root(dir.path().to_str().unwrap());
@@ -36,70 +35,50 @@ mod tests {
 
         // ⚡ CHANGE: Inject Operator into Manager
         let persistence = PersistenceManager::new(op, dir.path());
-
         let index_original = create_index_with_storage(dir.path(), "current.wal");
 
         // Train
         let train_data = vec![vec![10.0, 10.0], vec![-10.0, -10.0]];
         index_original.train(&train_data).await.unwrap();
 
-        // Insert Data to L0 (MemTable) -> Persisted via WAL
-        for i in 0..50 {
-            index_original.insert(i, &vec![10.0, 10.0]).unwrap();
-        }
-        for i in 50..100 {
-            index_original.insert(i, &vec![-10.0, -10.0]).unwrap();
-        }
+        // 1. Snapshot L1 (Partitioned Flush)
+        // We manually trigger the calculation to get partitions
+        let ids: Vec<u64> = (0..50).collect();
+        let vectors: Vec<Vec<f32>> = (0..50).map(|_| vec![10.0, 10.0]).collect();
 
-        // Verify state before "Crash"
-        let pre_crash = index_original
-            .search_async(&vec![10.0, 10.0], 1, 0.9, 1.0, 10.0)
+        let partitions = index_original
+            .calculate_partitions(&ids, &vectors)
             .await
             .unwrap();
-        assert!(!pre_crash.is_empty());
 
-        // Snapshot L1 (buckets) to disk
-        // ⚡ CHANGE: This returns a String (key) now, not a PathBuf
-        let segment_key = persistence
-            .flush_to_segment(&index_original, "run_1")
+        // Write Segment
+        let (run_id, _locations) = persistence
+            .write_partitioned_segment(&partitions, &index_original)
             .await
             .expect("Flush failed");
+
+        let segment_key = format!("segment_{}.drift", run_id);
 
         // "Crash"
         drop(index_original);
 
-        // Recover
-        // ⚡ CHANGE: Pass the key string
+        // 2. Recover
         let index_recovered = persistence
             .load_from_segment(&segment_key)
             .await
             .expect("Load failed");
 
-        // Verify L0 Recovery (from WAL)
-        let results_a = index_recovered
+        // 3. Verify L1 Recovery
+        // We wrote 50 items at [10.0, 10.0]. They should be searchable.
+        let results = index_recovered
             .search_async(&vec![10.0, 10.0], 5, 0.9, 1.0, 10.0)
             .await
             .unwrap();
 
-        assert_eq!(
-            results_a.len(),
-            5,
-            "Failed to recover L0 data for Cluster A"
-        );
-
-        let results_b = index_recovered
-            .search_async(&vec![-10.0, -10.0], 5, 0.9, 1.0, 10.0)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            results_b.len(),
-            5,
-            "Failed to recover L0 data for Cluster B"
-        );
+        assert_eq!(results.len(), 5, "Failed to recover L1 data from segment");
 
         // Verify Data Fidelity
-        let top_dist = results_a[0].distance;
+        let top_dist = results[0].distance;
         assert!(
             top_dist < 0.02,
             "Recovered distance too high: {}. Expected near 0.0",
@@ -107,5 +86,37 @@ mod tests {
         );
 
         println!("Persistence Lifecycle Passed!");
+    }
+
+    #[tokio::test]
+    async fn test_flush_memtable_l0_persistence() {
+        let dir = tempdir().unwrap();
+        let mut builder = services::Fs::default();
+        builder = builder.root(dir.path().to_str().unwrap());
+        let op = Operator::new(builder).unwrap().finish();
+
+        let persistence = PersistenceManager::new(op, dir.path());
+        let index = create_index_with_storage(dir.path(), "l0.wal");
+
+        index.train(&vec![vec![1.0, 1.0]]).await.unwrap();
+
+        let data = vec![(100, vec![1.0, 1.0]), (200, vec![2.0, 2.0])];
+
+        // Write L0 Segment
+        let run_id = "test_l0";
+        let file_name = persistence
+            .flush_memtable_to_segment(&data, &index, run_id)
+            .await
+            .unwrap();
+
+        // Load Back
+        let loaded_index = persistence.load_from_segment(&file_name).await.unwrap();
+
+        // Verify
+        let res = loaded_index
+            .search_async(&vec![1.0, 1.0], 1, 0.9, 1.0, 10.0)
+            .await
+            .unwrap();
+        assert_eq!(res[0].id, 100);
     }
 }

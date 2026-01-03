@@ -6,7 +6,7 @@ use rand::Rng;
 
 // Helper to generate random aligned bytes
 fn random_aligned_bytes(len: usize) -> AlignedBytes {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut bytes = AlignedBytes::new(len);
     // Unsafe access to write random data into aligned buffer
     unsafe {
@@ -134,7 +134,7 @@ fn test_bucket_header_stats_persistence() {
     assert_eq!(header.page_id.file_id, 99);
 
     // Stats start at default
-    assert_eq!(header.temperature(), 0.0);
+    assert_eq!(header.temperature(), 0.5);
 
     header.touch();
     assert!(

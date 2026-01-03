@@ -357,19 +357,21 @@ mod tests {
         let persistence = PersistenceManager::new(op, dir.path());
 
         let index = create_index(dir.path(), "split.wal", 20);
+
+        // Train with basic data
         index.train(&vec![vec![0.0, 0.0]]).await.unwrap();
 
         let mut ids = Vec::new();
         let mut vecs = Vec::new();
 
-        // 1. Cluster A: ~[0,0] (15 items)
+        // 1. Cluster A: Around [0,0] (15 items)
         for i in 0..15 {
             ids.push(i);
-            // ⚡ FIX: Add noise to prevent K-Means Singularity error
+            // ⚡ FIX: Add noise to stabilize K-Means
             let noise = (i as f32) * 0.001;
             vecs.push(vec![0.0 + noise, 0.0 + noise]);
         }
-        // 2. Cluster B: ~[100,100] (35 items) - The Drift
+        // 2. Cluster B: Around [100,100] (35 items) - The Drift
         for i in 15..50 {
             ids.push(i);
             // ⚡ FIX: Add noise
@@ -377,6 +379,7 @@ mod tests {
             vecs.push(vec![100.0 + noise, 100.0 + noise]);
         }
 
+        // Force L1 Write
         index
             .force_register_bucket_with_ids(0, &ids, &vecs)
             .await
@@ -385,13 +388,14 @@ mod tests {
         let initial_buckets = index.get_all_bucket_headers();
         assert_eq!(initial_buckets.len(), 1, "Should start with 1 bucket");
 
+        // Janitor with fast polling
         let janitor = Janitor::new(index.clone(), persistence, 1000, Duration::from_millis(10));
         let j_handle = tokio::spawn(async move { janitor.run().await });
 
         println!("--- INDUCING DRIFT ---");
 
+        // Wait for split (Bucket Count >= 2)
         let split_happened = wait_for_condition(Duration::from_secs(5), || {
-            // Bump timeout slightly
             let idx = index.clone();
             async move {
                 let buckets = idx.get_all_bucket_headers();
@@ -411,6 +415,7 @@ mod tests {
             final_buckets.len()
         );
 
+        // Verify Search works on both clusters
         let res_near = index
             .search_async(&vec![0.0, 0.0], 1, 0.9, 1.0, 100.0)
             .await

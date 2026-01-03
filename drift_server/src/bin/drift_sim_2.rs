@@ -202,8 +202,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Initial Training
     println!("\n📚 Phase 1: Training...");
-    let train_batch = world.generate_batch(2000, next_id);
+    let mut train_batch = world.generate_batch(2000, next_id);
     next_id += 2000;
+
+    if !train_batch.is_empty() {
+        // Anchor Low
+        train_batch[0].values = vec![-500.0; args.dim];
+        // Anchor High (Drift moves +100, let's give room for +1000)
+        train_batch[1].values = vec![1500.0; args.dim];
+    }
 
     for v in &train_batch {
         shadow_db.push((v.id, v.values.clone()));

@@ -14,7 +14,7 @@ impl StorageFactory {
     }
 
     fn build_fs(config: &FileConfig, scope: &str) -> io::Result<Operator> {
-        let mut builder = services::Fs::default();
+        let builder = services::Fs::default();
 
         // Isolation: Root = base_path / collection_name
         // e.g., ./data/my_collection
@@ -23,7 +23,7 @@ impl StorageFactory {
         std::fs::create_dir_all(&root)?;
 
         let op = Operator::new(builder.root(&root.to_string_lossy()))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .finish();
         Ok(op)
     }

@@ -12,7 +12,7 @@ use parking_lot::{Mutex, RwLock};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{error, instrument};
@@ -23,6 +23,17 @@ pub enum MaintenanceStatus {
     SkippedSingularity,
     SkippedTooSmall,
     SkippedLocked,
+}
+
+impl MaintenanceStatus {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            MaintenanceStatus::Completed => "Completed",
+            MaintenanceStatus::SkippedSingularity => "Skipped Singularity",
+            MaintenanceStatus::SkippedTooSmall => "Skipped Too Small",
+            MaintenanceStatus::SkippedLocked => "SkippedLocked",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -447,10 +458,9 @@ impl VectorIndex {
                     crate::math::l2_sq(query, &a.centroid)
                         .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
                         .unwrap_or(CmpOrdering::Equal)
-                }) {
-                    if !headers.iter().any(|h| h.id == best.id) {
-                        headers.push((*best).clone());
-                    }
+                }) && !headers.iter().any(|h| h.id == best.id)
+                {
+                    headers.push((*best).clone());
                 }
 
                 // Update "Heat" for Urgency Calculation
@@ -1495,30 +1505,27 @@ impl VectorIndex {
     pub async fn register_partitions(
         &self,
         partitions: &[PartitionResult],
-        segment_id: &str, // Not strictly used for logic, but good for tracing
+        segment_id: &str,
+        offsets: &HashMap<u32, (u64, u32)>,
     ) -> io::Result<()> {
-        let dim = self.config.dim;
+        let _dim = self.config.dim; // Unused now
+        let segment_filename = format!("segment_{}.drift", segment_id);
 
         for p in partitions {
-            let bucket_data = BucketData {
-                codes: AlignedBytes::from_slice(&p.codes),
-                vids: p.ids.clone(),
-                tombstones: bit_set::BitSet::with_capacity(p.ids.len()),
-            };
+            let (off, len) = offsets
+                .get(&p.bucket_id)
+                .ok_or(io::Error::other("Missing offset"))?;
 
-            // 2. Write to BlockCache (Local NVMe)
-            // This ensures immediate availability without re-downloading from S3
-            let bytes = bucket_data.to_bytes(dim)?;
+            // 1. Register the File Mapping
             self.cache
                 .storage()
-                .write_page(p.bucket_id, 0, &bytes)
-                .await?;
+                .register_file(p.bucket_id, PathBuf::from(&segment_filename));
 
-            // 3. Update Maps
+            // 2. Update Maps
             let page_id = PageId {
                 file_id: p.bucket_id,
-                offset: 0,
-                length: bytes.len() as u32,
+                offset: *off,
+                length: *len,
             };
 
             self.update_buckets(|b| {
@@ -1545,7 +1552,7 @@ impl VectorIndex {
                 new
             });
 
-            // 4. Update KV Index
+            // 3. Update KV Index
             for &vid in &p.ids {
                 let _ = self.kv.put(&vid.to_le_bytes(), &p.bucket_id.to_le_bytes());
             }
