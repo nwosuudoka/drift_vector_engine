@@ -2,6 +2,7 @@
 mod tests {
     use crate::index::{IndexOptions, VectorIndex};
     use crate::memtable::MemTable;
+    use crate::memtable::MemTableSnapshot;
     use drift_cache::local_store::LocalDiskManager;
     use std::sync::Arc;
     use std::time::Duration;
@@ -41,7 +42,7 @@ mod tests {
         memtable.insert(3, &vec![1.0, 1.0]);
 
         // Search near [0,0]
-        let results = memtable.search(&vec![0.1, 0.1], 2, 40);
+        let results = memtable.search(&vec![0.1, 0.1], 2);
         assert!(results.len() >= 2);
 
         // Closest should be ID 1 (dist ~0.02) or ID 3 (dist ~1.62)
@@ -50,7 +51,7 @@ mod tests {
 
         // Test Delete
         memtable.delete(1);
-        let results_after = memtable.search(&vec![0.1, 0.1], 2, 40);
+        let results_after = memtable.search(&vec![0.1, 0.1], 2);
         assert!(
             !results_after.iter().any(|(id, _)| *id == 1),
             "Deleted item 1 found"
@@ -145,5 +146,47 @@ mod tests {
         });
 
         let _ = tokio::join!(writer, reader);
+    }
+
+    #[test]
+    fn test_memtable_flat_buffer_alignment() {
+        const DIM: usize = 4;
+        let memtable = MemTable::new(10, DIM, 0, 0);
+
+        // Insert recognizable patterns
+        memtable.insert(1, &[1.0, 1.1, 1.2, 1.3]);
+        memtable.insert(2, &[2.0, 2.1, 2.2, 2.3]);
+
+        assert_eq!(memtable.len(), 2);
+
+        // Verify internal search finds exact matches
+        let results = memtable.search(&[1.0, 1.1, 1.2, 1.3], 1);
+        assert_eq!(results[0].0, 1);
+        assert!(results[0].1 < 1e-6);
+    }
+
+    #[test]
+    fn test_snapshot_zero_copy_integrity() {
+        const DIM: usize = 4;
+        let memtable = MemTable::new(100, DIM, 0, 0);
+        for i in 0..50 {
+            memtable.insert(i as u64, &[i as f32; DIM]);
+        }
+
+        // ⚡ Perform the hardware-native freeze
+        let snapshot = memtable.freeze_snapshot();
+
+        // 1. Verify IDs are preserved
+        assert_eq!(snapshot.ids.len(), 50);
+        assert_eq!(snapshot.ids[10], 10);
+
+        // 2. Verify Vectors are contiguous (Offset = Index * DIM)
+        assert_eq!(snapshot.vectors[10 * DIM], 10.0);
+        assert_eq!(snapshot.vectors[10 * DIM + (DIM - 1)], 10.0);
+
+        // 3. Verify search on immutable snapshot
+        let query = vec![25.0; DIM];
+        let hits = snapshot.search(&query, 1);
+        assert_eq!(hits[0].0, 25);
     }
 }
