@@ -197,4 +197,152 @@ mod tests {
             Ok(_) => panic!("Should have failed"),
         }
     }
+
+    #[test]
+    fn test_prepare_bucket_data_with_flat_buffer() {
+        let dim = 2;
+
+        // 1. Setup "MemTable" Data (3 vectors)
+        // ID 0: [1.0, 1.0]
+        // ID 1: [2.0, 2.0]
+        // ID 2: [3.0, 3.0]
+        let flat_data = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+
+        // 2. Partition Choice: We want ID 0 and ID 2 (Skip 1)
+        let indices = vec![0, 2];
+        let vids = vec![100, 300]; // IDs corresponding to indices 0 and 2
+
+        // 3. Setup Bucket Struct (Mocking what Index does)
+        let bucket = BucketData {
+            codes: AlignedBytes::new(4), // Dummy codes
+            vids: vids.clone(),
+            tombstones: BitSet::new(),
+        };
+
+        // 4. Execute Preparation
+        let (idx_bytes, dat_bytes, count) =
+            SegmentWriter::prepare_bucket_data(1, &bucket, &flat_data, &indices, dim);
+
+        // 5. Assertions
+        assert_eq!(count, 2, "Should process 2 vectors");
+        assert!(!idx_bytes.is_empty(), "Index blob should not be empty");
+        assert!(!dat_bytes.is_empty(), "Data blob should not be empty");
+
+        // Verify Data Blob Structure: [Len][Col0] [Len][Col1]
+        // We know ALP overhead is non-zero, so checks are basic but ensuring validity
+        assert!(dat_bytes.len() > 8, "Data blob too small");
+    }
+}
+
+#[cfg(test)]
+mod round_trip_test {
+    use crate::disk_manager::DiskManager;
+    use crate::segment_reader::SegmentReader;
+    use crate::segment_writer::SegmentWriter;
+    use bit_set::BitSet;
+    use drift_core::aligned::AlignedBytes;
+    use drift_core::bucket::BucketData;
+    use opendal::{Operator, services};
+    use tempfile::tempdir;
+
+    // Helper to create a local filesystem operator
+    fn create_op(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
+    #[tokio::test]
+    async fn test_segment_read_write_roundtrip_flat_buffer() {
+        let dir = tempdir().unwrap();
+        let op = create_op(dir.path());
+        let filename = "roundtrip.drift";
+        let dim = 2;
+
+        // 1. Prepare Mock Data (Flat Buffer Layout)
+        // 3 Vectors: [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]
+        let flat_data: Vec<f32> = vec![
+            1.0, 1.0, // Index 0 (ID 100)
+            2.0, 2.0, // Index 1 (ID 200) - We will SKIP this one
+            3.0, 3.0, // Index 2 (ID 300)
+        ];
+
+        // We only want to persist Index 0 and Index 2 (Cluster A)
+        let indices = vec![0, 2];
+        let vids = vec![100, 300];
+
+        // Mock BucketData (SQ8 codes would be here in a real scenario)
+        // We just put dummy bytes for the SQ8 part
+        let bucket_data = BucketData {
+            codes: AlignedBytes::from_slice(&[0xAA, 0xAA, 0xCC, 0xCC]), // 4 bytes (2 vectors * 2 dim)
+            vids: vids.clone(),
+            tombstones: BitSet::new(),
+        };
+
+        let quantizer_metadata = vec![1, 2, 3, 4]; // Dummy Quantizer
+
+        // --- WRITE PHASE ---
+        {
+            let manager = DiskManager::new(op.clone(), filename.to_string());
+            let mut writer = SegmentWriter::new(manager, quantizer_metadata.clone())
+                .await
+                .unwrap();
+
+            // 1. Prepare the blob using the Zero-Copy helper
+            let (idx_bytes, dat_bytes, _count) = SegmentWriter::prepare_bucket_data(
+                1, // Bucket ID
+                &bucket_data,
+                &flat_data,
+                &indices,
+                dim,
+            );
+
+            // 2. Write the pre-compressed blobs
+            writer
+                .write_pre_compressed_partition(1, idx_bytes, dat_bytes, &vids)
+                .await
+                .unwrap();
+
+            writer.finalize().await.unwrap();
+        }
+
+        // --- READ PHASE ---
+        let reader = SegmentReader::open_with_op(op.clone(), filename)
+            .await
+            .expect("Failed to open segment");
+
+        // 1. Verify Global Metadata
+        assert_eq!(reader.read_metadata(), &quantizer_metadata);
+
+        // 2. Verify Bloom Filter
+        assert!(reader.might_contain(100));
+        assert!(reader.might_contain(300));
+        assert!(!reader.might_contain(200)); // We skipped this ID
+
+        // 3. Verify Hot Path (SQ8 Bucket)
+        let (read_ids, read_codes) = reader
+            .read_bucket(1)
+            .await
+            .expect("Failed to read bucket index");
+        assert_eq!(read_ids, vids);
+        // Expect codes we passed in: [0xAA, 0xAA, 0xCC, 0xCC]
+        assert_eq!(read_codes, vec![0xAA, 0xAA, 0xCC, 0xCC]);
+
+        // 4. Verify Cold Path (High Fidelity ALP)
+        // This is the critical check for transpose_subset logic
+        let vectors = reader
+            .read_bucket_high_fidelity(1)
+            .await
+            .expect("Failed to read ALP data");
+
+        assert_eq!(vectors.len(), 2);
+
+        // Vector 0 (Should match original Index 0: [1.0, 1.0])
+        assert_eq!(vectors[0][0], 1.0);
+        assert_eq!(vectors[0][1], 1.0);
+
+        // Vector 1 (Should match original Index 2: [3.0, 3.0])
+        assert_eq!(vectors[1][0], 3.0);
+        assert_eq!(vectors[1][1], 3.0);
+    }
 }

@@ -7,7 +7,14 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    // Helper to create an index with storage
+    // --- Helpers ---
+
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
     fn create_index_with_storage(dir: &std::path::Path, wal_name: &str) -> Arc<VectorIndex> {
         let wal_path = dir.join(wal_name);
         let storage_path = dir.join("storage");
@@ -25,33 +32,35 @@ mod tests {
         Arc::new(VectorIndex::new(options, &wal_path, storage).unwrap())
     }
 
+    // --- Tests ---
+
     #[tokio::test]
     async fn test_end_to_end_persistence_lifecycle() {
         let dir = tempdir().unwrap();
-        // ⚡ CHANGE: Build the Operator manually for the test
-        let mut builder = services::Fs::default();
-        builder = builder.root(dir.path().to_str().unwrap());
-        let op = Operator::new(builder).unwrap().finish();
-
-        // ⚡ CHANGE: Inject Operator into Manager
+        let op = create_local_operator(dir.path());
         let persistence = PersistenceManager::new(op, dir.path());
         let index_original = create_index_with_storage(dir.path(), "current.wal");
 
-        // Train
-        let train_data = vec![vec![10.0, 10.0], vec![-10.0, -10.0]];
-        index_original.train(&train_data).await.unwrap();
+        // 1. Train & Fill MemTable
+        let train_vecs: Vec<Vec<f32>> = (0..50).map(|_| vec![10.0, 10.0]).collect();
+        for (i, vec) in train_vecs.iter().enumerate() {
+            index_original.insert(i as u64, vec).unwrap();
+        }
 
-        // 1. Snapshot L1 (Partitioned Flush)
-        // We manually trigger the calculation to get partitions
-        let ids: Vec<u64> = (0..50).collect();
-        let vectors: Vec<Vec<f32>> = (0..50).map(|_| vec![10.0, 10.0]).collect();
+        // 2. Snapshot (Zero-Copy)
+        let memtable = index_original.memtable.read().clone();
 
-        let partitions = index_original
-            .calculate_partitions(&ids, &vectors)
-            .await
-            .unwrap();
+        index_original.train_from_memtable(&memtable).await.unwrap();
 
-        // Write Segment
+        let partitions = index_original.partition_memtable(&memtable).unwrap();
+
+        // 3. Write Segment
+        // We mock the freeze so persistence can access data via the "Frozen" slot
+        {
+            let mut guard = index_original.frozen_memtable.write();
+            *guard = Some(memtable.clone());
+        }
+
         let (run_id, _locations) = persistence
             .write_partitioned_segment(&partitions, &index_original)
             .await
@@ -59,46 +68,99 @@ mod tests {
 
         let segment_key = format!("segment_{}.drift", run_id);
 
-        // "Crash"
-        drop(index_original);
-
-        // 2. Recover
+        // 4. Recover Specific Segment
         let index_recovered = persistence
             .load_from_segment(&segment_key)
             .await
             .expect("Load failed");
 
-        // 3. Verify L1 Recovery
-        // We wrote 50 items at [10.0, 10.0]. They should be searchable.
+        // 5. Verify L1 Recovery
         let results = index_recovered
             .search_async(&vec![10.0, 10.0], 5, 0.9, 1.0, 10.0)
             .await
             .unwrap();
 
         assert_eq!(results.len(), 5, "Failed to recover L1 data from segment");
+        assert!(results[0].distance < 0.02);
+    }
 
-        // Verify Data Fidelity
-        let top_dist = results[0].distance;
-        assert!(
-            top_dist < 0.02,
-            "Recovered distance too high: {}. Expected near 0.0",
-            top_dist
-        );
+    #[tokio::test]
+    async fn test_full_index_hydration_recovery() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op, dir.path());
 
-        println!("Persistence Lifecycle Passed!");
+        // --- PHASE 1: Create and Persist Data ---
+        {
+            let index = create_index_with_storage(dir.path(), "run1.wal");
+
+            // ⚡ FIX: Use distinct data so ranking is deterministic.
+            for i in 0..50 {
+                // ID 0 = [10.0, 10.0]
+                // ID 1 = [10.1, 10.1]
+                let val = 10.0 + (i as f32 * 0.1);
+                index.insert(i, &vec![val, val]).unwrap();
+            }
+
+            // Prepare Flush
+            let memtable = index.memtable.read().clone();
+            index.train_from_memtable(&memtable).await.unwrap();
+
+            // ⚡ SYNC Partition (Updated API)
+            let partitions = index.partition_memtable(&memtable).unwrap();
+
+            // Freeze
+            {
+                *index.frozen_memtable.write() = Some(memtable);
+            }
+
+            // Write Segment 1
+            persistence
+                .write_partitioned_segment(&partitions, &index)
+                .await
+                .unwrap();
+        }
+        // Index 1 is dropped here. RAM is clear.
+
+        // --- PHASE 2: Hydration (Server Restart) ---
+
+        // 1. Create a FRESH, empty index
+        let new_index = create_index_with_storage(dir.path(), "run2.wal");
+
+        // 2. Hydrate
+        persistence
+            .hydrate_index(&new_index)
+            .await
+            .expect("Hydration failed");
+
+        // 3. Verify
+        let headers_after = new_index.get_all_bucket_headers();
+        assert!(!headers_after.is_empty(), "Buckets were not restored");
+
+        // 4. Search for the exact vector of ID 0
+        let results = new_index
+            .search_async(&vec![10.0, 10.0], 5, 0.9, 1.0, 10.0)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 5, "Hydrated index returned no results");
+
+        // ⚡ NOW THIS IS SAFE: ID 0 is strictly the closest vector.
+        assert_eq!(results[0].id, 0, "Top result should be ID 0");
+        assert!(results[0].distance < 0.001, "Distance should be near zero");
     }
 
     #[tokio::test]
     async fn test_flush_memtable_l0_persistence() {
         let dir = tempdir().unwrap();
-        let mut builder = services::Fs::default();
-        builder = builder.root(dir.path().to_str().unwrap());
-        let op = Operator::new(builder).unwrap().finish();
-
+        let op = create_local_operator(dir.path());
         let persistence = PersistenceManager::new(op, dir.path());
         let index = create_index_with_storage(dir.path(), "l0.wal");
 
-        index.train(&vec![vec![1.0, 1.0]]).await.unwrap();
+        index.insert(0, &vec![1.0, 1.0]).unwrap();
+
+        let memtable = index.memtable.read().clone();
+        index.train_from_memtable(&memtable).await.unwrap();
 
         let data = vec![(100, vec![1.0, 1.0]), (200, vec![2.0, 2.0])];
 

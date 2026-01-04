@@ -34,139 +34,6 @@ impl PersistenceManager {
         }
     }
 
-    // pub async fn flush_to_segment(
-    //     &self,
-    //     index: &VectorIndex,
-    //     run_id: &str,
-    // ) -> std::io::Result<String> {
-    //     // Returns object key (filename)
-    //     let file_name = format!("segment_{}.drift", run_id);
-
-    //     let quantizer_arc = index.get_quantizer().ok_or(std::io::Error::new(
-    //         std::io::ErrorKind::InvalidInput,
-    //         "Untrained",
-    //     ))?;
-    //     let q_bytes = bincode::encode_to_vec(&*quantizer_arc, bincode::config::standard())
-    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    //     // ⚡ Use DI: DiskManager::new(op, path)
-    //     let manager = DiskManager::new(self.op.clone(), file_name.clone());
-    //     let mut writer = SegmentWriter::new(manager, q_bytes).await?;
-
-    //     let headers = index.get_all_bucket_headers();
-    //     for header in headers {
-    //         if let Ok(data) = index.cache.get(&header.page_id).await
-    //             && !data.vids.is_empty()
-    //         {
-    //             writer
-    //                 .write_bucket_sq8(
-    //                     header.id,
-    //                     &data.vids,
-    //                     data.codes.as_slice(),
-    //                     index.config.dim,
-    //                 )
-    //                 .await?;
-    //         }
-    //     }
-    //     writer.finalize().await?;
-    //     Ok(file_name)
-    // }
-
-    // pub async fn flush_memtable_to_segment(
-    //     &self,
-    //     data: &[(u64, Vec<f32>)],
-    //     index: &VectorIndex,
-    //     run_id: &str,
-    // ) -> std::io::Result<String> {
-    //     let file_name = format!("segment_l0_{}.drift", run_id);
-
-    //     let quantizer_arc = index.get_quantizer().ok_or(std::io::Error::new(
-    //         std::io::ErrorKind::InvalidInput,
-    //         "Untrained",
-    //     ))?;
-    //     let q_bytes = bincode::encode_to_vec(&*quantizer_arc, bincode::config::standard())
-    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    //     // ⚡ Use DI
-    //     let manager = DiskManager::new(self.op.clone(), file_name.clone());
-    //     let mut writer = SegmentWriter::new(manager, q_bytes).await?;
-
-    //     let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
-    //     let vecs: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
-
-    //     if !vecs.is_empty() {
-    //         let dim = index.config.dim;
-    //         let mut flat_codes = Vec::with_capacity(vecs.len() * dim);
-    //         for v in &vecs {
-    //             flat_codes.extend_from_slice(&quantizer_arc.encode(v));
-    //         }
-
-    //         writer
-    //             .write_bucket_dual(0, &ids, &vecs, &flat_codes, dim)
-    //             .await?;
-    //     }
-
-    //     writer.finalize().await?;
-    //     Ok(file_name)
-    // }
-
-    // Note: 'path' here is a relative object key string, not a PathBuf
-    // pub async fn load_from_segment(&self, object_key: &str) -> std::io::Result<VectorIndex> {
-    //     // ⚡ Use DI: SegmentReader must act on the injected operator
-    //     // We will add a helper to SegmentReader to accept (Operator, path)
-    //     let reader = SegmentReader::open_with_op(self.op.clone(), object_key).await?;
-
-    //     let q_bytes = reader.read_metadata();
-    //     let (quantizer, _): (Quantizer, usize) =
-    //         bincode::decode_from_slice(q_bytes, bincode::config::standard()).map_err(|_| {
-    //             std::io::Error::new(std::io::ErrorKind::InvalidData, "Corrupt Quantizer")
-    //         })?;
-    //     let dim = quantizer.min.len();
-
-    //     // Use default options for recovery
-    //     let options = IndexOptions {
-    //         dim,
-    //         num_centroids: 0,
-    //         training_sample_size: 0,
-    //         max_bucket_capacity: 1000,
-    //         ..Default::default()
-    //     };
-
-    //     // Rebuild storage layout
-    //     let storage_path = self.local_base_path.join("storage");
-    //     std::fs::create_dir_all(&storage_path)?;
-
-    //     // Use DriftPageManager with the same Operator!
-    //     let storage = Arc::new(DriftPageManager::new(self.op.clone()));
-    //     let wal_path = self.local_base_path.join("current.wal");
-
-    //     let index = VectorIndex::new(options, &wal_path, storage)?;
-    //     index.set_quantizer(quantizer.clone());
-
-    //     let bucket_ids: Vec<u32> = reader.index.buckets.keys().cloned().collect();
-    //     for id in bucket_ids {
-    //         let vectors = match reader.read_bucket_high_fidelity(id).await {
-    //             Ok(v) => v,
-    //             Err(_) => {
-    //                 info!("Recovering bucket {} from SQ8", id);
-    //                 let (_, codes) = reader.read_bucket(id).await?;
-    //                 let count = codes.len() / dim;
-    //                 let mut rec_vecs = Vec::with_capacity(count);
-    //                 for i in 0..count {
-    //                     let start = i * dim;
-    //                     rec_vecs.push(quantizer.reconstruct(&codes[start..start + dim]));
-    //                 }
-    //                 rec_vecs
-    //             }
-    //         };
-    //         let (ids, _) = reader.read_bucket(id).await?;
-    //         index
-    //             .force_register_bucket_with_ids(id, &ids, &vectors)
-    //             .await?;
-    //     }
-    //     Ok(index)
-    // }
-
     pub async fn hydrate_index(&self, index: &VectorIndex) -> std::io::Result<()> {
         // List files from the Operator
         let _lister = self.op.lister("").await.map_err(std::io::Error::other)?;
@@ -295,52 +162,6 @@ impl PersistenceManager {
         // Return the RUN_ID (raw UUID), not the filename.
         // The Janitor uses this ID to name related files (like tombstones).
         Ok(run_id)
-    }
-
-    /// This is the primary path used by the Janitor.
-    pub async fn write_partitioned_segment_2(
-        &self,
-        partitions: &[PartitionResult],
-        index: &VectorIndex,
-    ) -> std::io::Result<(String, HashMap<u32, BucketLocation>)> {
-        let run_id = uuid::Uuid::new_v4().to_string();
-        let file_name = format!("segment_{}.drift", run_id);
-
-        let quantizer_arc = index
-            .get_quantizer()
-            .ok_or(std::io::Error::other("Untrained"))?;
-        let q_bytes = bincode::encode_to_vec(&*quantizer_arc, bincode::config::standard())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        let manager = DiskManager::new(self.op.clone(), file_name.clone());
-        let mut writer = SegmentWriter::new(manager, q_bytes).await?;
-
-        for p in partitions {
-            // Reconstruct the BucketData object for the writer
-            // This ensures we have the correct structure for to_bytes()
-            let bucket_data = BucketData {
-                codes: AlignedBytes::from_slice(&p.codes),
-                vids: p.ids.clone(),
-                tombstones: BitSet::with_capacity(p.ids.len()),
-            };
-
-            writer
-                .write_partition(
-                    p.bucket_id,
-                    &bucket_data, // ⚡ Pass full struct (Format Source of Truth)
-                    &p.vectors,   // Raw floats for ALP
-                    index.config.dim,
-                )
-                .await?;
-        }
-
-        let location = writer.finalize().await?;
-        info!(
-            "Persistence: Wrote segment {} with {} buckets",
-            file_name,
-            partitions.len()
-        );
-        Ok((run_id, location))
     }
 
     /// Updated to use `write_partition` to ensure format consistency.
@@ -495,7 +316,6 @@ impl PersistenceManager {
         Ok(all_deleted)
     }
 
-    // TODO: integrate this
     pub async fn write_partitioned_segment(
         &self,
         partitions: &[PartitionResult],
@@ -503,31 +323,47 @@ impl PersistenceManager {
     ) -> std::io::Result<(String, HashMap<u32, BucketLocation>)> {
         let run_id = uuid::Uuid::new_v4().to_string();
         let file_name = format!("segment_{}.drift", run_id);
-        let dim = index.config.dim;
 
         info!(
             "Persistence: Step 4.1 - Parallel ALP Encoding for {} partitions",
             partitions.len()
         );
 
-        // ⚡ PARALLEL PHASE: Use Rayon to compress all buckets at once
-        let prepared_buckets: Vec<(u32, Vec<u8>, Vec<u8>, usize)> = partitions
-            .par_iter()
-            .map(|p| {
-                let bucket_data = BucketData {
-                    codes: AlignedBytes::from_slice(&p.codes),
-                    vids: p.ids.clone(),
-                    tombstones: bit_set::BitSet::with_capacity(p.ids.len()),
-                };
-                let (idx_b, dat_b, count) =
-                    SegmentWriter::prepare_bucket_data(p.bucket_id, &bucket_data, &p.vectors, dim);
-                (p.bucket_id, idx_b, dat_b, count)
-            })
-            .collect();
+        // ⚡ FIX: We introduce this block to restrict the lifetime of the locks.
+        // The locks (frozen_guard, data_guard) will be dropped at the closing brace '};'
+        let prepared_buckets: Vec<(u32, Vec<u8>, Vec<u8>, Vec<u64>)> = {
+            // 1. Acquire Locks
+            let frozen_guard = index.frozen_memtable.read();
+            let memtable = frozen_guard
+                .as_ref()
+                .expect("Flush called but no frozen memtable");
+            let (_, data_guard, _) = memtable.get_data_guards();
+
+            // 2. CPU Heavy Work (Rayon) - Synchronous, no .await here
+            partitions
+                .par_iter()
+                .map(|p| {
+                    let bucket_data = BucketData {
+                        codes: AlignedBytes::from_slice(&p.codes),
+                        vids: p.ids.clone(),
+                        tombstones: bit_set::BitSet::with_capacity(p.ids.len()),
+                    };
+                    let (idx_b, dat_b, _count) = SegmentWriter::prepare_bucket_data(
+                        p.bucket_id,
+                        &bucket_data,
+                        &data_guard, // Safe to access here
+                        &p.indices,
+                        index.config.dim,
+                    );
+                    (p.bucket_id, idx_b, dat_b, p.ids.clone())
+                })
+                .collect()
+        }; // <--- 🔓 LOCKS ARE DROPPED HERE. Future is now Send!
 
         info!("Persistence: Step 4.2 - Sequential Disk Write");
 
-        // 💾 SEQUENTIAL PHASE: Write prepared bytes to disk
+        // 3. Async Disk I/O
+        // We can safely await here because we no longer hold any non-Send guards.
         let quantizer_arc = index
             .get_quantizer()
             .ok_or(std::io::Error::other("Untrained"))?;
@@ -537,11 +373,10 @@ impl PersistenceManager {
         let manager = DiskManager::new(self.op.clone(), file_name.clone());
         let mut writer = SegmentWriter::new(manager, q_bytes).await?;
 
-        for (bid, idx_bytes, dat_bytes, count) in prepared_buckets {
-            // We need a small helper in SegmentWriter to write pre-compressed blobs
+        for (bid, idx_bytes, dat_bytes, ids) in prepared_buckets {
             writer
-                .write_pre_compressed_partition(bid, idx_bytes, dat_bytes, count)
-                .await?;
+                .write_pre_compressed_partition(bid, idx_bytes, dat_bytes, &ids)
+                .await?; // ✅ Safe await
         }
 
         let location = writer.finalize().await?;

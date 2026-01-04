@@ -10,14 +10,12 @@ mod tests {
     use tempfile::tempdir;
 
     // --- Helpers ---
-
     fn create_local_operator(path: &std::path::Path) -> Operator {
         let mut builder = services::Fs::default();
         builder = builder.root(path.to_str().unwrap());
         Operator::new(builder).unwrap().finish()
     }
 
-    // --- Setup ---
     async fn setup_index(dir: &std::path::Path) -> Arc<VectorIndex> {
         let wal_path = dir.join("test.wal");
         let storage_path = dir.join("storage");
@@ -34,32 +32,52 @@ mod tests {
         };
 
         let index = Arc::new(VectorIndex::new(options, &wal_path, storage).unwrap());
-
-        // Train initializes the Quantizer and creates Bucket 0 (Training Data)
         let train_data = vec![vec![0.0, 0.0]; 10];
         index.train(&train_data).await.unwrap();
-
         index
     }
 
-    // ⚡ HELPER: Returns the ID of the bucket it just created
+    // ⚡ HELPER: Flushes memtable to L1 and returns the created bucket ID
     async fn flush_to_bucket(index: &Arc<VectorIndex>) -> u32 {
-        let data = index.rotate_memtable().expect("Failed to rotate memtable");
+        // 1. Rotate
+        let memtable = index
+            .rotate_and_freeze()
+            .unwrap()
+            .expect("Failed to rotate");
 
-        if data.is_empty() {
-            // Should not happen in these tests, but handle gracefully
+        if memtable.len() == 0 {
             panic!("flush_to_bucket called with empty memtable");
         }
 
-        let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
-        let vecs: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
+        // 2. Partition (Sync)
+        let partitions = index.partition_memtable(&memtable).unwrap();
 
-        // Register Bucket
-        let bucket_id = index.allocate_next_bucket_id();
+        // For testing scavenger, we don't strictly need to write to disk if we use force_register,
+        // BUT force_register requires raw vectors.
+        // Let's extract them from the partitions.
+
+        // Note: PartitionResult now contains INDICES. We need to look up vectors.
+        // But force_register expects vectors.
+        // We can cheat and read from memtable using the indices.
+
+        let p = &partitions[0]; // Assuming 1 bucket for this test
+        let (_ids_guard, data_guard, _) = memtable.get_data_guards();
+
+        let mut vecs = Vec::new();
+        for &idx in &p.indices {
+            let start = idx * 2; // dim 2
+            vecs.push(data_guard[start..start + 2].to_vec());
+        }
+
+        // Register
+        let bucket_id = p.bucket_id; // Use the ID allocated by partitioner
         index
-            .force_register_bucket_with_ids(bucket_id, &ids, &vecs)
+            .force_register_bucket_with_ids(bucket_id, &p.ids, &vecs)
             .await
             .unwrap();
+
+        // Clean up frozen slot
+        index.confirm_flush().unwrap();
 
         bucket_id
     }
@@ -88,21 +106,20 @@ mod tests {
             "Memory should hold deletes before scavenge"
         );
 
-        // 3. Get Headers deterministically
+        // 3. Verify Stats
         let headers = index.get_all_bucket_headers();
         let header = headers
             .iter()
             .find(|h| h.id == target_bucket)
             .expect("Target bucket not found");
 
-        // Pre-check: Stats update
         let dead = header
             .stats
             .tombstone_count
             .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(dead, 20, "Bucket stats should reflect deletions");
 
-        // 4. EXECUTE COMPACTION on the correct bucket
+        // 4. EXECUTE COMPACTION
         let purged_ids = index.compact_bucket(target_bucket).await.unwrap().unwrap();
         assert_eq!(
             purged_ids.len(),

@@ -8,50 +8,65 @@ pub struct Quantizer {
 }
 
 impl Quantizer {
-    /// Train the quantizer using Percentile Clipping (1% - 99%) for sufficient data.
-    /// This handles "Soap Bubble" distributions where outliers skew the grid,
-    /// while preserving exact range for small datasets (<100 items).
-    pub fn train(data: &[Vec<f32>]) -> Self {
+    /// Train the quantizer using a flat buffer of vectors.
+    /// Uses Percentile Clipping (1% - 99%) to ignore outliers[cite: 81, 423].
+    ///
+    /// # Performance
+    /// * **Input:** Flat slice `&[f32]` (Zero-Copy input).
+    /// * **Memory:** O(N) allocation *per column* (reused), not O(N*D).
+    ///   For 1M vectors, this uses ~4MB temporary RAM instead of ~512MB.
+    pub fn train(data: &[f32], dim: usize) -> Self {
         if data.is_empty() {
             panic!("Cannot train quantizer on empty data");
         }
+        assert_eq!(data.len() % dim, 0, "Data length must be a multiple of dim");
 
-        let dim = data[0].len();
+        let count = data.len() / dim;
         let mut min = vec![0.0; dim];
         let mut max = vec![0.0; dim];
         let mut scale = vec![0.0; dim];
 
-        for i in 0..dim {
-            let mut column: Vec<f32> = data.iter().map(|v| v[i]).collect();
-            // Sort to find percentiles (Handle NaNs)
-            column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let len = column.len();
+        // Reusable buffer to avoid re-allocating for every dimension
+        let mut column_buffer = Vec::with_capacity(count);
 
-            // PUSH BACK: Only clip if we have enough data to form meaningful percentiles.
-            // If N < 100, "1%" is less than 1 item, so we shouldn't drop anything.
+        for d in 0..dim {
+            // 1. Extract Column (Strided Read)
+            column_buffer.clear();
+            for i in 0..count {
+                // Accessing the d-th component of the i-th vector
+                // Layout: [v0_d0, v0_d1, ... | v1_d0, v1_d1 ... ]
+                column_buffer.push(data[i * dim + d]);
+            }
+
+            // 2. Sort for Percentiles
+            // Handle NaNs by defaulting to Equal (treats NaN as equal to itself for sorting stability)
+            column_buffer.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            let len = column_buffer.len();
+
+            // 3. Percentile Logic (Restored from your code)
+            // If N < 100, we don't drop anything.
             let count_to_drop = if len >= 100 { len / 100 } else { 0 };
 
-            // Robust Indexing
             let p01_idx = count_to_drop.min(len - 1);
             let p99_idx = len
                 .saturating_sub(count_to_drop)
                 .saturating_sub(1)
                 .min(len - 1);
 
-            // Inversion Protection (Just in case)
             let actual_min_idx = p01_idx.min(p99_idx);
             let actual_max_idx = p01_idx.max(p99_idx);
 
-            let p_min = column[actual_min_idx];
-            let p_max = column[actual_max_idx];
+            let p_min = column_buffer[actual_min_idx];
+            let p_max = column_buffer[actual_max_idx];
 
-            min[i] = p_min;
-            max[i] = p_max;
+            min[d] = p_min;
+            max[d] = p_max;
 
-            // Calculate scale
-            let range = max[i] - min[i];
-            scale[i] = if range.abs() < 1e-6 {
-                1.0 // Prevent div by zero for constant dimensions
+            // 4. Calculate Scale
+            let range = p_max - p_min;
+            scale[d] = if range.abs() < 1e-6 {
+                1.0 // Constant dimension protection
             } else {
                 range / 255.0
             };
@@ -61,13 +76,16 @@ impl Quantizer {
     }
 
     /// Convert a float vector to SQ8 bytes.
-    /// Values outside the p1-p99 range are clamped.
+    /// Values outside the trained p1-p99 range are clamped.
     pub fn encode(&self, vec: &[f32]) -> Vec<u8> {
         let mut codes = Vec::with_capacity(vec.len());
-        for i in 0..vec.len() {
-            let val = (vec[i] - self.min[i]) / self.scale[i];
-            // Use round() to minimize quantization error (vs floor)
-            let byte = val.round().clamp(0.0, 255.0) as u8;
+        for (i, &val) in vec.iter().enumerate() {
+            // Formula: code = (val - min) / scale
+            let normalized = (val - self.min[i]) / self.scale[i];
+
+            // Use round() to minimize quantization error
+            // Clamp to u8 range [0, 255] handles outliers automatically
+            let byte = normalized.round().clamp(0.0, 255.0) as u8;
             codes.push(byte);
         }
         codes
@@ -106,8 +124,6 @@ impl Quantizer {
         }
         vec
     }
-
-    // in drift_core/src/quantizer.rs
 
     /// Asymmetric Distance Calculation (ADC)
     /// Computes distance between a precise Query (f32) and a quantized Code (u8).
