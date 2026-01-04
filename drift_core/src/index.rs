@@ -1592,53 +1592,6 @@ impl VectorIndex {
         memtable.len()
     }
 
-    // ⚡ Rotation Logic
-    // pub fn rotate_and_freeze(&self) -> io::Result<Option<Arc<MemTable>>> {
-    //     // 1. Check if frozen slot is empty (Backpressure)
-    //     let mut frozen_guard = self.frozen_memtable.write();
-    //     if frozen_guard.is_some() {
-    //         return Ok(None);
-    //     }
-
-    //     // 2. Lock WAL (Stops Inserts briefly)
-    //     let _wal = self.wal.lock();
-
-    //     // 3. Create New Active Table
-    //     let new_memtable = Arc::new(MemTable::new(
-    //         self.config.max_bucket_capacity * 10,
-    //         self.config.dim,
-    //         self.config.ef_construction,
-    //         16,
-    //     ));
-
-    //     // 4. Atomic Swap
-    //     // We swap the new table in and get the old one out in a single atomic step.
-    //     let guard = epoch::pin();
-    //     let new_owned = Owned::new(new_memtable);
-
-    //     let old_shared = self.memtable.swap(new_owned, Ordering::AcqRel, &guard);
-
-    //     // 5. Extract the Arc from the old pointer
-    //     // Safety: We successfully swapped it out, so we have the reference.
-    //     // We clone the inner Arc<MemTable> to hold it in the frozen slot.
-    //     let old_arc = unsafe { old_shared.as_ref() }
-    //         .expect("MemTable should not be null")
-    //         .clone();
-
-    //     // 6. Schedule cleanup of the old atomic wrapper
-    //     // The Atomic<Arc<...>> held a pointer to the Arc on the heap.
-    //     // We must defer deleting that pointer wrapper until all threads reading it are done.
-    //     unsafe { guard.defer_destroy(old_shared) };
-
-    //     // 7. Move Old Table to Frozen
-    //     *frozen_guard = Some(old_arc.clone());
-
-    //     // 8. Truncate WAL? NO!
-    //     // Data is only in memory. Do NOT truncate WAL yet.
-
-    //     Ok(Some(old_arc))
-    // } // WAL Lock released here.
-
     // Replace your current rotate_and_freeze with this:
     pub fn rotate_and_freeze(&self) -> io::Result<Option<Arc<MemTable>>> {
         // 1. Check if frozen slot is empty (Backpressure check)
@@ -1681,21 +1634,6 @@ impl VectorIndex {
         info!("MemTable Rotated. Ingestion can now resume on new table.");
         Ok(Some(old_memtable_arc))
     }
-
-    // Janitor calls this after disk IO is done.
-    // pub fn confirm_flush(&self) -> io::Result<()> {
-    //     let mut frozen_guard = self.frozen_memtable.write();
-
-    //     // 1. Clear Frozen Slot
-    //     *frozen_guard = None;
-
-    //     // 2. Truncate WAL
-    //     // Now that data is safely on disk segments, we can wipe the log.
-    //     let mut wal = self.wal.lock();
-    //     wal.truncate()?;
-
-    //     Ok(())
-    // }
 
     // Replace your current confirm_flush with this:
     pub fn confirm_flush(&self) -> io::Result<()> {
