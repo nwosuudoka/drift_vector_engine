@@ -169,4 +169,59 @@ impl SegmentWriter {
         self.current_offset += data.len() as u64;
         Ok(())
     }
+
+    pub fn prepare_bucket_data(
+        _bucket_id: u32,
+        bucket: &BucketData,
+        raw_vectors: &[Vec<f32>],
+        dim: usize,
+    ) -> (Vec<u8>, Vec<u8>, usize) {
+        // 1. Hot Index Bytes (SQ8) [cite: 3765, 3766]
+        let index_bytes = bucket.to_bytes(dim).unwrap();
+
+        // 2. Cold Data Bytes (ALP) - This is the CPU intensive part
+        let mut data_bytes = Vec::new();
+        let columns = crate::compression::wrapper::transpose(raw_vectors, dim);
+        for col_floats in columns {
+            let compressed = CompressedColumn::compress(
+                &col_floats,
+                crate::compression::wrapper::CompressionStrategy::AlpRd,
+            );
+            data_bytes.extend_from_slice(&(compressed.data.len() as u32).to_le_bytes());
+            data_bytes.extend_from_slice(&compressed.data);
+        }
+
+        (index_bytes, data_bytes, bucket.vids.len())
+    }
+
+    pub async fn write_pre_compressed_partition(
+        &mut self,
+        bucket_id: u32,
+        index_bytes: Vec<u8>,
+        data_bytes: Vec<u8>,
+        vector_count: usize,
+    ) -> io::Result<()> {
+        let idx_start = self.current_offset;
+        self.scratch_file.write_all(&index_bytes).await?;
+        self.current_offset += index_bytes.len() as u64;
+        let idx_len = self.current_offset - idx_start;
+
+        let dat_start = self.current_offset;
+        self.scratch_file.write_all(&data_bytes).await?;
+        self.current_offset += data_bytes.len() as u64;
+        let dat_len = self.current_offset - dat_start;
+
+        self.index.buckets.insert(
+            bucket_id,
+            BucketLocation {
+                index_offset: idx_start,
+                index_length: idx_len,
+                data_offset: dat_start,
+                data_length: dat_len,
+                vector_count,
+                compression_type: 1,
+            },
+        );
+        Ok(())
+    }
 }

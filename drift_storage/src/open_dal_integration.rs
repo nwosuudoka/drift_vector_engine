@@ -199,7 +199,7 @@ mod tests {
         // Write a segment with NO buckets
         {
             let manager = DiskManager::new(op.clone(), filename.to_string());
-            let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+            let writer = SegmentWriter::new(manager, vec![]).await.unwrap();
             writer.finalize().await.unwrap();
         }
 

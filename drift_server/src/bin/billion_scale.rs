@@ -39,8 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Anti-Fragmentation Strategy
     // We want 1-5 large segments, not 100 small ones.
-    let optimal_capacity = args.count.max(2000);
-    // let optimal_capacity = 600;
+    // let optimal_capacity = args.count.max(2000);
+    let optimal_capacity = 2000;
 
     let config = Config {
         port: 50099,
@@ -108,7 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while inserted < args.count {
         while coll.index.memtable_len() > 500_000 {
-            println!("   ✋ Backpressure: MemTable full. Waiting...");
+            let n = coll.index.memtable_len();
+
+            println!("   ✋ Backpressure: MemTable full. Waiting... {}", n);
             sleep(Duration::from_millis(500)).await;
         }
 

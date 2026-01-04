@@ -93,8 +93,9 @@ impl CollectionManager {
 
         const DEFAULT_CENTRIODS: usize = 16;
         const DEFAULT_TRAINING_SAMPLES: usize = 1000;
-        // num_centroids: 512,
-        // training_sample_size: 10_000,
+
+        // const DEFAULT_CENTRIODS: usize = 512;
+        // const DEFAULT_TRAINING_SAMPLES: usize = 10_000;
 
         let options = IndexOptions {
             dim,
