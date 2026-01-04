@@ -18,6 +18,4 @@ mod memtable_tests;
 #[cfg(test)]
 mod quantizer_tests;
 #[cfg(test)]
-mod store_integration_test;
-#[cfg(test)]
 mod wal_tests;

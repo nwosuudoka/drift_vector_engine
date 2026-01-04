@@ -139,7 +139,7 @@ mod tests {
                     .unwrap();
 
                 // Assert we found something or nothing, but didn't crash
-                assert!(results.len() >= 0);
+                assert!(results.len() > 0);
                 sleep(Duration::from_millis(2)).await;
             }
         });

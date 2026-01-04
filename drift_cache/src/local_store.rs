@@ -1,12 +1,9 @@
 use async_trait::async_trait;
 use drift_traits::{PageId, PageManager};
-use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Result;
 use std::os::unix::fs::FileExt; // Linux/Mac specific optimization
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::task;
 
 /// A Disk Manager optimized for NVMe Random Reads.

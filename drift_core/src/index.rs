@@ -1,5 +1,5 @@
 use crate::aligned::AlignedBytes;
-use crate::bucket::{Bucket, BucketData, BucketHeader, compute_distance_lut};
+use crate::bucket::{Bucket, BucketData, BucketHeader};
 use crate::kmeans::KMeansTrainer;
 use crate::memtable::MemTable;
 use crate::quantizer::Quantizer;
@@ -860,6 +860,183 @@ impl VectorIndex {
 
     // drift_core/src/index.rs
 
+    // pub async fn partition_and_flush(
+    //     &self,
+    //     ids: &[u64],
+    //     vectors: &[Vec<f32>],
+    // ) -> io::Result<Vec<u32>> {
+    //     if vectors.is_empty() {
+    //         return Ok(Vec::new());
+    //     }
+
+    //     // 1. Filter Tombstones
+    //     let deleted_snapshot = self.deleted_ids.read().clone();
+    //     let (valid_ids, valid_vecs): (Vec<u64>, Vec<Vec<f32>>) = ids
+    //         .iter()
+    //         .zip(vectors.iter())
+    //         .filter(|(id, _)| !deleted_snapshot.contains(id))
+    //         .map(|(id, vec)| (*id, vec.clone()))
+    //         .unzip();
+
+    //     if valid_ids.is_empty() {
+    //         return Ok(Vec::new());
+    //     }
+
+    //     // 2. Determine K (Number of Buckets)
+    //     let target_cap = self.config.max_bucket_capacity;
+    //     let num_vectors = valid_ids.len();
+
+    //     // ⚡ FIX 2: Hardened Partition Logic
+    //     // Old logic: ceil(N / (Target * 0.8)) -> caused under-partitioning (3 buckets for 5 clusters)
+
+    //     // Strategy A: Conservative Capacity (aim for 60% fill, not 80%)
+    //     let count_based_k = (num_vectors as f32 / (target_cap as f32 * 0.6)).ceil() as usize;
+
+    //     // Strategy B: Structural Heuristic
+    //     // Assume latent clusters are rarely larger than 200 items in this workload.
+    //     // This prevents cramming 1000 items into 2 buckets just because capacity allows it.
+    //     let heuristic_k = (num_vectors / 200).max(1);
+    //     // let heuristic_k = (num_vectors / 2000).max(1);
+
+    //     // Take the maximum to be safe
+    //     let k = count_based_k.max(heuristic_k).max(2);
+
+    //     // Fast Path for tiny data
+    //     if num_vectors <= target_cap && k == 1 {
+    //         let id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+    //         self.force_register_bucket_with_ids(id, &valid_ids, &valid_vecs)
+    //             .await?;
+    //         return Ok(vec![id]);
+    //     }
+
+    //     tracing::info!(
+    //         "Flush: Partitioning {} vectors into {} buckets (Target Cap: {})",
+    //         num_vectors,
+    //         k,
+    //         target_cap
+    //     );
+
+    //     // 3. Train K-Means
+
+    //     let batch_size = (num_vectors / 10).clamp(1000, 5000);
+    //     info!(
+    //         "Flush: Partitioning {} vectors into {} buckets (Mini-Batch: {})",
+    //         num_vectors, k, batch_size
+    //     );
+
+    //     let trainer = KMeansTrainer::new(k, self.config.dim, 15).with_mini_batch(batch_size); // Enable optimization
+
+    //     // Wrap this call to catch K-Means panics
+    //     let result =
+    //         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| trainer.train(&valid_vecs)))
+    //             .map_err(|_| io::Error::other("K-Means Panicked!"))?;
+
+    //     println!(
+    //         "DEBUG: K-Means Complete. Centroids: {}",
+    //         result.centroids.len()
+    //     );
+
+    //     let result = trainer.train(&valid_vecs);
+
+    //     // 4. Group Data
+    //     let mut clusters: Vec<(Vec<u64>, Vec<Vec<f32>>)> = vec![(Vec::new(), Vec::new()); k];
+
+    //     for (i, &assignment) in result.assignments.iter().enumerate() {
+    //         if assignment < k {
+    //             clusters[assignment].0.push(valid_ids[i]);
+    //             clusters[assignment].1.push(valid_vecs[i].clone());
+    //         }
+    //     }
+
+    //     // 5. Prepare Results
+    //     let q_arc = self
+    //         .get_quantizer()
+    //         .expect("Quantizer missing during flush");
+    //     let mut created_ids = Vec::new();
+
+    //     for (idx, (c_ids, c_vecs)) in clusters.into_iter().enumerate() {
+    //         if c_ids.is_empty() {
+    //             continue;
+    //         }
+
+    //         // Calculate Centroid
+    //         let centroid = result.centroids[idx].clone();
+
+    //         // SQ8 Encode
+    //         let mut flat_codes = Vec::with_capacity(c_vecs.len() * self.config.dim);
+    //         for v in &c_vecs {
+    //             flat_codes.extend_from_slice(&q_arc.encode(v));
+    //         }
+
+    //         // ⚡ Calculate Vector Sum for Drift Tracking (O(1))
+    //         let mut vector_sum = vec![0.0; self.config.dim];
+    //         for v in &c_vecs {
+    //             for i in 0..self.config.dim {
+    //                 vector_sum[i] += v[i];
+    //             }
+    //         }
+
+    //         // Allocate ID
+    //         let bucket_id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
+
+    //         // Register (using internal logic to set vector_sum correctly)
+    //         // Note: We can't reuse force_register easily here without refactoring because
+    //         // force_register calculates its own centroid. We want to use the K-Means centroid.
+
+    //         // Manual Registration Pattern:
+    //         let bucket_data = BucketData {
+    //             codes: AlignedBytes::from_slice(&flat_codes),
+    //             vids: c_ids.clone(),
+    //             tombstones: bit_set::BitSet::with_capacity(c_ids.len()),
+    //         };
+
+    //         let bytes = bucket_data.to_bytes(self.config.dim)?;
+    //         self.cache
+    //             .storage()
+    //             .write_page(bucket_id, 0, &bytes)
+    //             .await?;
+    //         let page_id = PageId {
+    //             file_id: bucket_id,
+    //             offset: 0,
+    //             length: bytes.len() as u32,
+    //         };
+
+    //         self.update_buckets(|b| {
+    //             let mut new = b.clone();
+    //             let header = BucketHeader::new(
+    //                 bucket_id,
+    //                 centroid.clone(),
+    //                 c_ids.len() as u32,
+    //                 page_id.clone(),
+    //             );
+    //             // ⚡ IMPORTANT: Set the sum
+    //             *header.stats.vector_sum.write() = vector_sum.clone();
+    //             new.insert(bucket_id, header);
+    //             new
+    //         });
+
+    //         self.update_centroids(|c| {
+    //             let mut new = c.clone();
+    //             new.push(CentroidEntry {
+    //                 id: bucket_id,
+    //                 vector: centroid.clone(),
+    //                 active: true,
+    //             });
+    //             new
+    //         });
+
+    //         for &vid in &c_ids {
+    //             let _ = self.kv.put(&vid.to_le_bytes(), &bucket_id.to_le_bytes());
+    //         }
+
+    //         created_ids.push(bucket_id);
+    //     }
+
+    //     Ok(created_ids)
+    // }
+
+    // drift_core/src/kmeans.rs
+
     pub async fn partition_and_flush(
         &self,
         ids: &[u64],
@@ -869,125 +1046,107 @@ impl VectorIndex {
             return Ok(Vec::new());
         }
 
-        // 1. Filter Tombstones
-        let deleted_snapshot = self.deleted_ids.read().clone();
-        let (valid_ids, valid_vecs): (Vec<u64>, Vec<Vec<f32>>) = ids
-            .iter()
-            .zip(vectors.iter())
-            .filter(|(id, _)| !deleted_snapshot.contains(id))
-            .map(|(id, vec)| (*id, vec.clone()))
-            .unzip();
+        // ⚡ OPTIMIZATION 1: ZERO-COPY FILTERING
+        // Instead of cloning 1M vectors into a "valid_vecs" list, we only store their indices.
+        let deleted_snapshot = self.deleted_ids.read();
+        let valid_indices: Vec<usize> = (0..ids.len())
+            .filter(|&i| !deleted_snapshot.contains(&ids[i]))
+            .collect();
 
-        if valid_ids.is_empty() {
+        if valid_indices.is_empty() {
             return Ok(Vec::new());
         }
 
-        // 2. Determine K (Number of Buckets)
+        let num_vectors = valid_indices.len();
         let target_cap = self.config.max_bucket_capacity;
-        let num_vectors = valid_ids.len();
 
-        // ⚡ FIX 2: Hardened Partition Logic
-        // Old logic: ceil(N / (Target * 0.8)) -> caused under-partitioning (3 buckets for 5 clusters)
-
-        // Strategy A: Conservative Capacity (aim for 60% fill, not 80%)
+        // Determine K (Number of Buckets)
         let count_based_k = (num_vectors as f32 / (target_cap as f32 * 0.6)).ceil() as usize;
-
-        // Strategy B: Structural Heuristic
-        // Assume latent clusters are rarely larger than 200 items in this workload.
-        // This prevents cramming 1000 items into 2 buckets just because capacity allows it.
         let heuristic_k = (num_vectors / 200).max(1);
-        // let heuristic_k = (num_vectors / 2000).max(1);
-
-        // Take the maximum to be safe
         let k = count_based_k.max(heuristic_k).max(2);
 
         // Fast Path for tiny data
         if num_vectors <= target_cap && k == 1 {
             let id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
-            self.force_register_bucket_with_ids(id, &valid_ids, &valid_vecs)
+            let valid_ids: Vec<u64> = valid_indices.iter().map(|&i| ids[i]).collect();
+            let v_refs: Vec<Vec<f32>> = valid_indices.iter().map(|&i| vectors[i].clone()).collect();
+            self.force_register_bucket_with_ids(id, &valid_ids, &v_refs)
                 .await?;
             return Ok(vec![id]);
         }
 
         tracing::info!(
-            "Flush: Partitioning {} vectors into {} buckets (Target Cap: {})",
+            "Flush: Step 3 - Partitioning {} vectors into {} buckets",
             num_vectors,
-            k,
-            target_cap
+            k
         );
 
-        // 3. Train K-Means
+        // ⚡ OPTIMIZATION 2: SAMPLED TRAINING
+        // We only clone a 50k sample for the mathematical training phase.
+        let sample_limit = 50_000.min(num_vectors);
+        let trainer = KMeansTrainer::new(k, self.config.dim, 10).with_mini_batch(1024);
 
-        let batch_size = (num_vectors / 10).clamp(1000, 5000);
-        info!(
-            "Flush: Partitioning {} vectors into {} buckets (Mini-Batch: {})",
-            num_vectors, k, batch_size
-        );
+        let training_samples: Vec<Vec<f32>> = valid_indices
+            .iter()
+            .take(sample_limit)
+            .map(|&idx| vectors[idx].clone())
+            .collect();
 
-        let trainer = KMeansTrainer::new(k, self.config.dim, 15).with_mini_batch(batch_size); // Enable optimization
+        let result = trainer.train(&training_samples);
 
-        // Wrap this call to catch K-Means panics
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| trainer.train(&valid_vecs)))
-                .map_err(|_| io::Error::other("K-Means Panicked!"))?;
+        // ⚡ OPTIMIZATION 3: PARALLEL ZERO-COPY ASSIGNMENT
+        // Use Rayon to map every vector in the 1M set to the nearest centroid.
+        // We pass references (&vectors[idx]) to avoid copying float data.
+        let assignments: Vec<usize> = valid_indices
+            .par_iter()
+            .map(|&idx| Self::nearest_centroid_index(&vectors[idx], &result.centroids))
+            .collect();
 
-        println!(
-            "DEBUG: K-Means Complete. Centroids: {}",
-            result.centroids.len()
-        );
-
-        let result = trainer.train(&valid_vecs);
-
-        // 4. Group Data
-        let mut clusters: Vec<(Vec<u64>, Vec<Vec<f32>>)> = vec![(Vec::new(), Vec::new()); k];
-
-        for (i, &assignment) in result.assignments.iter().enumerate() {
+        // Group indices by cluster ID
+        let mut cluster_indices: Vec<Vec<usize>> = vec![Vec::new(); k];
+        for (i, &assignment) in assignments.iter().enumerate() {
             if assignment < k {
-                clusters[assignment].0.push(valid_ids[i]);
-                clusters[assignment].1.push(valid_vecs[i].clone());
+                cluster_indices[assignment].push(valid_indices[i]);
             }
         }
 
-        // 5. Prepare Results
+        // ⚡ OPTIMIZATION 4: PARALLEL BATCH ENCODING
         let q_arc = self
             .get_quantizer()
             .expect("Quantizer missing during flush");
         let mut created_ids = Vec::new();
 
-        for (idx, (c_ids, c_vecs)) in clusters.into_iter().enumerate() {
-            if c_ids.is_empty() {
+        for (cluster_idx, indices) in cluster_indices.into_iter().enumerate() {
+            if indices.is_empty() {
                 continue;
             }
 
-            // Calculate Centroid
-            let centroid = result.centroids[idx].clone();
+            let centroid = &result.centroids[cluster_idx];
 
-            // SQ8 Encode
-            let mut flat_codes = Vec::with_capacity(c_vecs.len() * self.config.dim);
-            for v in &c_vecs {
-                flat_codes.extend_from_slice(&q_arc.encode(v));
-            }
+            // Encode the vectors for this specific bucket in parallel.
+            // Data is pulled directly from the original 'vectors' buffer.
+            let flat_codes: Vec<u8> = indices
+                .par_iter()
+                .flat_map(|&idx| q_arc.encode(&vectors[idx]))
+                .collect();
 
-            // ⚡ Calculate Vector Sum for Drift Tracking (O(1))
+            let cluster_vids: Vec<u64> = indices.iter().map(|&idx| ids[idx]).collect();
+
+            // Calculate Vector Sum for Drift Tracking (O(N) pass)
             let mut vector_sum = vec![0.0; self.config.dim];
-            for v in &c_vecs {
-                for i in 0..self.config.dim {
-                    vector_sum[i] += v[i];
+            for &idx in &indices {
+                let v = &vectors[idx];
+                for d in 0..self.config.dim {
+                    vector_sum[d] += v[d];
                 }
             }
 
-            // Allocate ID
             let bucket_id = self.next_bucket_id.fetch_add(1, Ordering::Relaxed);
 
-            // Register (using internal logic to set vector_sum correctly)
-            // Note: We can't reuse force_register easily here without refactoring because
-            // force_register calculates its own centroid. We want to use the K-Means centroid.
-
-            // Manual Registration Pattern:
             let bucket_data = BucketData {
                 codes: AlignedBytes::from_slice(&flat_codes),
-                vids: c_ids.clone(),
-                tombstones: bit_set::BitSet::with_capacity(c_ids.len()),
+                vids: cluster_vids.clone(),
+                tombstones: bit_set::BitSet::with_capacity(indices.len()),
             };
 
             let bytes = bucket_data.to_bytes(self.config.dim)?;
@@ -995,21 +1154,22 @@ impl VectorIndex {
                 .storage()
                 .write_page(bucket_id, 0, &bytes)
                 .await?;
+
             let page_id = PageId {
                 file_id: bucket_id,
                 offset: 0,
                 length: bytes.len() as u32,
             };
 
+            // Update Metadata Maps Atomically
             self.update_buckets(|b| {
                 let mut new = b.clone();
                 let header = BucketHeader::new(
                     bucket_id,
                     centroid.clone(),
-                    c_ids.len() as u32,
+                    cluster_vids.len() as u32,
                     page_id.clone(),
                 );
-                // ⚡ IMPORTANT: Set the sum
                 *header.stats.vector_sum.write() = vector_sum.clone();
                 new.insert(bucket_id, header);
                 new
@@ -1025,7 +1185,8 @@ impl VectorIndex {
                 new
             });
 
-            for &vid in &c_ids {
+            // Update global locator for O(1) searches
+            for &vid in &cluster_vids {
                 let _ = self.kv.put(&vid.to_le_bytes(), &bucket_id.to_le_bytes());
             }
 
@@ -1033,6 +1194,22 @@ impl VectorIndex {
         }
 
         Ok(created_ids)
+    }
+
+    /// Internal helper utilizing the SIMD-friendly L2 distance kernel.
+    /// This prevents the math itself from being a bottleneck during assignment.
+    fn nearest_centroid_index(vec: &[f32], centroids: &[Vec<f32>]) -> usize {
+        let mut min_dist = f32::MAX;
+        let mut best_idx = 0;
+        for (i, c) in centroids.iter().enumerate() {
+            // Uses the optimized math from memtable.rs
+            let d_sq = crate::math::l2_sq(vec, c);
+            if d_sq < min_dist {
+                min_dist = d_sq;
+                best_idx = i;
+            }
+        }
+        best_idx
     }
 
     pub async fn split_and_steal(&self, bucket_id: u32) -> io::Result<MaintenanceStatus> {
@@ -2002,172 +2179,5 @@ impl VectorIndex {
         // Check MemTable
         // ...
         None
-    }
-
-    // ⚡ DEBUG: Search with Trace
-    // Returns: (Results, List of Scanned Bucket IDs, Debug Info Map)
-    pub async fn search_debug(
-        &self,
-        query: &[f32],
-        k: usize,
-        target_confidence: f32,
-        lambda: f32,
-        tau: f32,
-    ) -> io::Result<(Vec<SearchResult>, Vec<u32>, HashMap<String, String>)> {
-        // --- PHASE 1: SNAPSHOT ---
-        let lut = self
-            .quantizer
-            .read()
-            .as_ref()
-            .map(|q| q.precompute_lut(query));
-        let quantizer = self.quantizer.read().as_ref().unwrap().clone();
-
-        let guard = epoch::pin();
-        let buckets_map = unsafe { self.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
-
-        // 1. Calculate Scores for ALL buckets (for debug info)
-        let mut debug_scores = Vec::new();
-        for header in buckets_map.values() {
-            let centroid = &header.centroid;
-            let count = header.count;
-            let dist = crate::math::l2_sq(query, centroid).sqrt();
-            let p_geom = (-lambda * dist).exp();
-            let reliability = 1.0 - (-(count as f32) / tau).exp();
-            let p_eff = p_geom * reliability;
-
-            debug_scores.push((header.id, dist, count, p_eff));
-        }
-
-        // 2. Selection Logic (Cluster & Probabilistic + Guardrail)
-        let mut clusters: HashMap<Vec<u32>, Vec<&BucketHeader>> = HashMap::new();
-        for header in buckets_map.values() {
-            let key = header.centroid.iter().map(|f| f.to_bits()).collect();
-            clusters.entry(key).or_default().push(header);
-        }
-        let mut candidates: Vec<(Vec<&BucketHeader>, f32)> = clusters
-            .into_values()
-            .map(|h| {
-                let c = &h[0].centroid;
-                let count: u32 = h.iter().map(|b| b.count).sum();
-                let d = crate::math::l2_sq(query, c).sqrt();
-                let p = (-lambda * d).exp() * (1.0 - (-(count as f32) / tau).exp());
-                (h, p)
-            })
-            .collect();
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(CmpOrdering::Equal));
-
-        let mut selected_headers = Vec::new();
-        let mut acc = 0.0;
-        let mut visited = HashSet::new();
-        let min_scan = (buckets_map.len() / 20).max(5);
-        for (group, score) in candidates {
-            acc += score;
-            for h in group {
-                if visited.insert(h.id) {
-                    selected_headers.push(h);
-                }
-            }
-            if acc >= target_confidence && selected_headers.len() >= min_scan {
-                break;
-            }
-        }
-        let mut all = buckets_map.values().collect::<Vec<_>>();
-        all.sort_by(|a, b| {
-            crate::math::l2_sq(query, &a.centroid)
-                .partial_cmp(&crate::math::l2_sq(query, &b.centroid))
-                .unwrap()
-        });
-        for h in all.iter().take(5) {
-            if visited.insert(h.id) {
-                selected_headers.push(h);
-            }
-        }
-        // --- ROUTING LOGIC END ---
-
-        let scanned_ids: Vec<u32> = selected_headers.iter().map(|h| h.id).collect();
-
-        // 3. FORENSIC SCAN
-        let search_buffer_size = self.config.ef_search.max(k);
-        let mut sq8_heap = BinaryHeap::new();
-        let mut float_heap = BinaryHeap::new();
-
-        // Tracking specific missing ID details requires knowing the ground truth,
-        // but search_debug doesn't know it. We return a map of "ID -> (SQ8_Dist, Float_Dist)".
-        let mut forensics = HashMap::new();
-
-        for h in &selected_headers {
-            if let Ok(d) = self.cache.get(&h.page_id).await {
-                // A. SQ8 Scan
-                if let Some(l) = &lut {
-                    for r in Bucket::scan_with_lut(&d, l, self.config.dim) {
-                        Self::push_to_heap(&mut sq8_heap, r, search_buffer_size); // Buffer
-                    }
-                }
-
-                // B. ⚡ FLOAT RECONSTRUCTION SCAN (The Truth)
-                // We reconstruct the whole bucket to floats and check exact distances
-                let (vecs, ids) = d.reconstruct(&quantizer);
-                for (i, vec) in vecs.iter().enumerate() {
-                    let id = ids[i];
-                    let true_dist_sq = crate::math::l2_sq(query, vec);
-
-                    // We can re-calculate SQ8 distance for this specific vector to verify LUT
-                    // (Optional, expensive)
-
-                    let r = SearchResult {
-                        id,
-                        distance: true_dist_sq,
-                    };
-                    Self::push_to_heap(&mut float_heap, r, search_buffer_size);
-
-                    // Store detailed trace for every vector found
-                    let sq8_dist = if let Some(l) = &lut {
-                        // Re-run LUT for this single item
-                        let start = i * self.config.dim;
-                        let code_ptr = d.codes.as_ptr();
-                        unsafe {
-                            compute_distance_lut(code_ptr.add(start), l.as_ptr(), self.config.dim)
-                        }
-                    } else {
-                        0.0
-                    };
-
-                    forensics.insert(
-                        id.to_string(),
-                        format!("SQ8={:.2} Float={:.2}", sq8_dist, true_dist_sq),
-                    );
-                }
-            }
-        }
-
-        let mut results = sq8_heap.into_vec();
-        results.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(CmpOrdering::Equal)
-        });
-        if results.len() > k {
-            results.truncate(k);
-        }
-
-        let mut debug_info = HashMap::new();
-        debug_info.insert("total_buckets".to_string(), buckets_map.len().to_string());
-
-        // 4. Debug Report
-        let mut debug_info = HashMap::new();
-        debug_info.insert("total_buckets".to_string(), buckets_map.len().to_string());
-        debug_info.insert("scanned_count".to_string(), scanned_ids.len().to_string());
-
-        // Serialize top 5 bucket scores for context
-        debug_scores.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap()); // Sort by P_eff desc
-        let top_scores = debug_scores
-            .iter()
-            .take(5)
-            .map(|(id, d, c, p)| format!("B{}: D={:.2} C={} P={:.4}", id, d, c, p))
-            .collect::<Vec<_>>()
-            .join(", ");
-        debug_info.insert("top_candidates".to_string(), top_scores);
-
-        Ok((results, scanned_ids, debug_info))
     }
 }
