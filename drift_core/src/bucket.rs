@@ -307,6 +307,7 @@ impl Bucket {
 }
 
 /// ⚡ CORE ADC KERNEL
+#[allow(unsafe_op_in_unsafe_fn)]
 #[inline(always)]
 pub unsafe fn compute_distance_lut(
     mut code_ptr: *const u8,
@@ -322,7 +323,7 @@ pub unsafe fn compute_distance_lut(
         let c2 = *code_ptr.add(2) as usize;
         let c3 = *code_ptr.add(3) as usize;
 
-        let v0 = *lut_ptr.add((i + 0) * 256 + c0);
+        let v0 = *lut_ptr.add((i) * 256 + c0);
         let v1 = *lut_ptr.add((i + 1) * 256 + c1);
         let v2 = *lut_ptr.add((i + 2) * 256 + c2);
         let v3 = *lut_ptr.add((i + 3) * 256 + c3);

@@ -1,8 +1,18 @@
 [workspace]
-members = ["drift_core", "drift_storage", "drift_server", "drift_kv", "drift_cache", "drift_traits"]
+members = [
+    "drift_core",
+    "drift_storage",
+    "drift_server",
+    "drift_kv",
+    "drift_cache",
+    "drift_traits",
+]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"                                  # Explicitly targeting the 2024 edition
 authors = ["Drift Engineering <eng@flowdot.org>"]
+
+# [profile.release]
+# debug = true

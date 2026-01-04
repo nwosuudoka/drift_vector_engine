@@ -10,6 +10,7 @@ use drift_storage::segment_reader::SegmentReader;
 use drift_storage::segment_writer::{BucketLocation, SegmentWriter};
 use opendal::Entry;
 use opendal::Operator;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -296,55 +297,8 @@ impl PersistenceManager {
         Ok(run_id)
     }
 
-    // /// Writes multiple partitions into a single Segment File.
-    // /// Preserves ALP compression and Dual-Tier layout.
-    // pub async fn write_partitioned_segment(
-    //     &self,
-    //     partitions: &[PartitionResult],
-    //     index: &VectorIndex,
-    // ) -> std::io::Result<(String, HashMap<u32, BucketLocation>)> {
-    //     let run_id = uuid::Uuid::new_v4().to_string();
-    //     let file_name = format!("segment_{}.drift", run_id);
-
-    //     let quantizer_arc = index
-    //         .get_quantizer()
-    //         .ok_or(std::io::Error::other("Untrained"))?;
-    //     let q_bytes = bincode::encode_to_vec(&*quantizer_arc, bincode::config::standard())
-    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    //     let manager = DiskManager::new(self.op.clone(), file_name.clone());
-    //     let mut writer = SegmentWriter::new(manager, q_bytes).await?;
-
-    //     for p in partitions {
-    //         // Reconstruct the BucketData object for the writer
-    //         // (We created one for the cache in index.rs, here we create it for disk)
-    //         let bucket_data = BucketData {
-    //             codes: AlignedBytes::from_slice(&p.codes),
-    //             vids: p.ids.clone(),
-    //             tombstones: BitSet::with_capacity(p.ids.len()),
-    //         };
-
-    //         writer
-    //             .write_partition(
-    //                 p.bucket_id,
-    //                 &bucket_data, // ⚡ Pass the struct
-    //                 &p.vectors,   // Raw floats for ALP
-    //                 index.config.dim,
-    //             )
-    //             .await?;
-    //     }
-
-    //     let location = writer.finalize().await?;
-    //     info!(
-    //         "Persistence: Wrote segment {} with {} buckets",
-    //         file_name,
-    //         partitions.len()
-    //     );
-    //     Ok((run_id, location))
-    // }
-
     /// This is the primary path used by the Janitor.
-    pub async fn write_partitioned_segment(
+    pub async fn write_partitioned_segment_2(
         &self,
         partitions: &[PartitionResult],
         index: &VectorIndex,
@@ -539,5 +493,58 @@ impl PersistenceManager {
             }
         }
         Ok(all_deleted)
+    }
+
+    // TODO: integrate this
+    pub async fn write_partitioned_segment(
+        &self,
+        partitions: &[PartitionResult],
+        index: &VectorIndex,
+    ) -> std::io::Result<(String, HashMap<u32, BucketLocation>)> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let file_name = format!("segment_{}.drift", run_id);
+        let dim = index.config.dim;
+
+        info!(
+            "Persistence: Step 4.1 - Parallel ALP Encoding for {} partitions",
+            partitions.len()
+        );
+
+        // ⚡ PARALLEL PHASE: Use Rayon to compress all buckets at once
+        let prepared_buckets: Vec<(u32, Vec<u8>, Vec<u8>, usize)> = partitions
+            .par_iter()
+            .map(|p| {
+                let bucket_data = BucketData {
+                    codes: AlignedBytes::from_slice(&p.codes),
+                    vids: p.ids.clone(),
+                    tombstones: bit_set::BitSet::with_capacity(p.ids.len()),
+                };
+                let (idx_b, dat_b, count) =
+                    SegmentWriter::prepare_bucket_data(p.bucket_id, &bucket_data, &p.vectors, dim);
+                (p.bucket_id, idx_b, dat_b, count)
+            })
+            .collect();
+
+        info!("Persistence: Step 4.2 - Sequential Disk Write");
+
+        // 💾 SEQUENTIAL PHASE: Write prepared bytes to disk
+        let quantizer_arc = index
+            .get_quantizer()
+            .ok_or(std::io::Error::other("Untrained"))?;
+        let q_bytes = bincode::encode_to_vec(&*quantizer_arc, bincode::config::standard())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let manager = DiskManager::new(self.op.clone(), file_name.clone());
+        let mut writer = SegmentWriter::new(manager, q_bytes).await?;
+
+        for (bid, idx_bytes, dat_bytes, count) in prepared_buckets {
+            // We need a small helper in SegmentWriter to write pre-compressed blobs
+            writer
+                .write_pre_compressed_partition(bid, idx_bytes, dat_bytes, count)
+                .await?;
+        }
+
+        let location = writer.finalize().await?;
+        Ok((run_id, location))
     }
 }

@@ -6,6 +6,8 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use crate::segment_reader::SegmentReader;
+
 // --- DiskManager (Flat File Access) ---
 #[derive(Clone)]
 pub struct DiskManager {
@@ -133,5 +135,23 @@ impl PageManager for DriftPageManager {
     /// Returns None if the ID is not registered or purely in-memory.
     fn get_physical_path(&self, file_id: u32) -> Option<String> {
         self.files.read().unwrap().get(&file_id).cloned()
+    }
+
+    async fn read_high_fidelity(&self, file_id: u32) -> io::Result<Vec<Vec<f32>>> {
+        let path = {
+            let map = self.files.read().unwrap();
+            map.get(&file_id).cloned()
+        };
+
+        if let Some(p) = path {
+            // Instantiate a temporary reader to access the cold ALP blobs
+            let reader = SegmentReader::open_with_op(self.op.clone(), &p).await?;
+            reader.read_bucket_high_fidelity(file_id).await
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("File ID {} not registered", file_id),
+            ))
+        }
     }
 }

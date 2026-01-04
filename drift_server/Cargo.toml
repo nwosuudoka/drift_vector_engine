@@ -27,11 +27,15 @@ rand_distr = "0.5.1"
 walkdir = "2.4"
 opendal = "0.55.0"
 bit-set = "0.8.0"
+rayon = "1.0"
 
 [build-dependencies]
 tonic-build = "0.14.2"
 tonic-prost-build = "0.14.2"
 
+
+# [profile.release]
+# debug = true
 
 [features]
 stress-test = []

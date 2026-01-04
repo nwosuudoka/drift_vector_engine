@@ -26,8 +26,17 @@ pub trait PageManager: Send + Sync {
 
     /// Used by Compactor to determine liveness.
     /// Returns None if the ID is not registered or purely in-memory.
-    fn get_physical_path(&self, file_id: u32) -> Option<String> {
+    fn get_physical_path(&self, _file_id: u32) -> Option<String> {
         None
+    }
+
+    /// 💿 NEW: Fetches high-fidelity (ALP) vectors for a logical bucket ID.
+    /// This bypasses the block cache to provide raw floats for re-ranking.
+    async fn read_high_fidelity(&self, _file_id: u32) -> Result<Vec<Vec<f32>>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "High-fidelity reads not supported by this manager",
+        ))
     }
 }
 

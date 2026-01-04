@@ -73,7 +73,7 @@ mod tests {
         // 1. Create valid file
         {
             let manager = DiskManager::new(op.clone(), filename.to_string());
-            let mut writer = SegmentWriter::new(manager, vec![]).await.unwrap();
+            let writer = SegmentWriter::new(manager, vec![]).await.unwrap();
             writer.finalize().await.unwrap();
         }
 

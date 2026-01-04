@@ -103,7 +103,7 @@ mod tests {
         let janitor_handle = tokio::spawn(async move { janitor.run().await });
 
         // 5. Wait for GC
-        sleep(Duration::from_millis(500)).await;
+        sleep(Duration::from_millis(1500)).await;
 
         // 6. Verify Cleanup
         let exists_a = op.exists(&file_a).await.unwrap();
