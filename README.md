@@ -40,3 +40,15 @@ Rust workspace implementing the ideas sketched in `PAPER.pdf`: a drift-aware vec
 ## Status
 
 This codebase implements the core mechanics from `PAPER.pdf`—a drift-aware ANN with WAL-backed memtables, PQ buckets, compressed disk segments, and a gRPC service layer for training and search. Distributed consensus for stateless workers is the next major milestone (see `TODO.md`).
+
+## Next Steps
+
+| Feature            | Current State (v0.6.5)                                                                                | Target State (v2.0 LBR)                                                                     |
+| ------------------ | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Data Layout        | Segment-Based: 1 File (.drift) contains N Buckets.                                                    | Bucket-Based: 1 Logical Bucket = 1 Physical File (S3) + 1 Local Log (NVMe).                 |
+| Ingestion (Flush)  | "Centroid Proliferation: Every flush runs K-Means, creates new Bucket IDs, and writes a new Segment." | Incremental: Flush assigns vectors to existing Centroids and appends to Local Staging.      |
+| Write Path         | MemTable → Partition → New Segment File.                                                              | MemTable → Assign → Local Staging File (.bin).                                              |
+| Persistence        | Immutable Segments: New segments created constantly.                                                  | Mutable-ish: Local files append. S3 files are rewritten only when large enough (Promotion). |
+| File Format        | Interleaved: Hot/Cold blobs stored per bucket inside a segment.                                       | Sectioned: Header → Hot Region (All SQ8) → Cold Region (All ALP/Meta) → Footer.             |
+| Read Path          | Scatter-Gather: Search scans multiple segments for the same region.                                   | Unified: Search scans S3 File + Local Log for specific Bucket ID.                           |
+| Garbage Collection | Vacuum: Deletes old segments not referenced by index.                                                 | Compaction: Merges S3 File + Local Log → New S3 File.                                       |
