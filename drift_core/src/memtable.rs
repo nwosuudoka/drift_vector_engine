@@ -1,221 +1,109 @@
-// drift_core/src/memtable.rs
-
-use hnsw_rs::prelude::*;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use tracing::{Level, span};
+use std::collections::{BinaryHeap, HashSet};
 
-/// Wrapper to allow f32 in BinaryHeap (Max-Heap)
-#[derive(Debug, PartialEq)]
-struct OrderedFloat(f32);
-
-impl Eq for OrderedFloat {}
-
-impl PartialOrd for OrderedFloat {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.0.partial_cmp(&other.0)
-    }
-}
-
-impl Ord for OrderedFloat {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Handle NaNs by pushing them to the end
-        self.partial_cmp(other).unwrap_or(Ordering::Less)
-    }
-}
-
-/// Helper struct to keep track of top-k candidates in the heap
-#[derive(Debug, PartialEq, Eq)]
-struct HeapItem {
-    distance: OrderedFloat,
-    id: u64,
-}
-
-// Order by distance so BinaryHeap acts as a Max-Heap on distance.
-// We keep the K smallest items. If new_item < max_in_heap, replace max.
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.distance.partial_cmp(&other.distance)
-    }
-}
-
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.distance.cmp(&other.distance)
-    }
-}
-
-/// Level 0: The In-Memory Buffer (MemTable).
-///
-/// Stores raw f32 vectors.
-/// - Writes are O(1) (HashMap insert).
-/// - Reads are O(N) (Linear Scan).
-///
-/// The HNSW field is kept for compatibility but is NOT updated synchronously.
+/// Level 0: High-Density In-Memory Buffer.
+/// Used for both Active Ingestion and Frozen Flushing.
 pub struct MemTable {
-    // Hnsw is thread-safe for searching, but we wrap our secondary storage in locks
-    pub hnsw: RwLock<Hnsw<'static, f32, DistL2>>,
-    #[allow(dead_code)]
-    capacity: usize,
-    #[allow(dead_code)]
-    dim: usize,
-
-    // Stores raw data for flushing. Wrapped in RwLock for concurrent access.
-    data: RwLock<HashMap<u64, Vec<f32>>>,
+    ids: RwLock<Vec<u64>>,
+    data: RwLock<Vec<f32>>,
     tombstones: RwLock<HashSet<u64>>,
+    dim: usize,
 }
 
 impl MemTable {
-    pub fn new(capacity: usize, dim: usize, ef_construction: usize, max_layers: usize) -> Self {
-        let hnsw = Hnsw::new(
-            16, // max_nb_connection (M)
-            capacity,
-            max_layers,
-            ef_construction,
-            DistL2,
-        );
-
+    pub fn new(capacity: usize, dim: usize, _ef: usize, _layers: usize) -> Self {
         Self {
-            hnsw: RwLock::new(hnsw),
-            capacity,
-            dim,
-            data: RwLock::new(HashMap::new()),
+            ids: RwLock::new(Vec::with_capacity(capacity)),
+            data: RwLock::new(Vec::with_capacity(capacity * dim)),
             tombstones: RwLock::new(HashSet::new()),
+            dim,
         }
     }
 
     pub fn insert(&self, id: u64, vector: &[f32]) {
-        // 1. Tombstone Logic
-        {
-            let _span = span!(Level::TRACE, "lock_tombstones").entered();
-            let mut tombstones = self.tombstones.write();
-            if tombstones.contains(&id) {
-                tombstones.remove(&id);
-            }
-        }
-
-        // 2. Data Map Insert (O(1))
-        {
-            let _span = span!(Level::TRACE, "lock_data_map").entered();
-            self.data.write().insert(id, vector.to_vec());
-        }
-
-        // 3. HNSW Insert -> DISABLED for Lazy Indexing
-        // We skip the expensive graph update.
-        // Indexing will happen in bulk during the background flush.
-        /*
-        {
-            let _span = span!(Level::INFO, "lock_hnsw_insert").entered();
-            self.hnsw.write().insert((vector, id as usize));
-        }
-        */
+        assert!(
+            vector.len() == self.dim,
+            "mismatch dims {} != {}",
+            self.dim,
+            vector.len()
+        );
+        let mut ids = self.ids.write();
+        let mut data = self.data.write();
+        ids.push(id);
+        data.extend_from_slice(vector);
+        self.tombstones.write().remove(&id);
     }
 
     pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) {
-        // 1. Lock Tombstones ONCE
-        {
-            let _span = span!(Level::TRACE, "lock_tombstones_batch").entered();
-            let mut tombstones = self.tombstones.write();
-            for (id, _) in batch {
-                if tombstones.contains(id) {
-                    tombstones.remove(id);
-                }
-            }
+        let mut ids = self.ids.write();
+        let mut data = self.data.write();
+        let mut tombstones = self.tombstones.write();
+        for (id, vector) in batch {
+            ids.push(*id);
+            data.extend_from_slice(vector);
+            tombstones.remove(id);
         }
-
-        // 2. Lock Data Map ONCE
-        {
-            let _span = span!(Level::TRACE, "lock_data_map_batch").entered();
-            let mut data = self.data.write();
-            for (id, vector) in batch {
-                data.insert(*id, vector.clone());
-            }
-        }
-
-        // 3. HNSW Insert -> DISABLED
-        // Eliminates the O(Batch * log N) bottleneck.
     }
 
     pub fn delete(&self, id: u64) {
-        let mut set = self.tombstones.write();
-        set.insert(id);
-
-        // Also remove from data map so it doesn't get flushed to disk
-        let mut data = self.data.write();
-        data.remove(&id);
+        self.tombstones.write().insert(id);
     }
 
-    /// Brute Force Scan (O(N))
-    /// Optimized for throughput on 10k-100k items.
-    // pub fn search(&self, query: &[f32], k: usize, _ef_search: usize) -> Vec<(u64, f32)> {
-    //     let tombstones = self.tombstones.read();
-    //     let data = self.data.read();
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.ids.read().len()
+    }
 
-    //     // MaxHeap to maintain the K smallest distances.
-    //     // We push items in. If heap > K, we pop the MAX element.
-    //     let mut heap = BinaryHeap::with_capacity(k + 1);
+    #[allow(clippy::type_complexity)]
+    /// Accessors for the Janitor (Zero-Copy Read)
+    /// Returns ReadGuards. As long as these are held, no WRITES can happen.
+    /// But since this table is Frozen, writes shouldn't happen anyway.
+    /// Reads (Search) can still happen concurrently.
+    pub fn get_data_guards(
+        &self,
+    ) -> (
+        RwLockReadGuard<'_, Vec<u64>>,
+        RwLockReadGuard<'_, Vec<f32>>,
+        RwLockReadGuard<'_, HashSet<u64>>,
+    ) {
+        (self.ids.read(), self.data.read(), self.tombstones.read())
+    }
 
-    //     for (id, vector) in data.iter() {
-    //         if tombstones.contains(id) {
-    //             continue;
-    //         }
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
 
-    //         // SIMD-friendly L2 Squared calculation
-    //         let dist_sq: f32 = l2_sq_simd_friendly(query, vector);
-
-    //         let item = HeapItem {
-    //             distance: OrderedFloat(dist_sq),
-    //             id: *id,
-    //         };
-
-    //         if heap.len() < k {
-    //             heap.push(item);
-    //         } else if item.distance < heap.peek().unwrap().distance {
-    //             // New item is smaller than the largest in the heap
-    //             heap.pop();
-    //             heap.push(item);
-    //         }
-    //     }
-
-    //     // Convert Heap to sorted Vector
-    //     let mut result: Vec<(u64, f32)> = heap
-    //         .into_iter()
-    //         .map(|item| (item.id, item.distance.0))
-    //         .collect();
-
-    //     // Heap iteration is arbitrary, so we must sort finally
-    //     result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
-    //     result
-    // }
-
-    pub fn search(&self, query: &[f32], k: usize, _ef_search: usize) -> Vec<(u64, f32)> {
-        let tombstones = self.tombstones.read();
+    /// Parallel Scan Search
+    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        let ids = self.ids.read();
         let data = self.data.read();
+        let tombstones = self.tombstones.read();
+        let dim = self.dim;
 
-        // Snapshot tombstones to a thread-safe structure if needed,
-        // but since we hold the read lock on `data`, and `tombstones` logic is coupled,
-        // we just read the local reference. Rayon handles the scope.
+        let n = ids.len();
+        let chunk_size = dim;
 
-        let final_heap = data
-            .par_iter() // 1. Iterate in Parallel
+        let final_heap = (0..n)
+            .into_par_iter()
             .fold(
-                || BinaryHeap::with_capacity(k + 1), // 2. Init Local Heap
-                |mut heap, (id, vector)| {
-                    // Filter tombstone
-                    if tombstones.contains(id) {
+                || BinaryHeap::with_capacity(k + 1),
+                |mut heap, i| {
+                    let id = ids[i];
+                    if tombstones.contains(&id) {
                         return heap;
                     }
 
+                    let start = i * chunk_size;
+                    let vector = &data[start..start + chunk_size];
                     let dist_sq = l2_sq_simd_friendly(query, vector);
+
                     let item = HeapItem {
                         distance: OrderedFloat(dist_sq),
-                        id: *id,
+                        id,
                     };
 
-                    // Maintain Top-K
                     if heap.len() < k {
                         heap.push(item);
                     } else if item.distance < heap.peek().unwrap().distance {
@@ -226,7 +114,7 @@ impl MemTable {
                 },
             )
             .reduce(
-                || BinaryHeap::with_capacity(k), // 3. Reduce (Merge Heaps)
+                || BinaryHeap::with_capacity(k),
                 |mut a, b| {
                     for item in b {
                         if a.len() < k {
@@ -240,48 +128,56 @@ impl MemTable {
                 },
             );
 
-        // 4. Final Sort
         let mut result: Vec<(u64, f32)> = final_heap
             .into_iter()
             .map(|item| (item.id, item.distance.0))
             .collect();
-
         result.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         result
     }
-
-    pub fn len(&self) -> usize {
-        self.data.read().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn extract_all(&self) -> Vec<(u64, Vec<f32>)> {
-        let guard = self.tombstones.read();
-        self.data
-            .read()
-            .iter()
-            .filter(|(id, _)| !guard.contains(id))
-            .map(|(k, v)| (*k, v.clone()))
-            .collect()
-    }
 }
 
-/// Explicit loop structure to encourage auto-vectorization.
-/// Modern compilers (LLVM) vectorize this better than zip().map().sum() in some debug profiles.
+// Helpers
 #[inline(always)]
-fn l2_sq_simd_friendly(a: &[f32], b: &[f32]) -> f32 {
+pub fn l2_sq_simd_friendly(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = 0.0;
-    let n = a.len();
-    // Hint to compiler about slice length equality to remove bounds checks inside loop
-    let a = &a[..n];
-    let b = &b[..n];
-
-    for i in 0..n {
+    for i in 0..a.len() {
         let diff = a[i] - b[i];
         sum += diff * diff;
     }
     sum
+}
+
+#[derive(Debug, PartialEq)]
+struct OrderedFloat(f32);
+impl Eq for OrderedFloat {}
+impl PartialOrd for OrderedFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.0.partial_cmp(&other.0)
+    }
+}
+impl Ord for OrderedFloat {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Less)
+    }
+}
+struct HeapItem {
+    distance: OrderedFloat,
+    id: u64,
+}
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance
+    }
+}
+impl Eq for HeapItem {}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.distance.partial_cmp(&other.distance)
+    }
+}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance.cmp(&other.distance)
+    }
 }

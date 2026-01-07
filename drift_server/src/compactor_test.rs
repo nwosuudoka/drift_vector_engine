@@ -3,7 +3,7 @@ mod tests {
     use crate::compactor::SegmentCompactor;
     use crate::persistence::PersistenceManager;
     use drift_core::index::{IndexOptions, VectorIndex};
-    use drift_storage::disk_manager::DriftPageManager; // ⚡ Use DriftPageManager
+    use drift_storage::disk_manager::DriftPageManager;
     use opendal::{Operator, services};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -15,17 +15,62 @@ mod tests {
         Operator::new(builder).unwrap().finish()
     }
 
+    // Helper: Returns (RunID, BucketID)
+    async fn create_segment_via_memtable(
+        index: &Arc<VectorIndex>,
+        persistence: &PersistenceManager,
+        ids: &[u64],
+        vectors: &[Vec<f32>],
+    ) -> (String, u32) {
+        // 1. Fill
+        for (i, id) in ids.iter().enumerate() {
+            index.insert(*id, &vectors[i]).unwrap();
+        }
+
+        // 2. Snapshot
+        let memtable = index.memtable.read().clone();
+
+        // 3. Partition (Allocates NEW Bucket ID)
+        let partitions = index.partition_memtable(&memtable).unwrap();
+        let bucket_id = partitions[0].bucket_id;
+
+        // 4. Write
+        {
+            let mut guard = index.frozen_memtable.write();
+            *guard = Some(memtable.clone());
+        }
+
+        let (run_id, locs) = persistence
+            .write_partitioned_segment(&partitions, index)
+            .await
+            .unwrap();
+
+        let offsets: HashMap<u32, (u64, u32)> = locs
+            .into_iter()
+            .map(|(id, loc)| (id, (loc.index_offset, loc.index_length as u32)))
+            .collect();
+
+        // 5. Register
+        index
+            .register_partitions(&partitions, &run_id, &offsets)
+            .await
+            .unwrap();
+
+        // 6. Cleanup
+        index.confirm_flush().unwrap();
+        index.rotate_and_freeze().unwrap(); // Clear memtable
+        index.confirm_flush().unwrap(); // Clear frozen
+
+        (run_id, bucket_id)
+    }
+
     #[tokio::test]
     async fn test_segment_vacuum_cleans_obsolete_files() {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let persistence = PersistenceManager::new(op.clone(), dir.path());
 
-        // 1. Setup Index using DriftPageManager (Supports File Mapping)
         let wal_path = dir.path().join("test.wal");
-
-        // ⚡ FIX: Use DriftPageManager so register_partitions works correctly
-        // and get_physical_path returns the registered segment filenames.
         let storage = Arc::new(DriftPageManager::new(op.clone()));
 
         let options = IndexOptions {
@@ -38,61 +83,42 @@ mod tests {
 
         let index = Arc::new(VectorIndex::new(options, &wal_path, storage).unwrap());
 
-        // 2. Train (Required for Quantizer)
+        // 1. Train
         let train_data = vec![vec![0.0; 2]; 10];
         index.train(&train_data).await.unwrap();
 
-        // 3. Prepare Data
+        // 2. Create "Segment A"
         let ids = vec![1];
         let vectors = vec![vec![0.0; 2]];
 
-        // 4. Create "Segment A" (Simulate Run 1)
-        let partitions = index.calculate_partitions(&ids, &vectors).await.unwrap();
-        let (run_id_a, locs_a) = persistence
-            .write_partitioned_segment(&partitions, &index)
-            .await
-            .unwrap();
-
-        let offsets_a: HashMap<u32, (u64, u32)> = locs_a
-            .into_iter()
-            .map(|(id, loc)| (id, (loc.index_offset, loc.index_length as u32)))
-            .collect();
-
-        // Register A: Index points to Segment A
-        index
-            .register_partitions(&partitions, &run_id_a, &offsets_a)
-            .await
-            .unwrap();
-
+        let (run_id_a, bucket_id_a) =
+            create_segment_via_memtable(&index, &persistence, &ids, &vectors).await;
         let file_a = format!("segment_{}.drift", run_id_a);
 
-        // 5. Create "Segment B" (Simulate Run 2 / Compaction)
-        // Overwrite the SAME bucket ID.
-        let (run_id_b, locs_b) = persistence
-            .write_partitioned_segment(&partitions, &index)
-            .await
-            .unwrap();
+        // 3. Make Segment A Garbage
+        // We delete the data, then compact the bucket.
+        // This removes bucket_id_a from the Index.
+        index.delete(1).unwrap();
 
-        let offsets_b: HashMap<u32, (u64, u32)> = locs_b
-            .into_iter()
-            .map(|(id, loc)| (id, (loc.index_offset, loc.index_length as u32)))
-            .collect();
+        let compacted = index.compact_bucket(bucket_id_a).await.unwrap();
+        assert!(
+            compacted.is_some(),
+            "Bucket A should have been compacted away"
+        );
 
-        // Register B: Index updates to point to Segment B. Segment A becomes garbage.
-        index
-            .register_partitions(&partitions, &run_id_b, &offsets_b)
-            .await
-            .unwrap();
-
+        // 4. Create "Segment B" (Live Data)
+        // We re-insert ID 1 (Resurrect it in a new bucket/segment)
+        let (run_id_b, _bucket_id_b) =
+            create_segment_via_memtable(&index, &persistence, &ids, &vectors).await;
         let file_b = format!("segment_{}.drift", run_id_b);
 
-        // 6. Initialize Compactor
+        // 5. Initialize Compactor & Vacuum
         let compactor = SegmentCompactor::new(index.clone(), op.clone());
-
-        // 7. Run Vacuum
         compactor.vacuum_segments().await.unwrap();
 
-        // 8. Verify
+        // 6. Verify
+        // A should be gone (Bucket A removed from Index -> File A not in live set)
+        // B should exist (Bucket B is in Index -> File B in live set)
         let exists_a = op.exists(&file_a).await.unwrap();
         let exists_b = op.exists(&file_b).await.unwrap();
 

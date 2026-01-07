@@ -79,47 +79,6 @@ impl Janitor {
         }
     }
 
-    // pub async fn run(&self) {
-    //     let mut interval = time::interval(self.check_interval);
-    //     loop {
-    //         interval.tick().await;
-
-    //         let cycle = self.cycle_count.fetch_add(1, Ordering::Relaxed);
-
-    //         // 1. Flush Logic
-    //         // Check if we need to flush (Threshold met OR pending frozen work from a failed retry)
-    //         let mem_size = self.index.memtable_len();
-    //         let has_frozen = self.index.frozen_memtable.read().is_some();
-
-    //         if mem_size >= self.flush_threshold || has_frozen {
-    //             match self.perform_flush().await {
-    //                 Ok(Some(p)) => info!("Janitor: Flushed to {:?}", p),
-    //                 Ok(None) => {} // No work needed
-    //                 Err(e) => error!("Janitor Error: Failed to flush: {}", e),
-    //             }
-    //         }
-
-    //         // 2. Scavenge (Disk -> Disk Compaction)
-    //         if let Err(e) = self.scavenge().await {
-    //             error!("Janitor: Scavenge failed: {}", e);
-    //         }
-
-    //         // 3. Maintenance
-    //         self.perform_maintenance().await;
-
-    //         // 4. Garbage Collection (Every 100 cycles)
-    //         if cycle > 0
-    //             && cycle.is_multiple_of(10)
-    //             && let Some(c) = &self.compactor
-    //         {
-    //             info!("Janitor: Running Compaction Cycle #{}", cycle);
-    //             if let Err(e) = c.run_cycle().await {
-    //                 error!("Janitor: Compaction cycle failed: {}", e);
-    //             }
-    //         }
-    //     }
-    // }
-
     pub async fn run(&self) {
         let mut interval = time::interval(self.check_interval);
         info!("Janitor: Started monitoring loop.");
@@ -165,7 +124,7 @@ impl Janitor {
             }
 
             // 3. Maintenance
-            self.perform_maintenance().await; // Comment out to isolate flush issues for now
+            self.perform_maintenance().await;
 
             // 4. Garbage Collection
             if cycle > 0 && cycle % 100 == 0 {
@@ -191,9 +150,7 @@ impl Janitor {
             }
             {
                 let mut guard = self.ignore_map.lock().unwrap();
-                if let Some(state) = guard.get(&header.id)
-                    && state.should_skip(now)
-                {
+                if let Some(state) = guard.get(&header.id) {
                     if state.should_skip(now) {
                         continue;
                     } else {
@@ -214,7 +171,6 @@ impl Janitor {
             let capacity_ratio = header.count as f32 / target_cap as f32;
             let drift = header.calculate_drift();
 
-            // Make that value configurable
             if (capacity_ratio > BUCKET_SPLIT_THRESHOLD) || (drift > DRIFT_THRESHOLD) {
                 info!(
                     "Janitor: ✂️ Splitting Bucket {} (Count {})",
@@ -256,143 +212,63 @@ impl Janitor {
                     Err(e) => error!("Merge failed: {}", e),
                 }
             }
-            // header.temperature()
         }
     }
-
-    // #[instrument(skip(self), level = "info")]
-    // async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
-    //     let start = std::time::Instant::now();
-
-    //     // 1. Extract Data
-    //     let memtable_arc = {
-    //         let frozen = self.index.frozen_memtable.read();
-    //         if let Some(m) = frozen.as_ref() {
-    //             m.clone()
-    //         } else {
-    //             drop(frozen);
-    //             match self.index.rotate_and_freeze()? {
-    //                 Some(m) => m,
-    //                 None => return Ok(None),
-    //             }
-    //         }
-    //     };
-
-    //     let data = memtable_arc.extract_all();
-    //     if data.is_empty() {
-    //         self.index.confirm_flush()?;
-    //         return Ok(None);
-    //     }
-
-    //     let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
-    //     let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
-
-    //     // 2. Train (if needed)
-    //     if self.index.get_quantizer().is_none() {
-    //         self.index.train(&vectors).await?;
-    //     }
-
-    //     // 3. Partition
-    //     let partitions = self.index.calculate_partitions(&ids, &vectors).await?;
-    //     if partitions.is_empty() {
-    //         self.index.confirm_flush()?;
-    //         return Ok(None);
-    //     }
-
-    //     info!("calculated {} partitions", partitions.len());
-
-    //     // 4. ⚡ PERSIST (Get Offsets) ⚡
-    //     let (run_id, locations) = self
-    //         .persistence
-    //         .write_partitioned_segment(&partitions, &self.index)
-    //         .await?;
-
-    //     // Extract just the (offset, len) for the Index Blob (SQ8) needed by BlockCache
-    //     // BucketLocation has many fields, we need 'index_offset' and 'index_length'
-    //     let offsets_map: HashMap<u32, (u64, u32)> = locations
-    //         .into_iter()
-    //         .map(|(id, loc)| (id, (loc.index_offset, loc.index_length as u32)))
-    //         .collect();
-
-    //     // 5. ⚡ REGISTER (Pass Offsets) ⚡
-    //     self.index
-    //         .register_partitions(&partitions, &run_id, &offsets_map)
-    //         .await?;
-
-    //     // 6. Cleanup
-    //     let deleted_snapshot: Vec<u64> = self.index.deleted_ids.read().iter().cloned().collect();
-    //     if !deleted_snapshot.is_empty() {
-    //         self.persistence
-    //             .flush_tombstones(&deleted_snapshot, &run_id)
-    //             .await?;
-    //     }
-    //     self.index.confirm_flush()?;
-
-    //     info!(
-    //         vectors = data.len(),
-    //         buckets = partitions.len(),
-    //         duration_ms = start.elapsed().as_millis(),
-    //         "Flush Complete"
-    //     );
-    //     Ok(Some(PathBuf::from(format!("segment_{}.drift", run_id))))
-    // }
 
     #[instrument(skip(self), level = "info")]
     async fn perform_flush(&self) -> std::io::Result<Option<std::path::PathBuf>> {
         let start = std::time::Instant::now();
-        info!("Janitor: Flush Step 1 - Extracting Data");
+        info!("Janitor: Flush Step 1 - Rotating MemTable");
 
-        // 1. Extract Data
-        let memtable_arc = {
-            let frozen = self.index.frozen_memtable.read();
-            if let Some(m) = frozen.as_ref() {
-                m.clone()
-            } else {
-                drop(frozen);
-                info!("Janitor: Flush Step 1.1 - Rotating MemTable");
-                match self.index.rotate_and_freeze()? {
-                    Some(m) => m,
-                    None => {
-                        info!("Janitor: Flush Aborted - Frozen slot occupied");
-                        return Ok(None);
-                    }
+        // 1. Rotate & Freeze
+        let memtable_arc = match self.index.rotate_and_freeze()? {
+            Some(m) => m,
+            None => {
+                let guard = self.index.frozen_memtable.read();
+                if let Some(existing) = guard.as_ref() {
+                    existing.clone()
+                } else {
+                    info!("Janitor: Flush Aborted - Frozen slot occupied but inaccessible?");
+                    return Ok(None);
                 }
             }
         };
 
-        let data = memtable_arc.extract_all();
-        if data.is_empty() {
+        if memtable_arc.len() == 0 {
             info!("Janitor: Flush Empty - Clearing Frozen");
             self.index.confirm_flush()?;
             return Ok(None);
         }
 
-        info!("Janitor: Flush Step 2 - Preparing {} vectors", data.len());
-        let vectors: Vec<Vec<f32>> = data.iter().map(|(_, v)| v.clone()).collect();
-        let ids: Vec<u64> = data.iter().map(|(id, _)| *id).collect();
-
-        // 2. Train (if needed)
-        let needs_training = self.index.get_quantizer().is_none();
-        if needs_training {
-            info!("Janitor: Flush Step 2.1 - Training Quantizer");
-            self.index.train(&vectors).await?;
+        info!("Janitor: Flush Step 2 - Training Quantizer");
+        if self.index.get_quantizer().is_none() {
+            self.index.train_from_memtable(&memtable_arc).await?;
         }
 
-        // 3. Partition
-        info!("Janitor: Flush Step 3 - Calculating Partitions");
-        // NOTE: This call enters drift_core where we added println logs
-        let partitions = self.index.calculate_partitions(&ids, &vectors).await?;
+        info!("Janitor: Flush Step 3 - Partitioning (CPU Offload)");
+
+        // ⚡ FIX: Offload synchronous CPU-heavy work to blocking thread.
+        // This avoids holding !Send locks across await points in the main task.
+        let index_clone = self.index.clone();
+        let memtable_clone = memtable_arc.clone();
+
+        let partitions =
+            tokio::task::spawn_blocking(move || index_clone.partition_memtable(&memtable_clone))
+                .await
+                .map_err(|e| std::io::Error::other(format!("Partition task failed: {}", e)))??;
 
         if partitions.is_empty() {
-            info!("Janitor: Flush - No partitions created (all deleted?)");
+            info!("Janitor: Flush - No partitions created");
             self.index.confirm_flush()?;
             return Ok(None);
         }
 
         info!(
-            "Janitor: Flush Step 4 - Writing {} partitions to disk",
+            "Janitor: Flush Step 4 - Writing {} partitions",
             partitions.len()
         );
+
+        // 4. Persist
         let (run_id, locations) = self
             .persistence
             .write_partitioned_segment(&partitions, &self.index)
@@ -403,29 +279,26 @@ impl Janitor {
             .map(|(id, loc)| (id, (loc.index_offset, loc.index_length as u32)))
             .collect();
 
-        info!("Janitor: Flush Step 5 - Registering Partitions");
         self.index
             .register_partitions(&partitions, &run_id, &offsets_map)
             .await?;
 
-        // 6. Cleanup
         let deleted_snapshot: Vec<u64> = self.index.deleted_ids.read().iter().cloned().collect();
         if !deleted_snapshot.is_empty() {
-            info!("Janitor: Flush Step 6 - Writing Tombstones");
             self.persistence
                 .flush_tombstones(&deleted_snapshot, &run_id)
                 .await?;
         }
 
-        info!("Janitor: Flush Step 7 - Confirming (Truncating WAL)");
         self.index.confirm_flush()?;
 
         info!(
-            vectors = data.len(),
+            vectors = memtable_arc.len(),
             buckets = partitions.len(),
             duration_ms = start.elapsed().as_millis(),
             "Janitor: Flush Complete"
         );
+
         Ok(Some(PathBuf::from(format!("segment_{}.drift", run_id))))
     }
 
@@ -447,7 +320,6 @@ impl Janitor {
             }
 
             // This load is atomic and safe.
-            // It reflects the current count updated by delete() calls.
             let dead = header
                 .stats
                 .tombstone_count

@@ -129,9 +129,44 @@ pub fn transpose_from_columns(columns: &[Vec<f32>], count: usize) -> Vec<Vec<f32
     vectors
 }
 
+/// Transpose scattered rows from a flat buffer.
+///
+/// # Arguments
+/// * `source` - The massive flat MemTable buffer.
+/// * `indices` - List of row indices to extract and transpose.
+/// * `dim` - Vector dimension.
+pub fn transpose_subset(source: &[f32], indices: &[usize], dim: usize) -> Vec<Vec<f32>> {
+    assert!(source.len() % dim == 0, "Invalid source length");
+
+    let n = indices.len();
+    if n == 0 {
+        return vec![Vec::new(); dim];
+    }
+
+    // Allocate columns (we must create these to compress them independently)
+    let mut columns = vec![Vec::with_capacity(n); dim];
+
+    for &row_idx in indices {
+        let start = row_idx * dim;
+        // Safety check
+        if start + dim > source.len() {
+            panic!("transpose_subset: Index out of bounds");
+        }
+
+        let vec_slice = &source[start..start + dim];
+        for (d, &val) in vec_slice.iter().enumerate() {
+            columns[d].push(val);
+        }
+    }
+    columns
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::compression::wrapper::{CompressedColumn, CompressionStrategy, transpose};
+    use crate::compression::wrapper::{
+        CompressedColumn, CompressionStrategy, transpose, transpose_subset,
+    };
+    use std::f32;
 
     #[test]
     fn test_transpose_logic() {
@@ -172,151 +207,130 @@ mod tests {
         }
     }
 
-    #[cfg(test)]
-    mod tests {
-        use crate::compression::wrapper::{CompressedColumn, CompressionStrategy, transpose};
-        use std::f32;
+    // ============================================================
+    // Test Category 1: The Transposition Engine
+    // ============================================================
 
-        // Helper for fuzzy float comparison
-        fn assert_floats_approx(a: &[f32], b: &[f32]) {
-            assert_eq!(a.len(), b.len(), "Length mismatch");
-            for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
-                // Bitwise comparison handles NaNs correctly if we expect exact preservation
-                // But ALP is lossless, so we expect exact bit matches for normal numbers.
-                // For NaNs, direct comparison fails, so we check is_nan.
-                if x.is_nan() {
-                    assert!(y.is_nan(), "Expected NaN at {}, got {}", i, y);
-                } else {
-                    assert_eq!(x, y, "Mismatch at index {}", i);
-                }
-            }
+    #[test]
+    fn test_transpose_basic() {
+        let vec1 = vec![1.0, 2.0];
+        let vec2 = vec![3.0, 4.0];
+        let input = vec![vec1, vec2];
+
+        let cols = transpose(&input, 2);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0], vec![1.0, 3.0]); // Column 0
+        assert_eq!(cols[1], vec![2.0, 4.0]); // Column 1
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 3")]
+    fn test_transpose_ragged_input_panics() {
+        let vec1 = vec![1.0, 2.0, 3.0];
+        let vec2 = vec![1.0, 2.0]; // Short vector
+        let input = vec![vec1, vec2];
+        transpose(&input, 3);
+    }
+
+    #[test]
+    fn test_transpose_empty_input() {
+        let input: Vec<Vec<f32>> = vec![];
+        let cols = transpose(&input, 128);
+        assert_eq!(cols.len(), 128); // Should have 128 empty columns
+        assert!(cols[0].is_empty());
+    }
+
+    // ============================================================
+    // Test Category 2: Data Distribution Edge Cases
+    // ============================================================
+
+    #[test]
+    fn test_compress_constant_values() {
+        // [Cite 250] Constant values (trailing zero / low variance) logic
+        let data = vec![42.0; 1000]; // Zero variance
+
+        let col = CompressedColumn::compress(&data, CompressionStrategy::AlpRd);
+        let recovered = col.decompress();
+
+        assert_floats_approx(&data, &recovered);
+
+        // Compression check: 1000 * 4 bytes = 4000 bytes.
+        // ALP should crush this to negligible size (headers + run length).
+        println!("Constant Data Size: {} -> {}", 4000, col.data.len());
+        assert!(col.data.len() < 200, "Constant compression failed");
+    }
+
+    #[test]
+    fn test_compress_toxic_floats() {
+        // ALP must handle NaNs, Infinities, and Denormals gracefully
+        let data = vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE, // Denormal
+        ];
+
+        let col = CompressedColumn::compress(&data, CompressionStrategy::AlpRd);
+        let recovered = col.decompress();
+
+        assert_floats_approx(&data, &recovered);
+    }
+
+    #[test]
+    fn test_compress_high_entropy_random() {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let data: Vec<f32> = (0..1000).map(|_| rng.random()).collect();
+
+        // High entropy data is hard to compress. ALP_RD should handle it via exceptions/dictionary
+        let col = CompressedColumn::compress(&data, CompressionStrategy::AlpRd);
+        let recovered = col.decompress();
+
+        assert_floats_approx(&data, &recovered);
+    }
+
+    // ============================================================
+    // Test Category 3: Scale Tests
+    // ============================================================
+
+    #[test]
+    fn test_openai_scale_simulation() {
+        // Simulate a Bucket of 100 OpenAI vectors (1536 dims)
+        // Total Floats: 153,600
+        let n_vecs = 100;
+        let dim = 1536;
+
+        // Create synthetic embedding-like data (normalized, small range)
+        let mut vectors = Vec::with_capacity(n_vecs);
+        for i in 0..n_vecs {
+            let v: Vec<f32> = (0..dim).map(|j| ((i + j) as f32).sin()).collect();
+            vectors.push(v);
         }
 
-        // ============================================================
-        // Test Category 1: The Transposition Engine
-        // ============================================================
+        // 1. Transpose
+        let columns = transpose(&vectors, dim);
+        assert_eq!(columns.len(), dim);
+        assert_eq!(columns[0].len(), n_vecs);
 
-        #[test]
-        fn test_transpose_basic() {
-            let vec1 = vec![1.0, 2.0];
-            let vec2 = vec![3.0, 4.0];
-            let input = vec![vec1, vec2];
+        // 2. Compress a single column (Simulate Segment Write)
+        let col_0 = &columns[0];
+        let compressed = CompressedColumn::compress(col_0, CompressionStrategy::AlpRd);
 
-            let cols = transpose(&input, 2);
-            assert_eq!(cols.len(), 2);
-            assert_eq!(cols[0], vec![1.0, 3.0]); // Column 0
-            assert_eq!(cols[1], vec![2.0, 4.0]); // Column 1
-        }
+        // 3. Verify Ratio
+        let raw_size = n_vecs * 4;
+        let comp_size = compressed.data.len();
+        println!(
+            "OpenAI Column Compression: {}b -> {}b (Ratio: {:.2}x)",
+            raw_size,
+            comp_size,
+            raw_size as f32 / comp_size as f32
+        );
 
-        #[test]
-        #[should_panic(expected = "expected 3")]
-        fn test_transpose_ragged_input_panics() {
-            let vec1 = vec![1.0, 2.0, 3.0];
-            let vec2 = vec![1.0, 2.0]; // Short vector
-            let input = vec![vec1, vec2];
-            transpose(&input, 3);
-        }
-
-        #[test]
-        fn test_transpose_empty_input() {
-            let input: Vec<Vec<f32>> = vec![];
-            let cols = transpose(&input, 128);
-            assert_eq!(cols.len(), 128); // Should have 128 empty columns
-            assert!(cols[0].is_empty());
-        }
-
-        // ============================================================
-        // Test Category 2: Data Distribution Edge Cases
-        // ============================================================
-
-        #[test]
-        fn test_compress_constant_values() {
-            // [Cite 250] Constant values (trailing zero / low variance) logic
-            let data = vec![42.0; 1000]; // Zero variance
-
-            let col = CompressedColumn::compress(&data, CompressionStrategy::AlpRd);
-            let recovered = col.decompress();
-
-            assert_floats_approx(&data, &recovered);
-
-            // Compression check: 1000 * 4 bytes = 4000 bytes.
-            // ALP should crush this to negligible size (headers + run length).
-            println!("Constant Data Size: {} -> {}", 4000, col.data.len());
-            assert!(col.data.len() < 200, "Constant compression failed");
-        }
-
-        #[test]
-        fn test_compress_toxic_floats() {
-            // ALP must handle NaNs, Infinities, and Denormals gracefully
-            let data = vec![
-                f32::NAN,
-                f32::INFINITY,
-                f32::NEG_INFINITY,
-                0.0,
-                -0.0,
-                f32::MIN_POSITIVE, // Denormal
-            ];
-
-            let col = CompressedColumn::compress(&data, CompressionStrategy::AlpRd);
-            let recovered = col.decompress();
-
-            assert_floats_approx(&data, &recovered);
-        }
-
-        #[test]
-        fn test_compress_high_entropy_random() {
-            use rand::Rng;
-            let mut rng = rand::rng();
-            let data: Vec<f32> = (0..1000).map(|_| rng.random()).collect();
-
-            // High entropy data is hard to compress. ALP_RD should handle it via exceptions/dictionary
-            let col = CompressedColumn::compress(&data, CompressionStrategy::AlpRd);
-            let recovered = col.decompress();
-
-            assert_floats_approx(&data, &recovered);
-        }
-
-        // ============================================================
-        // Test Category 3: Scale Tests
-        // ============================================================
-
-        #[test]
-        fn test_openai_scale_simulation() {
-            // Simulate a Bucket of 100 OpenAI vectors (1536 dims)
-            // Total Floats: 153,600
-            let n_vecs = 100;
-            let dim = 1536;
-
-            // Create synthetic embedding-like data (normalized, small range)
-            let mut vectors = Vec::with_capacity(n_vecs);
-            for i in 0..n_vecs {
-                let v: Vec<f32> = (0..dim).map(|j| ((i + j) as f32).sin()).collect();
-                vectors.push(v);
-            }
-
-            // 1. Transpose
-            let columns = transpose(&vectors, dim);
-            assert_eq!(columns.len(), dim);
-            assert_eq!(columns[0].len(), n_vecs);
-
-            // 2. Compress a single column (Simulate Segment Write)
-            let col_0 = &columns[0];
-            let compressed = CompressedColumn::compress(col_0, CompressionStrategy::AlpRd);
-
-            // 3. Verify Ratio
-            let raw_size = n_vecs * 4;
-            let comp_size = compressed.data.len();
-            println!(
-                "OpenAI Column Compression: {}b -> {}b (Ratio: {:.2}x)",
-                raw_size,
-                comp_size,
-                raw_size as f32 / comp_size as f32
-            );
-
-            // 4. Decompress
-            let recovered = compressed.decompress();
-            assert_floats_approx(col_0, &recovered);
-        }
+        // 4. Decompress
+        let recovered = compressed.decompress();
+        assert_floats_approx(col_0, &recovered);
     }
 
     #[allow(dead_code)]
@@ -332,15 +346,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "expected 3")]
-    fn test_transpose_ragged_input_panics() {
-        let vec1 = vec![1.0, 2.0, 3.0];
-        let vec2 = vec![1.0, 2.0]; // Short vector
-        let input = vec![vec1, vec2];
-        transpose(&input, 3);
-    }
-
-    #[test]
     fn test_transpose_logic_2() {
         let vec1 = vec![1.0, 2.0, 3.0];
         let vec2 = vec![4.0, 5.0, 6.0];
@@ -348,5 +353,61 @@ mod tests {
         let columns = transpose(&input, 3);
         assert_eq!(columns.len(), 3);
         assert_eq!(columns[0], vec![1.0, 4.0]);
+    }
+
+    #[test]
+    fn test_transpose_subset_scattering() {
+        let dim = 2;
+        // 4 vectors [v0, v1, v2, v3] flattened
+        // v0: [0.0, 0.1]
+        // v1: [1.0, 1.1]
+        // v2: [2.0, 2.1]
+        // v3: [3.0, 3.1]
+        let flat_data = vec![
+            0.0, 0.1, // Row 0
+            1.0, 1.1, // Row 1
+            2.0, 2.1, // Row 2
+            3.0, 3.1, // Row 3
+        ];
+
+        // We want to extract only Row 0 and Row 3 (Skipping 1 and 2)
+        let indices = vec![0, 3];
+
+        let columns = transpose_subset(&flat_data, &indices, dim);
+
+        assert_eq!(columns.len(), 2, "Should produce 2 columns (dim=2)");
+        assert_eq!(
+            columns[0].len(),
+            2,
+            "Each column should have 2 items (indices.len())"
+        );
+
+        // Column 0 should contain [v0[0], v3[0]] -> [0.0, 3.0]
+        assert_eq!(columns[0], vec![0.0, 3.0]);
+
+        // Column 1 should contain [v0[1], v3[1]] -> [0.1, 3.1]
+        assert_eq!(columns[1], vec![0.1, 3.1]);
+    }
+
+    #[test]
+    fn test_transpose_subset_empty() {
+        let flat_data = vec![1.0, 2.0];
+        let indices = vec![];
+        let dim = 2;
+
+        let columns = transpose_subset(&flat_data, &indices, dim);
+
+        assert_eq!(columns.len(), 2);
+        assert!(columns[0].is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Index out of bounds")]
+    fn test_transpose_subset_out_of_bounds() {
+        let flat_data = vec![1.0, 2.0]; // 1 vector
+        let indices = vec![5]; // Requesting index 5
+        let dim = 2;
+
+        transpose_subset(&flat_data, &indices, dim);
     }
 }

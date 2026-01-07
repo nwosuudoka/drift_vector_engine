@@ -30,38 +30,42 @@ impl KMeansTrainer {
         self
     }
 
-    pub fn train(&self, data: &[Vec<f32>]) -> KMeansResult {
+    /// Train using a flat buffer slice.
+    pub fn train(&self, data: &[f32]) -> KMeansResult {
         assert!(!data.is_empty(), "Cannot train on empty data");
-        assert_eq!(data[0].len(), self.dim, "Dimension mismatch");
+        assert_eq!(data.len() % self.dim, 0, "Dimension mismatch");
+        let num_samples = data.len() / self.dim;
 
-        // 1. Initialization (Optimized)
-        let mut centroids = self.init_kmeans_plus_plus(data);
-
+        // 1. Init
+        let mut centroids = self.init_kmeans_plus_plus(data, num_samples);
         let mut cluster_history_counts = vec![0usize; self.k];
         let mut rng = rand::rng();
 
         for _iter in 0..self.max_iter {
-            // A. Select Batch
+            // A. Batch Selection
             let batch_indices: Vec<usize> = if let Some(bs) = self.batch_size {
-                if bs >= data.len() {
-                    (0..data.len()).collect()
+                if bs >= num_samples {
+                    (0..num_samples).collect()
                 } else {
-                    (0..bs).map(|_| rng.random_range(0..data.len())).collect()
+                    (0..bs).map(|_| rng.random_range(0..num_samples)).collect()
                 }
             } else {
-                (0..data.len()).collect()
+                (0..num_samples).collect()
             };
 
-            // B. Parallel Assignment
+            // B. Parallel Assignment & Summation
             let batch_results: Vec<(usize, Vec<f32>, usize)> = batch_indices
                 .par_iter()
                 .fold(
                     || vec![(0, vec![0.0; self.dim], 0); self.k],
-                    |mut acc, &data_idx| {
-                        let vec = &data[data_idx];
-                        let (best_idx, _) = Self::nearest_centroid(vec, &centroids);
+                    |mut acc, &idx| {
+                        // ZERO-COPY ACCESS: Slice directly from flat buffer
+                        let start = idx * self.dim;
+                        let vec = &data[start..start + self.dim];
 
+                        let (best_idx, _) = Self::nearest_centroid(vec, &centroids);
                         let (_, sum_vec, count) = &mut acc[best_idx];
+
                         for i in 0..self.dim {
                             sum_vec[i] += vec[i];
                         }
@@ -82,9 +86,8 @@ impl KMeansTrainer {
                     },
                 );
 
-            // C. Update Centroids
+            // C. Centroid Update (Streaming Mean)
             let mut max_shift = 0.0f32;
-
             for (cluster_idx, (_, batch_sum, batch_count)) in batch_results.into_iter().enumerate()
             {
                 if batch_count == 0 {
@@ -95,9 +98,6 @@ impl KMeansTrainer {
                 let new_count = old_count + batch_count;
                 cluster_history_counts[cluster_idx] = new_count;
 
-                // Weighted update: Move centroid towards new batch mean
-                // Alpha (Learning Rate) = BatchCount / TotalHistory
-                // This simulates "streaming mean" updates.
                 let lr = batch_count as f32 / new_count as f32;
                 let momentum = 1.0 - lr;
 
@@ -105,14 +105,11 @@ impl KMeansTrainer {
                 for d in 0..self.dim {
                     let old_val = centroids[cluster_idx][d];
                     let batch_avg = batch_sum[d] / batch_count as f32;
-
                     let new_val = (old_val * momentum) + (batch_avg * lr);
-
                     centroids[cluster_idx][d] = new_val;
                     let diff = new_val - old_val;
                     current_shift_sq += diff * diff;
                 }
-
                 if current_shift_sq > max_shift {
                     max_shift = current_shift_sq;
                 }
@@ -123,10 +120,15 @@ impl KMeansTrainer {
             }
         }
 
-        // 4. Final Assignment (Must be over ALL data for correct partitioning)
-        let final_assignments = data
-            .par_iter()
-            .map(|vec| Self::nearest_centroid(vec, &centroids).0)
+        // Final Assignment Pass
+        // We map simply to the index, no need to clone floats here.
+        let final_assignments = (0..num_samples)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let vec = &data[start..start + self.dim];
+                Self::nearest_centroid(vec, &centroids).0
+            })
             .collect();
 
         KMeansResult {
@@ -135,48 +137,51 @@ impl KMeansTrainer {
         }
     }
 
-    fn init_kmeans_plus_plus(&self, data: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    fn init_kmeans_plus_plus(&self, data: &[f32], num_samples: usize) -> Vec<Vec<f32>> {
         let mut rng = rand::rng();
         let mut centroids = Vec::with_capacity(self.k);
-        let n = data.len();
-        if n == 0 {
+
+        if num_samples == 0 {
             return centroids;
         }
 
-        // ⚡ OPTIMIZATION: Subsample for Initialization
-        // If we are in mini-batch mode, or data is huge, we only look at a subset
-        // to pick initial centroids. Scanning 100M items for init is too slow.
         let pool_limit = if let Some(bs) = self.batch_size {
-            (bs * 10).clamp(1000, 20_000).min(n)
+            (bs * 10).clamp(1000, 20_000).min(num_samples)
         } else {
-            // For full mode, limit to 50k to be safe
-            50_000.min(n)
+            50_000.min(num_samples)
         };
 
-        // Create the pool indices
-        let indices: Vec<usize> = if pool_limit < n {
-            (0..pool_limit).map(|_| rng.random_range(0..n)).collect()
+        // Pick indices
+        let indices: Vec<usize> = if pool_limit < num_samples {
+            (0..pool_limit)
+                .map(|_| rng.random_range(0..num_samples))
+                .collect()
         } else {
-            (0..n).collect()
+            (0..num_samples).collect()
         };
 
-        // 1. Pick first random
-        centroids.push(data[indices[rng.random_range(0..pool_limit)]].clone());
+        // 1. First Centroid
+        let first_idx = indices[rng.random_range(0..pool_limit)];
+        let start = first_idx * self.dim;
+        centroids.push(data[start..start + self.dim].to_vec());
 
-        // 2. K-Means++ on the POOL (not full data)
+        // 2. Remaining Centroids
         for _ in 1..self.k {
             let mut dists = vec![0.0; pool_limit];
             let mut total_dist_sq = 0.0;
 
             for (i, &data_idx) in indices.iter().enumerate() {
-                let vec = &data[data_idx];
+                let start = data_idx * self.dim;
+                let vec = &data[start..start + self.dim];
                 let (_, d_sq) = Self::nearest_centroid(vec, &centroids);
                 dists[i] = d_sq;
                 total_dist_sq += d_sq;
             }
 
             if total_dist_sq <= 0.0 {
-                centroids.push(data[indices[rng.random_range(0..pool_limit)]].clone());
+                let idx = indices[rng.random_range(0..pool_limit)];
+                let start = idx * self.dim;
+                centroids.push(data[start..start + self.dim].to_vec());
                 continue;
             }
 
@@ -185,7 +190,9 @@ impl KMeansTrainer {
             for (i, &d) in dists.iter().enumerate() {
                 cumulative += d;
                 if cumulative >= target {
-                    centroids.push(data[indices[i]].clone());
+                    let idx = indices[i];
+                    let start = idx * self.dim;
+                    centroids.push(data[start..start + self.dim].to_vec());
                     break;
                 }
             }
@@ -197,10 +204,9 @@ impl KMeansTrainer {
     fn nearest_centroid(vec: &[f32], centroids: &[Vec<f32>]) -> (usize, f32) {
         let mut min_dist = f32::MAX;
         let mut best_idx = 0;
-
         for (i, c) in centroids.iter().enumerate() {
+            // Using l2_sq from crate::math would be better, but implementing inline for self-containment in this refactor
             let dist_sq: f32 = vec.iter().zip(c.iter()).map(|(a, b)| (a - b).powi(2)).sum();
-
             if dist_sq < min_dist {
                 min_dist = dist_sq;
                 best_idx = i;
@@ -217,6 +223,8 @@ mod tests {
     #[test]
     fn test_kmeans_dimensions() {
         let data = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let data = data.into_iter().flatten().collect::<Vec<f32>>();
+
         let trainer = KMeansTrainer::new(1, 3, 10);
         let result = trainer.train(&data);
 
@@ -242,6 +250,8 @@ mod tests {
         for _ in 0..100 {
             data.push(vec![-10.0, -10.0]);
         }
+
+        let data = data.into_iter().flatten().collect::<Vec<f32>>();
 
         let trainer = KMeansTrainer::new(2, 2, 20);
         let result = trainer.train(&data);
@@ -276,6 +286,8 @@ mod tests {
         // With K=1, the centroid MUST be the exact average of all points.
         // Avg([1,4])=2.5, Avg([2,5])=3.5, Avg([3,6])=4.5
 
+        let data = data.into_iter().flatten().collect::<Vec<f32>>();
+
         let trainer = KMeansTrainer::new(1, 3, 10);
         let result = trainer.train(&data);
 
@@ -300,6 +312,7 @@ mod tests {
         for _ in 0..50 {
             data.push(vec![0.0; dim]);
         }
+        let data = data.into_iter().flatten().collect::<Vec<f32>>();
 
         let trainer = KMeansTrainer::new(2, dim, 10);
         let result = trainer.train(&data);
@@ -331,6 +344,7 @@ mod tests {
         for _ in 0..100 {
             data.push(vec![1.0; dim]);
         }
+        let data = data.into_iter().flatten().collect::<Vec<f32>>();
 
         // We ask for K=5. This is impossible (only 1 distinct point exists).
         // The algorithm should not crash (NaN) or panic.
@@ -352,7 +366,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Cannot train on empty data")]
     fn test_panic_on_empty_input() {
-        let data: Vec<Vec<f32>> = vec![];
+        let data: Vec<f32> = vec![];
         let trainer = KMeansTrainer::new(2, 4, 10);
         trainer.train(&data);
     }
@@ -361,7 +375,9 @@ mod tests {
     #[should_panic(expected = "Dimension mismatch")]
     fn test_panic_on_dimension_mismatch() {
         let data = vec![vec![1.0, 2.0]]; // 2D data
-        let trainer = KMeansTrainer::new(2, 128, 10); // Trainer expects 128D
+        let data = data.into_iter().flatten().collect::<Vec<f32>>();
+
+        let trainer = KMeansTrainer::new(5, 128, 10); // Trainer expects 128D
         trainer.train(&data);
     }
 
@@ -383,6 +399,8 @@ mod tests {
             let point: Vec<f32> = center.iter().map(|&c| c + rng.random::<f32>()).collect();
             data.push(point);
         }
+
+        let data = data.into_iter().flatten().collect::<Vec<f32>>();
 
         // A. Standard (Full)
         let start_full = std::time::Instant::now();

@@ -1,5 +1,7 @@
 use crate::DriftFooter;
-use crate::compression::wrapper::{CompressedColumn, CompressionStrategy, transpose};
+use crate::compression::wrapper::{
+    CompressedColumn, CompressionStrategy, transpose, transpose_subset,
+};
 use crate::disk_manager::DiskManager;
 use crc32fast::Hasher;
 use drift_core::bucket::BucketData;
@@ -173,21 +175,26 @@ impl SegmentWriter {
     pub fn prepare_bucket_data(
         _bucket_id: u32,
         bucket: &BucketData,
-        raw_vectors: &[Vec<f32>],
+        flat_data: &[f32],
+        indices: &[usize],
         dim: usize,
     ) -> (Vec<u8>, Vec<u8>, usize) {
-        // 1. Hot Index Bytes (SQ8) [cite: 3765, 3766]
         let index_bytes = bucket.to_bytes(dim).unwrap();
 
-        // 2. Cold Data Bytes (ALP) - This is the CPU intensive part
         let mut data_bytes = Vec::new();
-        let columns = crate::compression::wrapper::transpose(raw_vectors, dim);
+
+        if indices.is_empty() {
+            return (index_bytes, data_bytes, 0);
+        }
+
+        // ⚡ Use the new scattered transpose
+        let columns = transpose_subset(flat_data, indices, dim);
+
         for col_floats in columns {
-            let compressed = CompressedColumn::compress(
-                &col_floats,
-                crate::compression::wrapper::CompressionStrategy::AlpRd,
-            );
-            data_bytes.extend_from_slice(&(compressed.data.len() as u32).to_le_bytes());
+            let compressed = CompressedColumn::compress(&col_floats, CompressionStrategy::AlpRd);
+            // Write Length Prefix (4 bytes)
+            let len = compressed.data.len() as u32;
+            data_bytes.extend_from_slice(&len.to_le_bytes());
             data_bytes.extend_from_slice(&compressed.data);
         }
 
@@ -199,12 +206,17 @@ impl SegmentWriter {
         bucket_id: u32,
         index_bytes: Vec<u8>,
         data_bytes: Vec<u8>,
-        vector_count: usize,
+        ids: &[u64], // ⚡ NEW: Pass IDs to update Bloom Filter
     ) -> io::Result<()> {
         let idx_start = self.current_offset;
         self.scratch_file.write_all(&index_bytes).await?;
         self.current_offset += index_bytes.len() as u64;
         let idx_len = self.current_offset - idx_start;
+
+        // ⚡ Update Bloom Filter
+        for &id in ids {
+            self.bloom.insert(&id.to_le_bytes());
+        }
 
         let dat_start = self.current_offset;
         self.scratch_file.write_all(&data_bytes).await?;
@@ -218,7 +230,7 @@ impl SegmentWriter {
                 index_length: idx_len,
                 data_offset: dat_start,
                 data_length: dat_len,
-                vector_count,
+                vector_count: ids.len(), // Use ids.len() instead of passing explicit count
                 compression_type: 1,
             },
         );

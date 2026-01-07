@@ -1,10 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::index::{IndexOptions, MaintenanceStatus, VectorIndex};
-    use crossbeam_epoch::{self as epoch};
     use drift_cache::local_store::LocalDiskManager;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
     use tempfile::TempDir;
 
     // Helper to setup Async Index
@@ -42,16 +40,13 @@ mod tests {
         }
         index.train(&train).await.unwrap();
 
+        // ⚡ CHANGE: Use RwLock read()
         let left_id = {
-            let guard = epoch::pin();
-            let centroids =
-                unsafe { index.centroids.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+            let centroids = index.centroids.read();
             centroids.iter().find(|c| c.vector[0] < 0.0).unwrap().id
         };
         let right_id = {
-            let guard = epoch::pin();
-            let centroids =
-                unsafe { index.centroids.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+            let centroids = index.centroids.read();
             centroids.iter().find(|c| c.vector[0] > 0.0).unwrap().id
         };
 
@@ -62,53 +57,22 @@ mod tests {
             .unwrap();
 
         // HACK 1: Reset RIGHT Centroid to force it to accept the defector later
-        // (This existed in your previous code)
-        {
-            let guard = epoch::pin();
-            loop {
-                let shared = index.buckets.load(Ordering::Acquire, &guard);
-                let current = unsafe { shared.as_ref() }.unwrap();
-                let mut new_map = current.clone();
-                if let Some(h) = new_map.get_mut(&right_id) {
-                    h.centroid = vec![10.0, 0.0]; // Force it "Far Right"
-                }
-                if index
-                    .buckets
-                    .compare_exchange(
-                        shared,
-                        epoch::Owned::new(new_map),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                        &guard,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
+        // ⚡ CHANGE: Use helper methods instead of CAS loops
+        index.update_buckets(|current| {
+            let mut new = current.clone();
+            if let Some(h) = new.get_mut(&right_id) {
+                h.centroid = vec![10.0, 0.0]; // Force it "Far Right"
             }
-            // Also update Centroids list to match
-            loop {
-                let shared = index.centroids.load(Ordering::Acquire, &guard);
-                let current = unsafe { shared.as_ref() }.unwrap();
-                let mut new_vec = current.clone();
-                if let Some(c) = new_vec.iter_mut().find(|c| c.id == right_id) {
-                    c.vector = vec![10.0, 0.0];
-                }
-                if index
-                    .centroids
-                    .compare_exchange(
-                        shared,
-                        epoch::Owned::new(new_vec),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                        &guard,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
+            new
+        });
+
+        index.update_centroids(|current| {
+            let mut new = current.clone();
+            if let Some(c) = new.iter_mut().find(|c| c.id == right_id) {
+                c.vector = vec![10.0, 0.0];
             }
-        }
+            new
+        });
 
         // 3. Setup LEFT Bucket (The Split Candidate)
         let mut left_ids = Vec::new();
@@ -124,35 +88,15 @@ mod tests {
             .await
             .unwrap();
 
-        // ⚡ FIX: HACK 2: Manually skew LEFT Centroid to create DRIFT ⚡
-        // force_register set the centroid to -9.0 (the data mean). Drift is 0.
-        // We force the header centroid to -5.0.
-        // Drift = Distance(-9.0, -5.0) = 4.0. This is > 0.15 threshold.
-        {
-            let guard = epoch::pin();
-            loop {
-                let shared = index.buckets.load(Ordering::Acquire, &guard);
-                let current = unsafe { shared.as_ref() }.unwrap();
-                let mut new_map = current.clone();
-                if let Some(h) = new_map.get_mut(&left_id) {
-                    h.centroid = vec![-5.0, 0.0]; // <--- ARTIFICIAL DRIFT
-                }
-                if index
-                    .buckets
-                    .compare_exchange(
-                        shared,
-                        epoch::Owned::new(new_map),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                        &guard,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
+        // HACK 2: Manually skew LEFT Centroid to create DRIFT
+        // ⚡ CHANGE: Use helper
+        index.update_buckets(|current| {
+            let mut new = current.clone();
+            if let Some(h) = new.get_mut(&left_id) {
+                h.centroid = vec![-5.0, 0.0]; // <--- ARTIFICIAL DRIFT (Distance 4.0 > 0.15)
             }
-            // No need to update global centroids list for split logic, it checks the BucketHeader.
-        }
+            new
+        });
 
         // 4. Trigger Split
         let status = index.split_and_steal(left_id).await.unwrap();
@@ -186,9 +130,7 @@ mod tests {
         index.train(&train).await.unwrap();
 
         let (left_id, right_id) = {
-            let guard = epoch::pin();
-            let centroids =
-                unsafe { index.centroids.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+            let centroids = index.centroids.read();
             let left = centroids.iter().find(|c| c.vector[0] < 0.0).unwrap().id;
             let right = centroids.iter().find(|c| c.vector[0] > 0.0).unwrap().id;
             (left, right)
@@ -210,31 +152,15 @@ mod tests {
             .await
             .unwrap();
 
-        // ⚡ FIX: HACK: Manually skew LEFT Centroid to create DRIFT ⚡
-        {
-            let guard = epoch::pin();
-            loop {
-                let shared = index.buckets.load(Ordering::Acquire, &guard);
-                let current = unsafe { shared.as_ref() }.unwrap();
-                let mut new_map = current.clone();
-                if let Some(h) = new_map.get_mut(&left_id) {
-                    h.centroid = vec![-5.0, 0.0]; // <--- ARTIFICIAL DRIFT
-                }
-                if index
-                    .buckets
-                    .compare_exchange(
-                        shared,
-                        epoch::Owned::new(new_map),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                        &guard,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
+        // HACK: Manually skew LEFT Centroid to create DRIFT
+        // ⚡ CHANGE: Use helper
+        index.update_buckets(|current| {
+            let mut new = current.clone();
+            if let Some(h) = new.get_mut(&left_id) {
+                h.centroid = vec![-5.0, 0.0]; // <--- ARTIFICIAL DRIFT
             }
-        }
+            new
+        });
 
         // Seed RIGHT bucket
         let mut right_ids = vec![777u64];
@@ -281,9 +207,7 @@ mod tests {
         index.train(&train_data).await.unwrap();
 
         let near_zero_bucket = {
-            let guard = epoch::pin();
-            let buckets =
-                unsafe { index.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+            let buckets = index.buckets.read();
             buckets
                 .iter()
                 .min_by(|(_, a), (_, b)| {
@@ -319,9 +243,7 @@ mod tests {
         index.train(&train_data).await.unwrap();
 
         let (id_0, _) = {
-            let guard = epoch::pin();
-            let buckets =
-                unsafe { index.buckets.load(Ordering::Acquire, &guard).as_ref() }.unwrap();
+            let buckets = index.buckets.read();
             buckets
                 .iter()
                 .find(|(_, b)| b.centroid[0] < 50.0)
@@ -333,6 +255,11 @@ mod tests {
             .force_register_bucket_with_ids(id_0, &[888], &[vec![99.0, 99.0]])
             .await
             .unwrap();
+
+        // The bucket is "zombie" because force_register overwrites it,
+        // effectively deleting the old data (in test context) or just adding to it.
+        // scatter_merge logic detects it has drifted.
+
         index.scatter_merge(id_0).await.unwrap();
 
         let results = index

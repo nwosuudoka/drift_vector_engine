@@ -7,10 +7,10 @@ mod tests {
         // 1. Train on a simple range [0.0, 100.0]
         let mut data = Vec::new();
         for i in 0..100 {
-            data.push(vec![i as f32]);
+            data.push(i as f32);
         }
 
-        let q = Quantizer::train(&data);
+        let q = Quantizer::train(&data, 1);
 
         // 2. Encode & Reconstruct a known value
         let input = vec![50.0];
@@ -27,9 +27,10 @@ mod tests {
         // Train on [0, 100]
         let mut data = Vec::new();
         for i in 0..101 {
-            data.push(vec![i as f32]);
+            data.push(i as f32);
         }
-        let q = Quantizer::train(&data);
+
+        let q = Quantizer::train(&data, 1);
 
         // Encode a massive outlier (1000.0)
         // The Quantizer should clamp this to 255 (the max value representing ~100.0)
@@ -46,10 +47,13 @@ mod tests {
     #[test]
     fn test_constant_dimension_safety() {
         // Dim 0 varies, Dim 1 is always 5.0
-        let data = vec![vec![1.0, 5.0], vec![2.0, 5.0], vec![3.0, 5.0]];
+        let data = vec![vec![1.0, 5.0], vec![2.0, 5.0], vec![3.0, 5.0]]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<f32>>();
 
         // Should not panic (Division by Zero check)
-        let q = Quantizer::train(&data);
+        let q = Quantizer::train(&data, 2);
 
         let input = vec![1.5, 5.0];
         let _code = q.encode(&input);

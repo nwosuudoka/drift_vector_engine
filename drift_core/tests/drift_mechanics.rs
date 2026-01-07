@@ -97,8 +97,9 @@ fn test_saturating_density_equation_2() {
 async fn test_budgeted_scatter_merge_strictness() {
     // Setup Index
     let dir = tempdir().unwrap();
+    let dim = 2;
     let options = IndexOptions {
-        dim: 2,
+        dim,
         max_bucket_capacity: 100,
         ..Default::default()
     };
@@ -123,11 +124,12 @@ async fn test_budgeted_scatter_merge_strictness() {
     // 1. PREPARE DATA
     let ids: Vec<u64> = (0..51).collect();
     let vectors: Vec<Vec<f32>> = (0..51).map(|_| vec![0.1, 0.1]).collect();
+    let vectors_flat = vectors.iter().flatten().cloned().collect::<Vec<_>>();
 
     // 2. ⚡ FIX: INITIALIZE QUANTIZER ⚡
     // The index needs to know how to compress floats to bytes.
     // We train it on the data we are about to insert.
-    let q = Quantizer::train(&vectors);
+    let q = Quantizer::train(&vectors_flat, dim);
     index.set_quantizer(q); // <--- This prevents the Panic
 
     // 3. Force bucket ID 1 (OVER BUDGET > 50)
