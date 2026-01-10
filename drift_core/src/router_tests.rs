@@ -17,8 +17,10 @@ mod tests {
                 vector: vec![10.0, 10.0],
             },
         ];
+        // Dummy counts for L2 routing test
+        let counts = vec![100, 100];
 
-        let router = Router::new(&centroids, 2, "L2").unwrap();
+        let router = Router::new(&centroids, &counts, 2, "L2").unwrap();
 
         // Query: [1, 1] -> Should be closer to C1
         let q1 = vec![1.0, 1.0];
@@ -44,8 +46,9 @@ mod tests {
                 vector: vec![0.0, 1.0],
             },
         ];
+        let counts = vec![100, 100];
 
-        let router = Router::new(&centroids, 2, "COSINE").unwrap();
+        let router = Router::new(&centroids, &counts, 2, "COSINE").unwrap();
 
         // Query: [0.9, 0.1] -> Closer angle to X-axis (C1)
         assert_eq!(router.route(&vec![0.9, 0.1]), 1);
@@ -63,7 +66,8 @@ mod tests {
                 vector: vec![0.0],
             }, // Dim 1
         ];
+        let counts = vec![100];
         // Init with Dim 2 -> Panic
-        Router::new(&centroids, 2, "L2");
+        Router::new(&centroids, &counts, 2, "L2");
     }
 }

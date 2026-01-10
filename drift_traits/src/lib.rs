@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::fmt::Debug;
 use std::io::Result;
 use std::path::PathBuf;
 
@@ -13,7 +14,7 @@ pub struct PageId {
 
 #[async_trait]
 pub trait PageManager: Send + Sync {
-    /// Maps a logical ID (e.g., 1) to a physical path (e.g., "/data/segment_123.drift")
+    /// Maps a logical ID (BucketID) to a physical path (e.g., "segment_uuid.drift")
     fn register_file(&self, file_id: u32, path: PathBuf);
 
     /// Fetches a raw blob from storage.
@@ -38,6 +39,8 @@ pub trait PageManager: Send + Sync {
             "High-fidelity reads not supported by this manager",
         ))
     }
+
+    async fn len(&self, file_id: u32) -> Result<u64>;
 }
 
 // Trait for object that can be cached (e.g Buckets).
@@ -47,4 +50,19 @@ pub trait Cacheable: Send + Sync + 'static {
     where
         Self: Sized;
     // We strictly use Arc for cache entries to allow cheap cloning
+}
+
+/// Represents a component capable of searching stored vectors.
+/// Implemented by `BucketManager` in the storage layer.
+#[async_trait]
+pub trait DiskSearcher: Send + Sync {
+    /// Searches specific buckets on disk.
+    ///
+    /// # Arguments
+    /// * `bucket_ids`: The list of buckets to query (determined by Router).
+    /// * `query`: The vector to search for.
+    /// * `k`: Number of results.
+    ///
+    /// Returns a flat list of (id, distance).
+    async fn search(&self, bucket_ids: &[u32], query: &[f32], k: usize) -> Vec<(u64, f32)>;
 }

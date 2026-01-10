@@ -1,204 +1,162 @@
-use crate::compression::wrapper::{
-    CompressionStrategy, decompress_vectors, transpose_from_columns,
+use crate::format::{
+    DriftFooter, FOOTER_SIZE, HEADER_SIZE, MAGIC_V2, ROW_GROUP_HEADER_SIZE, RowGroupHeader,
 };
-use crate::format::{DriftHeader, HEADER_SIZE, ROW_GROUP_HEADER_SIZE, RowGroupHeader};
 use byteorder::{LittleEndian, ReadBytesExt};
-use crc32fast::Hasher;
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
-use zerocopy::{FromBytes, FromZeros, IntoBytes};
+use drift_core::bucket::compute_distance_lut; // SIMD Kernel
+use drift_core::quantizer::Quantizer;
+use drift_traits::{PageId, PageManager};
+use std::io::{self, Cursor};
+use std::sync::Arc;
+use zerocopy::FromBytes;
 
-/// A reader for .drift v2 files.
-/// Optimized for "Stream-First" access but supports random access via offsets.
-pub struct BucketFileReader<R: Read + Seek> {
-    reader: R,
-    #[allow(dead_code)]
-    header: DriftHeader,
-    current_offset: u64,
-    next_header_offset: u64,
+pub struct BucketFileReader {
+    storage: Arc<dyn PageManager>,
+    file_id: u32,
+    quantizer: Option<Quantizer>,
 }
 
-impl<R: Read + Seek> BucketFileReader<R> {
-    pub fn new(mut reader: R) -> io::Result<Self> {
-        // 1. Read File Header
-        // let mut header_buf = [0u8; HEADER_SIZE];
-        // reader.read_exact(&mut header_buf)?;
-        let mut header = DriftHeader::new_zeroed();
-
-        reader.read_exact(header.as_mut_bytes())?;
-
-        if !header.validate() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid Magic/Version",
-            ));
+impl BucketFileReader {
+    pub fn new(storage: Arc<dyn PageManager>, file_id: u32) -> Self {
+        Self {
+            storage,
+            file_id,
+            quantizer: None,
         }
-
-        Ok(Self {
-            reader,
-            header,
-            current_offset: HEADER_SIZE as u64,
-            next_header_offset: HEADER_SIZE as u64,
-        })
     }
 
-    /// Reads the next Row Group from the stream.
-    /// Returns `None` if EOF.
-    ///
-    /// # Flow
-    /// 1. Seek to start of this group (Skipping previous cold data if unread).
-    /// 2. Read RG Header.
-    /// 3. Read Hot Index (SQ8 + IDs).
-    /// 4. Advance internal state to point to start of Cold Data.
-    /// 5. Calculate `next_header_offset` for the future.
-    pub fn read_next_group(&mut self) -> io::Result<Option<RowGroup<'_, R>>> {
-        // 1. Fast-Forward if needed (Skip previous unread cold data)
-        if self.current_offset < self.next_header_offset {
-            let skip = self.next_header_offset - self.current_offset;
-            self.reader.seek(SeekFrom::Current(skip as i64))?;
-            self.current_offset = self.next_header_offset;
+    /// Loads the Quantizer from the file footer.
+    pub async fn load_quantizer(&mut self) -> io::Result<()> {
+        if self.quantizer.is_some() {
+            return Ok(());
         }
 
-        // 2. Read RG Header
-        let mut buf = [0u8; ROW_GROUP_HEADER_SIZE];
-        let mut bytes_read = 0;
-        // Robust read loop for Header
-        while bytes_read < ROW_GROUP_HEADER_SIZE {
-            let n = self.reader.read(&mut buf[bytes_read..])?;
-            if n == 0 {
-                if bytes_read == 0 {
-                    return Ok(None); // Clean EOF
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "Partial RG Header",
-                    ));
-                }
-            }
-            bytes_read += n;
+        let file_len = self.storage.len(self.file_id).await?;
+        if file_len < FOOTER_SIZE as u64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "File too small"));
         }
 
-        let rg_header = RowGroupHeader::read_from_bytes(&buf).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid RG Header {e}"))
+        // 1. Read Footer
+        let footer_page = PageId {
+            file_id: self.file_id,
+            offset: file_len - FOOTER_SIZE as u64,
+            length: FOOTER_SIZE as u32,
+        };
+        let footer_bytes = self.storage.read_page(footer_page).await?;
+
+        let footer = DriftFooter::read_from_bytes(&footer_bytes).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Invalid Footer {e}"))
         })?;
 
-        self.current_offset += ROW_GROUP_HEADER_SIZE as u64;
-
-        // 3. Update State for NEXT call
-        // The next header starts after this group's cold data.
-        self.next_header_offset = rg_header.cold_offset + rg_header.cold_length as u64;
-
-        // 4. Read Hot Index (IDs + SQ8)
-        let hot_len = rg_header.hot_length as usize;
-        let mut hot_buffer = vec![0u8; hot_len];
-        self.reader.read_exact(&mut hot_buffer)?;
-        self.current_offset += hot_len as u64;
-
-        // 5. Seek to Cold Start (Skip Padding)
-        // This puts the file pointer exactly at the start of Cold Data.
-        let next_cold_start = rg_header.cold_offset;
-        if next_cold_start > self.current_offset {
-            let pad = next_cold_start - self.current_offset;
-            self.reader.seek(SeekFrom::Current(pad as i64))?;
-            self.current_offset += pad;
+        if footer.magic != MAGIC_V2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid Magic"));
         }
 
-        Ok(Some(RowGroup {
-            header: rg_header,
-            hot_data: hot_buffer,
-            reader_ref: self,
-        }))
+        // 2. Read Quantizer Blob
+        let q_page = PageId {
+            file_id: self.file_id,
+            offset: footer.quantizer_offset,
+            length: footer.quantizer_length,
+        };
+        let q_bytes = self.storage.read_page(q_page).await?;
+
+        let (q, _): (Quantizer, usize) =
+            bincode::decode_from_slice(&q_bytes, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        self.quantizer = Some(q);
+        Ok(())
     }
-}
 
-/// Represents a single Row Group being processed.
-/// Holds the Hot Data in RAM, and a reference to the Reader to fetch Cold Data on demand.
-pub struct RowGroup<'a, R: Read + Seek> {
-    pub header: RowGroupHeader,
-    pub hot_data: Vec<u8>,
-    reader_ref: &'a mut BucketFileReader<R>,
-}
+    pub async fn scan(&mut self, query: &[f32], _k: usize) -> io::Result<Vec<(u64, f32)>> {
+        if self.quantizer.is_none() {
+            self.load_quantizer().await?;
+        }
+        let q = self.quantizer.as_ref().unwrap();
+        let lut = q.precompute_lut(query);
+        let dim = query.len();
 
-impl<'a, R: Read + Seek> RowGroup<'a, R> {
-    /// Decodes the Hot Index (IDs + SQ8 Codes).
-    /// Returns (IDs, Flat SQ8 Codes).
-    pub fn decode_hot_index(&self, dim: usize) -> io::Result<(Vec<u64>, Vec<u8>)> {
-        let count = self.header.vector_count as usize;
-        // Hot Buffer Layout: [IDs (u64 array)] [SQ8 Codes (u8 array)] [Tombstone Len] [Tombstones]
-        let id_section_len = count * 8;
+        let mut results = Vec::new();
+        let mut current_offset = HEADER_SIZE as u64;
 
-        if self.hot_data.len() < id_section_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Hot buffer too small for IDs",
-            ));
+        loop {
+            // A. Read RG Header
+            let head_page = PageId {
+                file_id: self.file_id,
+                offset: current_offset,
+                length: ROW_GROUP_HEADER_SIZE as u32,
+            };
+
+            // Check file bounds implicitly via read failure or partial read?
+            // PageManager returns error on out of bounds usually.
+            let rg_bytes = match self.storage.read_page(head_page).await {
+                Ok(b) if b.len() == ROW_GROUP_HEADER_SIZE => b,
+                _ => break, // EOF
+            };
+
+            let rg = RowGroupHeader::read_from_bytes(&rg_bytes).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("Bad RG Header {e}"))
+            })?;
+
+            // B. Read Hot Index (IDs + SQ8)
+            let hot_len = rg.hot_length;
+            let hot_page = PageId {
+                file_id: self.file_id,
+                offset: rg.hot_offset,
+                length: hot_len,
+            };
+            let hot_blob = self.storage.read_page(hot_page).await?;
+
+            // C. Scan
+            let chunk_res = self.scan_row_group(&rg, &hot_blob, &lut, dim);
+            results.extend(chunk_res);
+
+            // D. Advance
+            current_offset = rg.cold_offset + rg.cold_length as u64;
         }
 
-        let mut cursor = Cursor::new(&self.hot_data);
+        Ok(results)
+    }
 
-        // 1. Read IDs
+    fn scan_row_group(
+        &self,
+        header: &RowGroupHeader,
+        hot_blob: &[u8],
+        lut: &[f32],
+        dim: usize,
+    ) -> Vec<(u64, f32)> {
+        let count = header.vector_count as usize;
+        let mut results = Vec::with_capacity(count);
+
+        // 1. Decode IDs
+        let mut cursor = Cursor::new(hot_blob);
         let mut ids = Vec::with_capacity(count);
         for _ in 0..count {
-            ids.push(cursor.read_u64::<LittleEndian>()?);
+            if let Ok(id) = cursor.read_u64::<LittleEndian>() {
+                ids.push(id);
+            }
         }
 
-        // 2. Read SQ8 Codes
-        let code_len = count * dim;
-        let mut codes = vec![0u8; code_len];
-        cursor.read_exact(&mut codes)?;
-
-        // 3. (Optional) Read Tombstones - logic would go here
-
-        Ok((ids, codes))
-    }
-
-    /// Fetches and decompresses the Cold Data (High-Fidelity Vectors).
-    /// CAUTION: This performs I/O.
-    pub fn fetch_cold_vectors(&mut self, dim: usize) -> io::Result<Vec<f32>> {
-        let cold_len = self.header.cold_length as usize;
-        let mut cold_buffer = vec![0u8; cold_len];
-
-        // Ensure reader is at the right spot (should be, unless seeking happened externally)
-        // For safety, we seek absolute.
-        self.reader_ref
-            .reader
-            .seek(SeekFrom::Start(self.header.cold_offset))?;
-        self.reader_ref.reader.read_exact(&mut cold_buffer)?;
-
-        // Update reader offset tracker
-        self.reader_ref.current_offset = self.header.cold_offset + cold_len as u64;
-
-        // Verify Checksum
-        let mut hasher = Hasher::new();
-        hasher.update(&self.hot_data);
-        hasher.update(&cold_buffer);
-        if hasher.finalize() != self.header.checksum {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Checksum Mismatch",
-            ));
+        // 2. Decode SQ8 Codes
+        let ids_size = cursor.position() as usize;
+        if ids_size >= hot_blob.len() {
+            return results;
         }
 
-        // Decompress
-        // Format: [Len][Bytes] repeated for each column
-        let mut cursor = Cursor::new(&cold_buffer);
-        let mut columns = Vec::with_capacity(dim);
-
-        for _ in 0..dim {
-            let chunk_len = cursor.read_u32::<LittleEndian>()? as usize;
-            let mut chunk = vec![0u8; chunk_len];
-            cursor.read_exact(&mut chunk)?;
-
-            let col_floats = decompress_vectors(
-                &chunk,
-                self.header.vector_count as usize,
-                CompressionStrategy::AlpRd,
-            );
-            columns.push(col_floats);
+        let codes = &hot_blob[ids_size..];
+        if codes.len() < count * dim {
+            return results;
         }
 
-        // Transpose back to Row-Major (Flat Buffer)
-        let rows = transpose_from_columns(&columns, self.header.vector_count as usize);
-        // Flatten
-        Ok(rows.into_iter().flatten().collect())
+        // 3. Run ADC Kernel (Unsafe SIMD)
+        let lut_ptr = lut.as_ptr();
+        let codes_ptr = codes.as_ptr();
+
+        for i in 0..count {
+            let offset = i * dim;
+            let dist = unsafe { compute_distance_lut(codes_ptr.add(offset), lut_ptr, dim) };
+            results.push((ids[i], dist));
+        }
+
+        results
     }
 }

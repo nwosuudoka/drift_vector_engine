@@ -1,7 +1,7 @@
 use crate::aligned::AlignedBytes;
 use crate::bucket::{Bucket, BucketData, BucketHeader};
 use crate::kmeans::KMeansTrainer;
-use crate::memtable::MemTable;
+use crate::memtable::{MemTable, MemTableOptions};
 use crate::quantizer::Quantizer;
 use crate::wal::{WalEntry, WalReader, WalWriter};
 use drift_cache::block_cache::BlockCache;
@@ -119,12 +119,10 @@ impl VectorIndex {
         wal_path: &Path,
         storage: Arc<dyn PageManager>,
     ) -> io::Result<Self> {
-        let memtable = Arc::new(MemTable::new(
-            config.max_bucket_capacity * 10,
-            config.dim,
-            config.ef_construction,
-            16,
-        ));
+        let memtable = Arc::new(MemTable::new(MemTableOptions {
+            capacity: config.max_bucket_capacity * 10,
+            dim: config.dim,
+        }));
 
         let mut recovered_deletes = HashSet::new();
 
@@ -179,12 +177,10 @@ impl VectorIndex {
         let _wal_lock = self.wal.lock();
 
         // 3. Create Fresh MemTable
-        let new_active = Arc::new(MemTable::new(
-            self.config.max_bucket_capacity * 10,
-            self.config.dim,
-            self.config.ef_construction,
-            16,
-        ));
+        let new_active = Arc::new(MemTable::new(MemTableOptions {
+            capacity: self.config.max_bucket_capacity * 10,
+            dim: self.config.dim,
+        }));
 
         // 4. Atomic Swap (using RwLock Write Guard)
         let old_arc = {

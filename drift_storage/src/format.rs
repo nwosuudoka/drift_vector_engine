@@ -83,18 +83,52 @@ impl RowGroupHeader {
     }
 }
 
+// /// 3. File Footer (Fixed 128 Bytes)
+// /// Note: This struct was already naturally aligned.
+// #[repr(C)]
+// #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable, KnownLayout)]
+// pub struct DriftFooter {
+//     pub row_group_count: u32,
+//     pub _pad_1: u32,
+//     pub index_start_offset: u64,
+//     pub bloom_filter_offset: u64,
+//     pub bloom_filter_length: u32,
+//     pub padding: [u8; 92],
+//     pub magic: u64,
+// }
+
+// impl DriftFooter {
+//     pub fn new(
+//         row_group_count: u32,
+//         index_start_offset: u64,
+//         bloom_offset: u64,
+//         bloom_length: u32,
+//     ) -> Self {
+//         Self {
+//             row_group_count,
+//             _pad_1: 0,
+//             index_start_offset,
+//             bloom_filter_offset: bloom_offset,
+//             bloom_filter_length: bloom_length,
+//             padding: [0u8; 92],
+//             magic: MAGIC_V2,
+//         }
+//     }
+// }
+
 /// 3. File Footer (Fixed 128 Bytes)
-/// Note: This struct was already naturally aligned.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable, KnownLayout)]
 pub struct DriftFooter {
-    pub row_group_count: u32,
-    pub _pad_1: u32,
-    pub index_start_offset: u64,
-    pub bloom_filter_offset: u64,
-    pub bloom_filter_length: u32,
-    pub padding: [u8; 92],
-    pub magic: u64,
+    pub row_group_count: u32,     // 0..4
+    pub _pad_1: u32,              // 4..8
+    pub index_start_offset: u64,  // 8..16
+    pub bloom_filter_offset: u64, // 16..24
+    pub quantizer_offset: u64,    // 28..36 (NEW)
+    pub bloom_filter_length: u32, // 24..28
+    pub quantizer_length: u32,    // 36..40 (NEW)
+    pub padding: [u8; 80],        // 40..120 (Reduced from 92 to 80)
+    pub magic: u64,               // 120..128
 }
 
 impl DriftFooter {
@@ -103,6 +137,8 @@ impl DriftFooter {
         index_start_offset: u64,
         bloom_offset: u64,
         bloom_length: u32,
+        quantizer_offset: u64, // NEW
+        quantizer_length: u32, // NEW
     ) -> Self {
         Self {
             row_group_count,
@@ -110,7 +146,9 @@ impl DriftFooter {
             index_start_offset,
             bloom_filter_offset: bloom_offset,
             bloom_filter_length: bloom_length,
-            padding: [0u8; 92],
+            quantizer_offset,
+            quantizer_length,
+            padding: [0u8; 80],
             magic: MAGIC_V2,
         }
     }

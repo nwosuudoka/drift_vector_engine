@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::memtable::MemTable;
+    use crate::memtable::{MemTable, MemTableOptions};
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -11,7 +11,11 @@ mod tests {
 
     #[test]
     fn test_memtable_basic_crud() {
-        let memtable = MemTable::new(100, DIM, 16, 16);
+        let m_opts = MemTableOptions {
+            capacity: 100,
+            dim: DIM,
+        };
+        let memtable = MemTable::new(m_opts);
 
         // A. Insert
         memtable.insert(1, &[10.0, 10.0]); // Far
@@ -38,7 +42,11 @@ mod tests {
     fn test_flat_buffer_alignment() {
         // Verify that the contiguous buffer logic actually packs floats correctly
         const TEST_DIM: usize = 4;
-        let memtable = MemTable::new(10, TEST_DIM, 16, 16);
+        let m_opts = MemTableOptions {
+            capacity: 10,
+            dim: TEST_DIM,
+        };
+        let memtable = MemTable::new(m_opts);
 
         memtable.insert(100, &[1.0, 2.0, 3.0, 4.0]);
         memtable.insert(101, &[5.0, 6.0, 7.0, 8.0]);
@@ -59,7 +67,11 @@ mod tests {
 
     #[test]
     fn test_freeze_is_cheap_pointer_copy() {
-        let memtable = Arc::new(MemTable::new(1000, DIM, 16, 16));
+        let m_opts = MemTableOptions {
+            capacity: 1000,
+            dim: DIM,
+        };
+        let memtable = Arc::new(MemTable::new(m_opts));
 
         // Insert some data
         for i in 0..100 {
@@ -88,7 +100,11 @@ mod tests {
         // This is the CRITICAL test for the "Shared Frozen State" architecture.
         // It proves that the Janitor reading data (to flush) does NOT block Search.
 
-        let memtable = Arc::new(MemTable::new(100, DIM, 16, 16));
+        let m_opts = MemTableOptions {
+            capacity: 100,
+            dim: DIM,
+        };
+        let memtable = Arc::new(MemTable::new(m_opts));
         for i in 0..50 {
             memtable.insert(i, &[i as f32, i as f32]);
         }
@@ -139,7 +155,11 @@ mod tests {
 
     #[test]
     fn test_tombstones_propagate_to_shared_view() {
-        let memtable = Arc::new(MemTable::new(100, DIM, 16, 16));
+        let m_opts = MemTableOptions {
+            capacity: 100,
+            dim: DIM,
+        };
+        let memtable = Arc::new(MemTable::new(m_opts));
         memtable.insert(1, &[10.0, 10.0]);
 
         let frozen_view = memtable.clone();

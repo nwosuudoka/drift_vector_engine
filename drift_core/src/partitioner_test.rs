@@ -19,7 +19,8 @@ mod tests {
                 vector: vec![10.0, 10.0],
             },
         ];
-        let router = Router::new(&centroids, 2, "L2").unwrap();
+        let counts = vec![0, 0]; // Counts don't affect simple routing
+        let router = Router::new(&centroids, &counts, 2, "L2").unwrap();
 
         // 2. Create Mixed Batch
         let batch = vec![

@@ -1,3 +1,4 @@
+use crate::segment_reader::SegmentReader;
 use async_trait::async_trait;
 use drift_traits::{PageId, PageManager};
 use opendal::Operator;
@@ -5,8 +6,6 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-
-use crate::segment_reader::SegmentReader;
 
 // --- DiskManager (Flat File Access) ---
 #[derive(Clone)]
@@ -152,6 +151,23 @@ impl PageManager for DriftPageManager {
                 io::ErrorKind::NotFound,
                 format!("File ID {} not registered", file_id),
             ))
+        }
+    }
+
+    async fn len(&self, file_id: u32) -> std::io::Result<u64> {
+        let path = {
+            let map = self.files.read().unwrap();
+            map.get(&file_id).cloned()
+        };
+
+        if let Some(p) = path {
+            let meta = self.op.stat(&p).await?;
+            Ok(meta.content_length())
+        } else {
+            Err(io::Error::other(format!(
+                "File ID {} not registered",
+                file_id
+            )))
         }
     }
 }

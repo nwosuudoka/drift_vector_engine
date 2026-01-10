@@ -2,6 +2,7 @@ pub mod aligned;
 pub mod bitpack;
 pub mod bucket;
 pub mod index;
+pub mod index_new;
 pub mod kmeans;
 pub mod manifest;
 pub mod math;
@@ -30,3 +31,6 @@ mod router_tests;
 
 #[cfg(test)]
 mod partitioner_test;
+
+#[cfg(test)]
+mod index_new_tests;

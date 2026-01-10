@@ -1,35 +1,30 @@
 use serde::{Deserialize, Serialize};
 
 pub mod block;
-pub mod compression;
-pub mod disk_manager;
-
 pub mod bucket_file_reader;
 pub mod bucket_file_writer;
+pub mod bucket_manager;
+pub mod compression;
+pub mod disk_manager;
 pub mod format;
-
 pub mod row_group_writer;
-
 pub mod segment_reader;
 pub mod segment_writer;
 
 #[cfg(test)]
-mod format_tests;
-
-#[cfg(test)]
-mod row_group_tests;
-
-#[cfg(test)]
 mod bucket_file_tests;
-
 #[cfg(test)]
-mod open_dal_integration;
-
-#[cfg(test)]
-mod segment_test;
-
+mod bucket_manager_tests;
 #[cfg(test)]
 mod footer_test;
+#[cfg(test)]
+mod format_tests;
+#[cfg(test)]
+mod open_dal_integration;
+#[cfg(test)]
+mod row_group_tests;
+#[cfg(test)]
+mod segment_test;
 
 // SHARED CONSTANTS (Single Source of Truth)
 pub const MAGIC_BYTES: &[u8; 8] = b"DRIFT_V1";

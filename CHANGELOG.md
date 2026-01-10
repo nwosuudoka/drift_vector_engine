@@ -1,5 +1,15 @@
 # Changelog
 
+### Changed
+
+- **Architecture:** `VectorIndexV2` now relies on `dyn DiskSearcher` trait for disk access, enabling dependency injection of the Storage Layer.
+- **Search:** Implemented Scatter-Gather search (MemTable + Disk) in `VectorIndexV2`.
+
+### Added
+
+- **Traits:** Added `DiskSearcher` trait to `drift_core` to decouple storage from logic.
+- **BucketManager:** Started implementation of the disk-tier manager.
+
 ## [Unreleased] - v2.0.0 Migration
 
 ### Added

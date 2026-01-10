@@ -72,7 +72,7 @@ _Goal: Ensure no data loss on crash and prevent "Split Brain" during splits._
 
 _Goal: Stop "Centroid Proliferation". Assign vectors to fixed buckets._
 
-- **3.1. Implement The Router**
+<!-- - **3.1. Implement The Router**
 - [x] Create `StaticRouter` struct in `VectorIndex`.
 - [ ] Initialize with centroids from `Manifest`.
 - [ ] Implement `assign(vector) -> BucketID` (Nearest Neighbor search on centroids).
@@ -85,7 +85,19 @@ _Goal: Stop "Centroid Proliferation". Assign vectors to fixed buckets._
 - Return `HashMap<BucketID, Vec<Vector>>`.
 
 - **3.3. Verify**
-- [ ] Test: Insert 1M vectors. Ensure Bucket Count == Initial Centroids (no new buckets created).
+- [ ] Test: Insert 1M vectors. Ensure Bucket Count == Initial Centroids (no new buckets created). -->
+
+- [x] 3.1. Implement The Router (`drift_core/src/router.rs`)
+- [ ] **3.2. Define Disk Interfaces** (New)
+  - [x] Create `drift_core/src/traits.rs` with `DiskSearcher` trait.
+- [x] **3.3. Implement BucketManager** (Storage Layer)
+  - [x] Create `drift_storage/src/bucket_manager.rs`.
+  - [x] Implement `search` (Iterate local/S3 readers).
+  - [ ] Implement `reconcile` (Sync open files with Manifest).
+- [ ] **3.5. Update VectorIndexV2** (The Migration)
+  - [ ] Integrate `WAL` (Safety).
+  - [ ] Integrate `Arc<dyn DiskSearcher>` (Disk Search).
+  - [ ] Implement Unified Search (RAM + Disk).
 
 ---
 

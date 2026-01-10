@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn test_footer_magic_placement() {
-        let footer = DriftFooter::new(10, 1000, 2000, 500);
+        let footer = DriftFooter::new(10, 1000, 2000, 500, 0, 0);
         let bytes = footer.as_bytes();
 
         // Magic must be at the very end (120..128)

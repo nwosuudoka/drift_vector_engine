@@ -76,4 +76,13 @@ impl PageManager for LocalDiskManager {
         })
         .await?
     }
+
+    async fn len(&self, file_id: u32) -> Result<u64> {
+        let file = self.open_file(file_id, false)?;
+        task::spawn_blocking(move || {
+            let meta = file.metadata()?;
+            Ok(meta.len())
+        })
+        .await?
+    }
 }

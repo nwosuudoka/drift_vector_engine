@@ -23,6 +23,11 @@ mod tests {
         async fn write_page(&self, _id: u32, _off: u64, _d: &[u8]) -> Result<()> {
             Ok(())
         }
+
+        async fn len(&self, _file_id: u32) -> Result<u64> {
+            let k = b"Hello Cache".len() as u64;
+            Ok(k)
+        }
     }
 
     #[derive(Debug, Clone, PartialEq)]
