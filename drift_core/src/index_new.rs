@@ -1,10 +1,10 @@
 use crate::memtable::{MemTable, MemTableOptions};
 use crate::partitioner::{IncrementalPartitioner, PartitionResult};
 use crate::router::Router;
+use crate::tombstone_v2::InMemoryTombstoneTracker;
 use crate::wal::WalWriter;
-use drift_traits::DiskSearcher;
+use drift_traits::{DiskSearcher, TombstoneTracker};
 use parking_lot::{Mutex, RwLock}; // Using parking_lot for perf
-use std::cmp::Ordering;
 use std::io;
 use std::sync::Arc;
 
@@ -23,6 +23,9 @@ pub struct VectorIndexV2 {
 
     // 4. Disk Tier (Injected Dependency)
     disk: Arc<dyn DiskSearcher>,
+
+    // tombstones
+    pub(crate) tombstones: Arc<dyn TombstoneTracker>,
 
     // 5. Logic
     router: Arc<RwLock<Router>>,
@@ -46,6 +49,7 @@ impl VectorIndexV2 {
             router,
             dim,
             capacity,
+            tombstones: Arc::new(InMemoryTombstoneTracker::new()),
         }
     }
 
@@ -91,6 +95,19 @@ impl VectorIndexV2 {
         Ok(false)
     }
 
+    pub fn delete(&self, id: u64) -> io::Result<()> {
+        // 1. WAL
+        self.wal.lock().write_delete(id)?;
+
+        // 2. MemTable
+        // We only need to mark it in the Active table.
+        // The Search logic merges tombstones from all RAM tables.
+        self.active.read().delete(id);
+        self.tombstones.mark_delete(id);
+
+        Ok(())
+    }
+
     /// Unified Scatter-Gather Search (RAM + Disk).
     /// Implements the "Saturating Density" search policy.
     pub async fn search(
@@ -102,17 +119,24 @@ impl VectorIndexV2 {
         lambda: f32,            // e.g. 1.0
         tau: f32,               // e.g. 100.0
     ) -> io::Result<Vec<(u64, f32)>> {
+        let view = self.tombstones.get_view();
         // 1. Snapshot RAM Tables (Active + Frozen)
-        let ram_tables: Vec<Arc<MemTable>> = {
-            let mut tables = Vec::new();
-            tables.push(self.active.read().clone());
-            tables.extend(self.frozen.read().iter().cloned());
-            tables
+        let (ram_tables, active_tombstones) = {
+            let active = self.active.read();
+            let frozen = self.frozen.read();
+
+            // Collect all tombstones from Active (and theoretically Frozen if they track them)
+            // For V2 MVP, let's assume Active Tombstones are the global overlay for this epoch.
+            let tombstones = active.get_tombstones_snapshot();
+
+            let mut tables = vec![active.clone()];
+            tables.extend(frozen.iter().cloned());
+            (tables, tombstones)
         };
 
         // 2. RAM Search (CPU Bound - Exact Scan)
         // We scan everything in RAM because it's cheap and high-priority.
-        let mut candidates = tokio::task::spawn_blocking({
+        let candidates = tokio::task::spawn_blocking({
             let query = query.to_vec();
             move || {
                 let mut results = Vec::new();
@@ -134,25 +158,36 @@ impl VectorIndexV2 {
 
         // 4. Disk Search (Async I/O)
         // We only scan the buckets selected by the math above.
-        let disk_results = self.disk.search(&bucket_ids, query, k).await;
-        candidates.extend(disk_results);
-
-        // 5. Merge & Sort (Gather)
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
-        // Deduplicate
-        let mut unique_candidates = Vec::with_capacity(k);
+        let disk_results = self.disk.search(&bucket_ids, query, k, view.as_ref()).await;
+        let mut final_results = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for c in candidates {
-            if seen.insert(c.0) {
-                unique_candidates.push(c);
-                if unique_candidates.len() >= k {
-                    break;
-                }
+
+        // Process RAM first (Fresh wins), then Disk
+        // Note: `candidates` (RAM) already filtered tombstones internally in MemTable::search
+        // But we must apply filtering to Disk Results.
+
+        // Let's create a unified stream
+        let all_candidates = candidates.into_iter().chain(disk_results);
+
+        for (id, dist) in all_candidates {
+            // FILTER: Is it dead?
+            if active_tombstones.contains(&id) {
+                continue;
+            }
+
+            // DEDUPLICATE: First valid occurrence wins
+            if seen.insert(id) {
+                final_results.push((id, dist));
             }
         }
 
-        Ok(unique_candidates)
+        // 5. Final Sort
+        final_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if final_results.len() > k {
+            final_results.truncate(k);
+        }
+
+        Ok(final_results)
     }
 
     /// Flushes ALL frozen tables.

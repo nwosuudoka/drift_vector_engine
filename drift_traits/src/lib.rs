@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::fmt::Debug;
 use std::io::Result;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// A lightweight handle to a chunk of data.
 /// This struct is the "Key" in our S3FIFO BlockCache.
@@ -64,5 +65,49 @@ pub trait DiskSearcher: Send + Sync {
     /// * `k`: Number of results.
     ///
     /// Returns a flat list of (id, distance).
-    async fn search(&self, bucket_ids: &[u32], query: &[f32], k: usize) -> Vec<(u64, f32)>;
+    async fn search(
+        &self,
+        bucket_ids: &[u32],
+        query: &[f32],
+        k: usize,
+        tombstones: &dyn TombstoneView,
+    ) -> Vec<(u64, f32)>;
+}
+
+// ... existing imports
+
+/// Represents a component capable of retrieving full bucket data.
+/// Used by maintenance tasks (Split/Merge) to load data for re-clustering.
+#[async_trait]
+pub trait DataProvider: Send + Sync {
+    /// Fetches all high-fidelity vectors for a specific bucket.
+    /// Returns (IDs, Vectors).
+    async fn fetch_bucket(&self, bucket_id: u32) -> Result<(Vec<u64>, Vec<f32>)>;
+}
+
+/// Abstraction for managing deleted vectors (Write Path).
+#[async_trait]
+pub trait TombstoneTracker: Send + Sync + Debug {
+    /// Marks a vector ID as deleted.
+    fn mark_delete(&self, id: u64);
+
+    /// Allow resurrection
+    fn unmark_delete(&self, id: u64);
+
+    /// Checks if a single ID is deleted (Fast path for MemTable/Ingest).
+    fn is_deleted(&self, id: u64) -> bool;
+
+    /// Returns a thread-safe snapshot for a query execution.
+    fn get_view(&self) -> Arc<dyn TombstoneView>;
+
+    /// Frees up storage after compaction.
+    fn dissolve_batch(&self, compacted_ids: &[u64]);
+}
+
+/// This completely hides whether we use HashSets, Bitmaps, or Bloom Filters.
+#[allow(clippy::len_without_is_empty)]
+pub trait TombstoneView: Send + Sync + Debug {
+    fn contains(&self, id: u64) -> bool;
+    /// Optional: Approximate count for statistics
+    fn len(&self) -> usize;
 }

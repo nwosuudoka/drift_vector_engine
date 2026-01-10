@@ -179,7 +179,7 @@ impl WalReader {
             }
             OP_DELETE => {
                 let id = cursor.read_u64::<LittleEndian>()?;
-            Ok(WalEntry::Delete { id })
+                Ok(WalEntry::Delete { id })
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown OpCode")),
         }

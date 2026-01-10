@@ -10,7 +10,7 @@ use pb::{Bucket, Centroid, Manifest};
 
 #[derive(Debug, Clone)]
 pub struct ManifestWrapper {
-    pub(crate) inner: Manifest,
+    pub inner: Manifest,
 }
 
 impl ManifestWrapper {
@@ -90,5 +90,9 @@ impl ManifestWrapper {
 
     pub fn get_buckets(&self) -> &Vec<Bucket> {
         &self.inner.buckets
+    }
+
+    pub fn get_dim(&self) -> u32 {
+        self.inner.dim
     }
 }

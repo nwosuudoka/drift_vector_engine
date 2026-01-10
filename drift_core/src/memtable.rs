@@ -162,6 +162,11 @@ impl MemTable {
         let tombstones = self.tombstones.read().clone();
         (ids, data, tombstones)
     }
+
+    // NEW: Expose tombstones for the global search merger
+    pub fn get_tombstones_snapshot(&self) -> HashSet<u64> {
+        self.tombstones.read().clone()
+    }
 }
 
 // Helpers
