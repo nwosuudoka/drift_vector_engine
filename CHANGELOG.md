@@ -4,9 +4,19 @@
 
 ### Added
 
+- Implemented Router with flat-memory layout for cache-optimized routing."
+
+### Added
+
+- "Implemented BucketFileReader with robust skip logic."
+
+### Added
+
+- "Implemented Zero-Copy RowGroupWriter with SIMD alignment enforcement."
+
+### Added
+
 - **Migration Plan:** Established 7-phase roadmap for "Unified Row-Group + LBR" architecture.
-- **Added** "Implemented Zero-Copy RowGroupWriter with SIMD alignment enforcement."
-- **Added** "Implemented BucketFileReader with robust skip logic."
 
 ## [0.6.5] - Physical Garbage Collection
 

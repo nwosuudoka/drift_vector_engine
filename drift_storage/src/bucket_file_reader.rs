@@ -4,9 +4,6 @@ use crate::compression::wrapper::{
 use crate::format::{DriftHeader, HEADER_SIZE, ROW_GROUP_HEADER_SIZE, RowGroupHeader};
 use byteorder::{LittleEndian, ReadBytesExt};
 use crc32fast::Hasher;
-use drift_core::aligned::AlignedBytes;
-use drift_core::bucket::BucketData;
-use rand::rand_core::le;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
@@ -14,6 +11,7 @@ use zerocopy::{FromBytes, FromZeros, IntoBytes};
 /// Optimized for "Stream-First" access but supports random access via offsets.
 pub struct BucketFileReader<R: Read + Seek> {
     reader: R,
+    #[allow(dead_code)]
     header: DriftHeader,
     current_offset: u64,
     next_header_offset: u64,

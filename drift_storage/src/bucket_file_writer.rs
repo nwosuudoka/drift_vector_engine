@@ -15,6 +15,7 @@ pub struct BucketFileWriter<W: Write> {
 
     // Global State
     total_vectors: u64,
+    #[allow(dead_code)]
     run_id: [u8; 16],
     quantizer: Quantizer,
     dim: usize,

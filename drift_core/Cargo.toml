@@ -34,3 +34,9 @@ drift_traits = { path = "../drift_traits" }
 zerocopy = "0.8.31"
 async-trait = "0.1.89"
 tracing = "0.1"
+prost = "0.14.1"
+
+
+[build-dependencies]
+prost-build = "0.14.1"
+tonic-build = "0.14.2"

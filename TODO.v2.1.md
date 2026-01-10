@@ -73,7 +73,7 @@ _Goal: Ensure no data loss on crash and prevent "Split Brain" during splits._
 _Goal: Stop "Centroid Proliferation". Assign vectors to fixed buckets._
 
 - **3.1. Implement The Router**
-- [ ] Create `StaticRouter` struct in `VectorIndex`.
+- [x] Create `StaticRouter` struct in `VectorIndex`.
 - [ ] Initialize with centroids from `Manifest`.
 - [ ] Implement `assign(vector) -> BucketID` (Nearest Neighbor search on centroids).
 
