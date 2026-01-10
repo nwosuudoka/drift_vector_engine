@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::manifest::pb::Centroid;
-    use crate::router::Router;
+    use crate::{manifest::pb::Centroid, router::Router};
 
     #[test]
     fn test_router_l2() {
