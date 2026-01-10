@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased] - v2.0.0 Migration
+
+### Added
+
+- **Migration Plan:** Established 7-phase roadmap for "Unified Row-Group + LBR" architecture.
+- **Added** "Implemented Zero-Copy RowGroupWriter with SIMD alignment enforcement."
+- **Added** "Implemented BucketFileReader with robust skip logic."
+
 ## [0.6.5] - Physical Garbage Collection
 
 **Work in Progress**

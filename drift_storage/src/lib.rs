@@ -3,8 +3,24 @@ use serde::{Deserialize, Serialize};
 pub mod block;
 pub mod compression;
 pub mod disk_manager;
+
+pub mod bucket_file_reader;
+pub mod bucket_file_writer;
+pub mod format;
+
+pub mod row_group_writer;
+
 pub mod segment_reader;
 pub mod segment_writer;
+
+#[cfg(test)]
+mod format_tests;
+
+#[cfg(test)]
+mod row_group_tests;
+
+#[cfg(test)]
+mod bucket_file_tests;
 
 #[cfg(test)]
 mod open_dal_integration;

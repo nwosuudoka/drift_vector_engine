@@ -104,6 +104,17 @@ pub fn transpose(vectors: &[Vec<f32>], dim: usize) -> Vec<Vec<f32>> {
     columns
 }
 
+pub fn transpose_flat(data: &[f32], count: usize, dim: usize) -> Vec<Vec<f32>> {
+    let mut columns = vec![Vec::with_capacity(count); dim];
+    for i in 0..count {
+        for d in 0..dim {
+            // Contiguous access is fast!
+            columns[d].push(data[i * dim + d]);
+        }
+    }
+    columns
+}
+
 /// Inverse Transpose: Column-Major [D][N] -> Row-Major [N][D].
 /// Used when loading data from disk into memory.
 pub fn transpose_from_columns(columns: &[Vec<f32>], count: usize) -> Vec<Vec<f32>> {

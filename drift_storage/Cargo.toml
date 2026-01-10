@@ -22,3 +22,4 @@ opendal = { version = "0.55.0", features = ["services-fs", "services-s3"] }
 url = "2.5"
 async-trait = "0.1"                                                         # For PageManager trait
 bit-set = "0.8.0"
+zerocopy = "0.8.33"
