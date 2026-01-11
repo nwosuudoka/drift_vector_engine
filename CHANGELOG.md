@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased] - v2.0.0 Migration
+
+### Added
+
+- **Storage:** Implemented `BucketFileWriter` with `Head-Of-Line` architecture (Quantizer in Header).
+- **Storage:** Added `Truncatable` trait to support safe file truncation on local disk while allowing streaming on S3.
+- **Storage:** Implemented `append_mode` logic: recovers Index/Bloom from old footer before overwriting.
+
+### Added
+
+- **Two-Stage Search:** Implemented `Scatter-Gather` (Hot Scan) + `Refine` (Cold Fetch) architecture.
+- **Tombstone Resurrection:** Added `unmark_delete` to `TombstoneTracker` to fix "Zombie" insert bugs.
+- **Parallel Scanning:** Updated `DiskSearcher` to use `Arc<dyn TombstoneView>`, enabling `tokio::spawn` for parallel bucket scans.
+- **VectorIndex Integration:** `VectorIndexV2::search` now orchestrates the full RAM -> Disk (Approx) -> Disk (Exact) pipeline.
+
 ### Changed
 
 - **Architecture:** `VectorIndexV2` now relies on `dyn DiskSearcher` trait for disk access, enabling dependency injection of the Storage Layer.

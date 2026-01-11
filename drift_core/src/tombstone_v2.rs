@@ -11,6 +11,14 @@ pub struct HashSetView {
     inner: Arc<HashSet<u64>>,
 }
 
+impl Default for HashSetView {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(HashSet::new()),
+        }
+    }
+}
+
 impl fmt::Debug for HashSetView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "HashSetView(items: {})", self.inner.len())

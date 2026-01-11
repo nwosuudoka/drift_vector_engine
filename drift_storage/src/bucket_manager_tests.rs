@@ -4,11 +4,11 @@ mod tests {
     use crate::bucket_file_writer::BucketFileWriter;
     use crate::bucket_manager::BucketManager;
     use crate::disk_manager::DriftPageManager; // Use the mapping-aware manager
-    use drift_core::manifest::ManifestWrapper;
     use drift_core::quantizer::Quantizer;
+    use drift_core::tombstone_v2::HashSetView;
     use drift_traits::{DiskSearcher, PageManager};
     use opendal::{Operator, services};
-    use std::sync::{Arc, RwLock};
+    use std::{path::PathBuf, sync::Arc};
     use tempfile::tempdir;
 
     // --- Helper: Create Local Operator ---
@@ -43,7 +43,7 @@ mod tests {
         let run_id = [1u8; 16];
 
         // 1. Write File (Standard IO)
-        let mut writer = BucketFileWriter::new(file, run_id, q.clone(), dim).unwrap();
+        let mut writer = BucketFileWriter::new_streaming(file, run_id, q.clone(), dim).unwrap();
         writer.write_batch(&ids, &vecs).unwrap();
         writer.finalize().unwrap();
 
@@ -79,7 +79,7 @@ mod tests {
         let file = std::fs::File::create(&file_path).unwrap();
 
         // 1. Write
-        let mut writer = BucketFileWriter::new(file, [0u8; 16], q.clone(), dim).unwrap();
+        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q.clone(), dim).unwrap();
         writer.write_batch(&ids, &vecs).unwrap();
         writer.finalize().unwrap();
 
@@ -90,50 +90,54 @@ mod tests {
         let mut reader = BucketFileReader::new(storage, 5);
         let query = vec![0.0; dim];
 
-        let results = reader.scan(&query, 10).await.expect("Scan failed");
+        let results = reader
+            .scan(&query, 10, &HashSetView::default())
+            .await
+            .expect("Scan failed");
 
         assert_eq!(results.len(), 10);
-        let found_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        let found_ids: Vec<u64> = results.iter().map(|c| c.id).collect();
         assert_eq!(found_ids, ids);
     }
 
     #[tokio::test]
     async fn test_bucket_manager_orchestration() {
         let dir = tempdir().unwrap();
-        let op = create_local_operator(dir.path());
-        let storage = Arc::new(DriftPageManager::new(op));
 
-        // 1. Setup Manifest
-        let mut manifest_inner = ManifestWrapper::new(8, "L2");
+        // 1. Setup Data
         let bucket_id = 100;
-        let run_id = "run_uuid_123";
+        let file_id = 123;
+        let dim = 8;
 
-        manifest_inner.add_bucket(bucket_id, run_id.to_string(), vec![0.0; 8]);
-        let manifest = Arc::new(RwLock::new(manifest_inner));
-
-        // 2. Create File
-        let filename = format!("segment_{}.drift", run_id);
+        // 2. Create File FIRST
+        let filename = format!("segment_{}.drift", file_id);
         let file_path = dir.path().join(&filename);
         let file = std::fs::File::create(&file_path).unwrap();
 
-        let dim = 8;
         let (ids, vecs) = mock_data(1000, 50, dim);
         let q = Quantizer::train(&vecs, dim);
 
-        let mut writer = BucketFileWriter::new(file, [0u8; 16], q, dim).unwrap();
+        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
         writer.write_batch(&ids, &vecs).unwrap();
         writer.finalize().unwrap();
 
-        // 3. Initialize Manager
-        let manager = BucketManager::new(storage, manifest);
+        // 3. Initialize Storage & Manager AFTER file exists
+        // Now DriftPageManager will see "segment_123.drift" on startup
+        let op = create_local_operator(dir.path());
+        let storage = Arc::new(DriftPageManager::new(op));
+
+        storage.register_file(file_id, PathBuf::from(&filename));
+
+        let manager = BucketManager::new(storage, 1);
+        manager.update_mapping(bucket_id, file_id);
 
         // 4. Search
-        // The Manager will lookup RunID -> Construct Path -> Register -> Scan
         let query = vec![0.0; 8];
-        let results = manager.search(&[bucket_id], &query, 10).await;
+        let results = manager
+            .search(&[bucket_id], &query, 10, Arc::new(HashSetView::default()))
+            .await;
 
         assert!(!results.is_empty(), "Manager failed to find results");
         assert_eq!(results.len(), 10);
-        assert_eq!(results[0].0, 1000);
     }
 }

@@ -25,7 +25,8 @@ mod tests {
         let q = Quantizer::train(&flat, dim);
 
         // 2. Initialize Writer
-        let mut writer = BucketFileWriter::new(&mut buffer, run_id, q.clone(), dim).unwrap();
+        let mut writer =
+            BucketFileWriter::new_streaming(&mut buffer, run_id, q.clone(), dim).unwrap();
 
         // 3. Write Batch 1 (100 vectors)
         let train_flat = vecs_train.into_iter().flatten().collect::<Vec<f32>>();
@@ -71,56 +72,146 @@ mod tests {
         let rg_count = u32::from_le_bytes(rg_count_bytes);
         assert_eq!(rg_count, 2);
     }
+}
 
-    /*
-    #[test]
-    fn test_reader_stream_skip_logic() {
-        // 1. Setup Writer
-        let mut buffer = Cursor::new(Vec::new());
-        let run_id = [2u8; 16];
-        let dim = 4;
+#[cfg(test)]
+mod writer_tests {
+    use crate::bucket_file_writer::BucketFileWriter;
+    use crate::format::HEADER_SIZE;
+    use drift_core::quantizer::Quantizer;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom};
+    use tempfile::NamedTempFile;
 
-        // Train Quantizer
-        let (ids, vecs) = mock_data(0, 10, dim); // Batch 1
-        let (ids2, vecs2) = mock_data(100, 10, dim); // Batch 2
-        let flat: Vec<f32> = vecs.clone().into_iter().flatten().collect();
-        let flat2: Vec<f32> = vecs2.clone().into_iter().flatten().collect();
-        let q = Quantizer::train(&flat, dim);
-
-        let mut writer = BucketFileWriter::new(&mut buffer, run_id, q.clone(), dim).unwrap();
-
-        writer.write_batch(&ids, &flat).unwrap();
-        writer.write_batch(&ids2, &flat2).unwrap();
-
-        writer.finalize().unwrap();
-
-        // 2. READ BACK
-        buffer.set_position(0);
-        let mut reader = BucketFileReader::new(buffer);
-
-        // --- Batch 1: Read Hot, SKIP Cold ---
-        {
-            let mut group1 = reader.read_next_group().unwrap().unwrap();
-            assert_eq!(group1.header.vector_count, 10);
-
-            let (read_ids, _codes) = group1.decode_hot_index(dim).unwrap();
-            assert_eq!(read_ids[0], 0);
-            // We DROP group1 here without calling fetch_cold_vectors
+    // Helper to generate mock data
+    fn mock_batch(start_id: u64, count: usize, dim: usize) -> (Vec<u64>, Vec<f32>) {
+        let mut ids = Vec::with_capacity(count);
+        let mut vecs = Vec::with_capacity(count * dim);
+        for i in 0..count {
+            ids.push(start_id + i as u64);
+            // Simple pattern: vector value = id
+            vecs.extend(std::iter::repeat((start_id + i as u64) as f32).take(dim));
         }
-
-        // --- Batch 2: Read Hot, FETCH Cold ---
-        // The reader should auto-skip Batch 1's cold data
-        {
-            let mut group2 = reader.read_next_group().unwrap().unwrap();
-            assert_eq!(group2.header.vector_count, 10);
-
-            let (read_ids2, _codes2) = group2.decode_hot_index(dim).unwrap();
-            assert_eq!(read_ids2[0], 100); // Correctly advanced to batch 2
-
-            let floats = group2.fetch_cold_vectors(dim).unwrap();
-            assert_eq!(floats.len(), 40); // 10 vectors * 4 dim
-            assert_eq!(floats[0], 1.0); // Value from mock_data
-        }
+        (ids, vecs)
     }
-    */
+
+    #[test]
+    fn test_append_recovery_and_truncation() {
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path().to_owned();
+        let dim = 8;
+
+        // ---------------------------------------------------------
+        // PHASE 1: Create New File (Day 0)
+        // ---------------------------------------------------------
+        let (ids_1, vecs_1) = mock_batch(0, 100, dim);
+        let q = Quantizer::train(&vecs_1, dim); // Train dummy quantizer
+
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true) // Ensure it exists
+                .open(&path)
+                .unwrap();
+
+            // Use "new_streaming" logic or just generic new with len=0
+            let mut writer = BucketFileWriter::new_streaming(
+                file,
+                [1u8; 16], // Run ID
+                q.clone(),
+                dim,
+            )
+            .expect("Failed to create writer");
+
+            writer
+                .write_batch(&ids_1, &vecs_1)
+                .expect("Write batch 1 failed");
+            writer.finalize().expect("Finalize 1 failed");
+        }
+
+        // Snapshot length after Phase 1
+        let len_phase_1 = std::fs::metadata(&path).unwrap().len();
+        println!("File Size Phase 1: {} bytes", len_phase_1);
+
+        // ---------------------------------------------------------
+        // PHASE 2: Append (Day 1)
+        // ---------------------------------------------------------
+        // We simulate opening the existing file.
+        // This exercises:
+        // 1. Seek to End -> Read Old Footer
+        // 2. Recover State (Bloom, Index)
+        // 3. Seek Back (Rewind) -> Ready to Overwrite
+
+        let (ids_2, vecs_2) = mock_batch(100, 50, dim);
+
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+
+            let initial_len = file.metadata().unwrap().len();
+
+            let mut writer = BucketFileWriter::new_append(
+                file,
+                [1u8; 16], // Should match old Run ID, but we don't validate strictly yet
+                q.clone(), // Must reuse same quantizer!
+                dim,
+                initial_len,
+            )
+            .expect("Failed to open append writer");
+
+            writer
+                .write_batch(&ids_2, &vecs_2)
+                .expect("Write batch 2 failed");
+
+            // finalize_and_truncate will ensure the file ends exactly at the new footer
+            writer.finalize_and_truncate().expect("Finalize 2 failed");
+        }
+
+        let len_phase_2 = std::fs::metadata(&path).unwrap().len();
+        println!("File Size Phase 2: {} bytes", len_phase_2);
+
+        // Assert Growth: File must be larger now
+        assert!(len_phase_2 > len_phase_1, "File should have grown");
+
+        // ---------------------------------------------------------
+        // PHASE 3: Verification (Read Back)
+        // ---------------------------------------------------------
+        // We manually scan the file structure to verify integrity.
+        // In a real integration test, we'd use BucketFileReader.
+
+        let mut file = std::fs::File::open(&path).unwrap();
+
+        // 1. Verify Header (Head-Of-Line Quantizer check)
+        let mut header_buf = [0u8; HEADER_SIZE];
+        file.read_exact(&mut header_buf).unwrap();
+        // Just verify magic
+        let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
+        assert_eq!(magic, crate::format::MAGIC_V2);
+
+        // 2. Verify Footer (At the VERY end)
+        file.seek(SeekFrom::End(-(crate::format::FOOTER_SIZE as i64)))
+            .unwrap();
+        let mut footer_buf = [0u8; crate::format::FOOTER_SIZE];
+        file.read_exact(&mut footer_buf).unwrap();
+
+        // Use byteorder/zerocopy to decode struct if needed, or just check basic fields
+        // Let's assume DriftFooter layout: [RowGroupCount (u32), ...]
+        let rg_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
+
+        // CRITICAL CHECK: We wrote 1 batch in Phase 1, 1 batch in Phase 2.
+        // Total RowGroups should be 2.
+        assert_eq!(rg_count, 2, "Footer should report 2 RowGroups after append");
+
+        // 3. Verify Truncation (No garbage after footer)
+        let current_pos = file.stream_position().unwrap();
+        let total_size = file.metadata().unwrap().len();
+        assert_eq!(
+            current_pos, total_size,
+            "File should end exactly after footer"
+        );
+    }
 }

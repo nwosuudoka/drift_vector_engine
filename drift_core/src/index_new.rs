@@ -4,9 +4,13 @@ use crate::router::Router;
 use crate::tombstone_v2::InMemoryTombstoneTracker;
 use crate::wal::WalWriter;
 use drift_traits::{DiskSearcher, TombstoneTracker};
-use parking_lot::{Mutex, RwLock}; // Using parking_lot for perf
+use parking_lot::{Mutex, RwLock};
+use std::cmp::Ordering;
+use std::collections::HashSet;
+// Using parking_lot for perf
 use std::io;
 use std::sync::Arc;
+use tokio::task;
 
 /// The Coordinator for the V2 Architecture.
 /// Manages the "Active" vs "Frozen" lifecycle and orchestrates Unified Search.
@@ -72,6 +76,10 @@ impl VectorIndexV2 {
         // Insert (Internal locks handle concurrency)
         let needs_rotate = active_ptr.insert(id, &vector);
 
+        // If this ID was previously deleted, we MUST unmark it now.
+        // Otherwise, the Searcher will filter out this new insert.
+        self.tombstones.unmark_delete(id);
+
         if needs_rotate {
             // Upgrade to write lock to rotate
             let mut active_guard = self.active.write();
@@ -108,39 +116,37 @@ impl VectorIndexV2 {
         Ok(())
     }
 
-    /// Unified Scatter-Gather Search (RAM + Disk).
-    /// Implements the "Saturating Density" search policy.
+    /// Unified Search: RAM (Exact) + Disk (Approx -> Exact Refine)
     pub async fn search(
         &self,
         query: &[f32],
         k: usize,
-        // Search Parameters
-        target_confidence: f32, // e.g. 0.95
-        lambda: f32,            // e.g. 1.0
-        tau: f32,               // e.g. 100.0
+        target_confidence: f32,
+        lambda: f32,
+        tau: f32,
     ) -> io::Result<Vec<(u64, f32)>> {
-        let view = self.tombstones.get_view();
-        // 1. Snapshot RAM Tables (Active + Frozen)
-        let (ram_tables, active_tombstones) = {
+        // 1. Snapshot Everything
+        let (ram_tables, view) = {
             let active = self.active.read();
             let frozen = self.frozen.read();
-
-            // Collect all tombstones from Active (and theoretically Frozen if they track them)
-            // For V2 MVP, let's assume Active Tombstones are the global overlay for this epoch.
-            let tombstones = active.get_tombstones_snapshot();
+            // Get consistent view of deletes
+            let view = self.tombstones.get_view();
 
             let mut tables = vec![active.clone()];
             tables.extend(frozen.iter().cloned());
-            (tables, tombstones)
+            (tables, view)
         };
 
-        // 2. RAM Search (CPU Bound - Exact Scan)
-        // We scan everything in RAM because it's cheap and high-priority.
-        let candidates = tokio::task::spawn_blocking({
+        // 2. RAM Search (CPU) - Exact L2
+        // We pass 'view' to RAM search or filter results?
+        // Let's filter post-search for RAM to keep MemTable simple,
+        // or update MemTable signature later. For now, filter post.
+        let ram_results_raw = task::spawn_blocking({
             let query = query.to_vec();
             move || {
                 let mut results = Vec::new();
                 for table in ram_tables {
+                    // MemTable search returns (id, dist)
                     results.extend(table.search(&query, k));
                 }
                 results
@@ -149,40 +155,51 @@ impl VectorIndexV2 {
         .await
         .map_err(io::Error::other)?;
 
-        // 3. Route to Disk Buckets (Probabilistic Selection)
-        // This is where we apply the Paper's logic.
+        // 3. Disk Search (IO) - Two Stage
         let bucket_ids = {
             let router = self.router.read();
             router.select_buckets(query, target_confidence, lambda, tau)
         };
 
-        // 4. Disk Search (Async I/O)
-        // We only scan the buckets selected by the math above.
-        let disk_results = self.disk.search(&bucket_ids, query, k, view.as_ref()).await;
+        // OVERSAMPLE: We need more candidates because SQ8 is approximate.
+        let oversample_k = k * 3;
+
+        // Stage A: Scatter (SQ8 Scan)
+        // Returns candidates with location metadata
+        let candidates = self
+            .disk
+            .search(&bucket_ids, query, oversample_k, view.clone())
+            .await;
+
+        // Stage B: Gather (ALP Refine)
+        // Returns (id, exact_dist)
+        let disk_results = self.disk.refine(candidates, query).await;
+
+        // 4. Merge & Deduplicate & Filter
         let mut final_results = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
 
-        // Process RAM first (Fresh wins), then Disk
-        // Note: `candidates` (RAM) already filtered tombstones internally in MemTable::search
-        // But we must apply filtering to Disk Results.
-
-        // Let's create a unified stream
-        let all_candidates = candidates.into_iter().chain(disk_results);
-
-        for (id, dist) in all_candidates {
-            // FILTER: Is it dead?
-            if active_tombstones.contains(&id) {
-                continue;
-            }
-
-            // DEDUPLICATE: First valid occurrence wins
-            if seen.insert(id) {
+        // RAM results need filtering against the view (Snapshot Isolation)
+        for (id, dist) in ram_results_raw {
+            if !view.contains(id) && seen.insert(id) {
                 final_results.push((id, dist));
             }
         }
 
+        // Disk results were already filtered during Scan (Stage A)
+        // but we check 'seen' to avoid duplicates if RAM has the same ID (fresh update)
+        for (id, dist) in disk_results {
+            if seen.insert(id) {
+                // Double check tombstone?
+                // Technically unnecessary if DiskSearcher respected view, but safe.
+                if !view.contains(id) {
+                    final_results.push((id, dist));
+                }
+            }
+        }
+
         // 5. Final Sort
-        final_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        final_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         if final_results.len() > k {
             final_results.truncate(k);
         }

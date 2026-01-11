@@ -6,7 +6,7 @@ mod tests {
     #[test]
     fn test_drift_header_roundtrip() {
         let run_id = [7u8; 16];
-        let original = DriftHeader::new(1000, run_id);
+        let original = DriftHeader::new(1000, run_id, 0, 0);
 
         // Zero-Copy serialization: as_bytes() returns a slice &[u8]
         let bytes = original.as_bytes();
@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn test_footer_magic_placement() {
-        let footer = DriftFooter::new(10, 1000, 2000, 500, 0, 0);
+        let footer = DriftFooter::new(10, 1000, 2000, 500);
         let bytes = footer.as_bytes();
 
         // Magic must be at the very end (120..128)

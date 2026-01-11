@@ -53,6 +53,18 @@ pub trait Cacheable: Send + Sync + 'static {
     // We strictly use Arc for cache entries to allow cheap cloning
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchCandidate {
+    pub id: u64,
+    pub approx_dist: f32,
+    // The "Cookie" for retrieving cold data
+    pub file_id: u32,
+    pub cold_offset: u64,  // Offset of the Cold RowGroup blob
+    pub cold_length: u32,  // Length of the Cold RowGroup blob
+    pub index_in_rg: u16,  // Index of this vector inside the RG
+    pub vector_count: u16, // Index of this vector inside the RG
+}
+
 /// Represents a component capable of searching stored vectors.
 /// Implemented by `BucketManager` in the storage layer.
 #[async_trait]
@@ -70,11 +82,11 @@ pub trait DiskSearcher: Send + Sync {
         bucket_ids: &[u32],
         query: &[f32],
         k: usize,
-        tombstones: &dyn TombstoneView,
-    ) -> Vec<(u64, f32)>;
-}
+        tombstones: Arc<dyn TombstoneView>,
+    ) -> Vec<SearchCandidate>;
 
-// ... existing imports
+    async fn refine(&self, candidates: Vec<SearchCandidate>, query: &[f32]) -> Vec<(u64, f32)>;
+}
 
 /// Represents a component capable of retrieving full bucket data.
 /// Used by maintenance tasks (Split/Merge) to load data for re-clustering.

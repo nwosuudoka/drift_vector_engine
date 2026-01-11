@@ -1334,6 +1334,7 @@ dependencies = [
  "drift_core",
  "drift_traits",
  "fastbloom",
+ "futures",
  "memmap2",
  "opendal",
  "parking_lot",
