@@ -2,23 +2,17 @@ pub mod aligned;
 pub mod bitpack;
 pub mod bucket;
 pub mod index;
-pub mod index_new;
 pub mod kmeans;
-pub mod maintainance;
 pub mod manifest;
 pub mod math;
 pub mod memtable;
-pub mod partitioner;
 pub mod quantizer;
 pub mod router;
 pub mod tombstone;
-pub mod tombstone_v2;
 pub mod wal;
 
 #[cfg(test)]
 mod bucket_serialization_tests;
-#[cfg(test)]
-mod index_new_tests;
 #[cfg(test)]
 mod index_tests;
 #[cfg(test)]
@@ -37,3 +31,18 @@ mod router_tests;
 mod tombstone_tests;
 #[cfg(test)]
 mod wal_tests;
+
+// v2
+pub mod index_v2;
+pub mod maintainance;
+pub mod memtable_v2;
+pub mod partitioner;
+pub mod tombstone_v2;
+pub mod wal_v2;
+
+#[cfg(test)]
+mod index_v2_tests;
+#[cfg(test)]
+mod memtable_v2_tests;
+#[cfg(test)]
+mod wal_v2_tests;

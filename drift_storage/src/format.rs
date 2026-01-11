@@ -1,6 +1,6 @@
 // drift_storage/src/format.rs
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 // --- CONSTANTS ---
 pub const MAGIC_V2: u64 = 0x32565F5446495244;
@@ -51,6 +51,18 @@ impl DriftHeader {
             _pad_1: 0,
             padding: [0u8; 64],
         }
+    }
+
+    pub fn force_copy(buf: &[u8]) -> Self {
+        let mut header = DriftHeader::new_zeroed();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                &mut header as *mut _ as *mut u8,
+                ROW_GROUP_HEADER_SIZE,
+            );
+        }
+        header // Return the OWNED struct
     }
 
     pub fn validate(&self) -> bool {

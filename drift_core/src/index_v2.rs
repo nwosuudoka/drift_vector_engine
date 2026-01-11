@@ -1,8 +1,8 @@
-use crate::memtable::{MemTable, MemTableOptions};
+use crate::memtable_v2::{MemTableOptions, MemTableV2};
 use crate::partitioner::{IncrementalPartitioner, PartitionResult};
 use crate::router::Router;
 use crate::tombstone_v2::InMemoryTombstoneTracker;
-use crate::wal::WalWriter;
+use crate::wal_v2::WalWriter;
 use drift_traits::{DiskSearcher, TombstoneTracker};
 use parking_lot::{Mutex, RwLock};
 use std::cmp::Ordering;
@@ -16,10 +16,10 @@ use tokio::task;
 /// Manages the "Active" vs "Frozen" lifecycle and orchestrates Unified Search.
 pub struct VectorIndexV2 {
     // 1. The Active Table (Receives Writes)
-    active: RwLock<Arc<MemTable>>,
+    active: RwLock<Arc<MemTableV2>>,
 
     // 2. The Frozen Tables (Read-Only, waiting for flush)
-    frozen: RwLock<Vec<Arc<MemTable>>>,
+    frozen: RwLock<Vec<Arc<MemTableV2>>>,
 
     // 3. Durability (Write-Ahead Log)
     // Protected by Mutex to ensure serial writes (append-only safety)
@@ -46,7 +46,7 @@ impl VectorIndexV2 {
         disk: Arc<dyn DiskSearcher>,
     ) -> Self {
         Self {
-            active: RwLock::new(Arc::new(MemTable::new(MemTableOptions { capacity, dim }))),
+            active: RwLock::new(Arc::new(MemTableV2::new(MemTableOptions { capacity, dim }))),
             frozen: RwLock::new(Vec::new()),
             wal,
             disk,
@@ -95,11 +95,99 @@ impl VectorIndexV2 {
                     dim: self.dim,
                 };
                 // Create New
-                *active_guard = Arc::new(MemTable::new(m_opts));
+                *active_guard = Arc::new(MemTableV2::new(m_opts));
                 return Ok(true);
             }
         }
 
+        Ok(false)
+    }
+
+    // /// Efficiently writes a batch to WAL and MemTable with minimal lock contention.
+    // pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) -> io::Result<bool> {
+    //     if batch.is_empty() {
+    //         return Ok(false);
+    //     }
+
+    //     // 1. Batch Write to WAL (Durability)
+    //     // We lock once for the whole batch.
+    //     {
+    //         let mut wal_guard = self.wal.lock();
+    //         for (id, vector) in batch {
+    //             wal_guard.write_insert(*id, vector)?;
+    //         }
+    //         // Sync once at the end of the batch
+    //         wal_guard.sync()?;
+    //     }
+
+    //     // 2. Batch Unmark Tombstones
+    //     // Collect IDs to avoid cloning vectors if possible, or just iterate.
+    //     // Since unmark_delete_batch takes &[u64], we map.
+    //     let ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
+    //     self.tombstones.unmark_delete_batch(&ids);
+
+    //     // 3. Batch Insert to MemTable
+    //     // Get Read Lock on Ptr (Fast)
+    //     let active_ptr = { self.active.read().clone() };
+
+    //     // Use optimized MemTable batch insert
+    //     let needs_rotate = active_ptr.insert_batch(batch);
+
+    //     // 4. Check Rotation
+    //     if needs_rotate {
+    //         return self.try_rotate();
+    //     }
+
+    //     Ok(false)
+    // }
+
+    pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) -> io::Result<bool> {
+        if batch.is_empty() {
+            return Ok(false);
+        }
+
+        // 1. Write to WAL (Transactional)
+        {
+            let mut wal_guard = self.wal.lock();
+            let tx_id = wal_guard.begin_transaction()?; // BEGIN
+
+            for (id, vector) in batch {
+                wal_guard.write_insert(*id, vector)?;
+            }
+
+            wal_guard.commit_transaction(tx_id)?; // COMMIT (Syncs here)
+        }
+
+        // 2. MemTable & Tombstones (In-Memory)
+        let ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
+        self.tombstones.unmark_delete_batch(&ids);
+
+        let active_ptr = { self.active.read().clone() };
+        let needs_rotate = active_ptr.insert_batch(batch);
+
+        if needs_rotate {
+            return self.try_rotate();
+        }
+
+        Ok(false)
+    }
+
+    // Helper to rotate active table
+    fn try_rotate(&self) -> io::Result<bool> {
+        let mut active_guard = self.active.write();
+
+        // Check condition again under write lock
+        if active_guard.len() >= self.capacity {
+            let old_table = active_guard.clone();
+            self.frozen.write().push(old_table);
+
+            let m_opts = MemTableOptions {
+                capacity: self.capacity,
+                dim: self.dim,
+            };
+            *active_guard = Arc::new(MemTableV2::new(m_opts));
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -110,7 +198,6 @@ impl VectorIndexV2 {
         // 2. MemTable
         // We only need to mark it in the Active table.
         // The Search logic merges tombstones from all RAM tables.
-        self.active.read().delete(id);
         self.tombstones.mark_delete(id);
 
         Ok(())
@@ -207,35 +294,22 @@ impl VectorIndexV2 {
         Ok(final_results)
     }
 
-    /// Flushes ALL frozen tables.
-    /// Returns data to be written by the caller (Server).
+    /// Used by Janitor to prepare writes.
     pub fn flush_frozen(&self) -> Option<PartitionResult> {
         let tables_to_flush = {
-            let mut f = self.frozen.write();
+            let f = self.frozen.read(); // Read lock only!
             if f.is_empty() {
                 return None;
             }
-            let pending = f.clone();
-            f.clear();
-            pending
+            f.clone()
         };
 
         let router_guard = self.router.read();
         let mut global_partition = std::collections::HashMap::new();
 
         for table in tables_to_flush {
-            let (ids, flat_vecs, _tomb) = table.snapshot();
-
-            // Adapt MemTable data for Partitioner
-            // TODO: Update Partitioner to accept flat slices directly to avoid this allocation
-            let mut batch = Vec::with_capacity(ids.len());
-            for (i, id) in ids.iter().enumerate() {
-                let s = i * self.dim;
-                let e = s + self.dim;
-                batch.push((*id, flat_vecs[s..e].to_vec()));
-            }
-
-            let part = IncrementalPartitioner::partition(&batch, &router_guard);
+            let (ids, flat_vecs) = table.snapshot();
+            let part = IncrementalPartitioner::partition(&ids, &flat_vecs, self.dim, &router_guard);
 
             // Merge
             for (bucket_id, group) in part {
@@ -252,7 +326,23 @@ impl VectorIndexV2 {
             }
         }
 
-        // ⚠️ CRITICAL: After successful return, the caller MUST truncate the WAL.
         Some(global_partition)
+    }
+
+    /// Call this ONLY after data is safely persisted to disk/staging.
+    pub fn acknowledge_flush(&self) -> io::Result<()> {
+        // 1. Clear Frozen (Write Lock)
+        {
+            let mut f = self.frozen.write();
+            f.clear();
+        }
+
+        // 2. Truncate WAL (Mutex Lock)
+        {
+            let mut wal = self.wal.lock();
+            wal.truncate()?;
+        }
+
+        Ok(())
     }
 }

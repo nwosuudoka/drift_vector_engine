@@ -29,13 +29,32 @@ impl IncrementalPartitioner {
     /// Partitions a batch of vectors into their respective buckets.
     ///
     /// # Arguments
-    /// * `vectors`: Slice of (ID, Vector).
+    /// * `ids`: Slice of Vector IDs.
+    /// * `flat_vectors`: Flattened vector data (layout: [v0_d0, v0_d1, ... v1_d0...]).
+    /// * `dim`: Dimensionality of vectors.
     /// * `router`: The read-only router to decide destination.
-    pub fn partition(vectors: &[(u64, Vec<f32>)], router: &Router) -> PartitionResult {
-        let dim = router.dim();
+    pub fn partition(
+        ids: &[u64],
+        flat_vectors: &[f32],
+        dim: usize,
+        router: &Router,
+    ) -> PartitionResult {
+        // Safety / Sanity check
+        assert_eq!(
+            flat_vectors.len(),
+            ids.len() * dim,
+            "Mismatch between IDs count and flat vector data length"
+        );
+
         let mut groups: PartitionResult = HashMap::new();
 
-        for (id, vec) in vectors {
+        for (i, &id) in ids.iter().enumerate() {
+            let start = i * dim;
+            let end = start + dim;
+
+            // Zero-copy slice
+            let vec = &flat_vectors[start..end];
+
             // 1. Route
             let bucket_id = router.route(vec);
 
@@ -44,8 +63,8 @@ impl IncrementalPartitioner {
                 .entry(bucket_id)
                 .or_insert_with(|| PartitionGroup::new(dim));
 
-            // 3. Append (Flattening on the fly)
-            group.ids.push(*id);
+            // 3. Append
+            group.ids.push(id);
             group.flat_vectors.extend_from_slice(vec);
             group.count += 1;
         }

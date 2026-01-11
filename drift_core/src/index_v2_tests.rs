@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::index_new::VectorIndexV2;
+    use crate::index_v2::VectorIndexV2;
     use crate::manifest::pb::Centroid; // Assuming this moved or is available
     use crate::router::Router;
-    use crate::wal::WalWriter;
+    use crate::wal_v2::WalWriter;
     use async_trait::async_trait;
     use drift_traits::{DiskSearcher, SearchCandidate, TombstoneView};
     use parking_lot::{Mutex, RwLock};
@@ -151,47 +151,6 @@ mod tests {
         let wal_path = dir.path().join("test.wal");
         let metadata = std::fs::metadata(wal_path).unwrap();
         assert!(metadata.len() > 0, "WAL should contain data after insert");
-    }
-
-    // --- TEST 2: FLUSH FROZEN LOGIC ---
-    #[test]
-    fn test_flush_frozen_partitioning() {
-        let dir = tempdir().unwrap();
-        // Capacity 2: Forces rotation ON the 2nd insert.
-        let (index, _) = create_index(&dir, 2);
-
-        // 1. Fill Active Table
-        index.insert(1, vec![-9.0, -9.0]).unwrap(); // Bucket 0
-
-        // 2. Trigger Rotation
-        // This insert fills capacity (len becomes 2).
-        // The implementation eagerly rotates immediately.
-        let rotated = index.insert(2, vec![9.0, 9.0]).unwrap(); // Bucket 1
-        assert!(rotated, "Should have triggered rotation at capacity limit");
-
-        // 3. New Active Table
-        // This goes into the NEW active table (len 1). Should NOT rotate.
-        let rotated_again = index.insert(3, vec![-8.0, -8.0]).unwrap(); // Bucket 0
-        assert!(!rotated_again, "New table should not rotate yet");
-
-        // 4. Flush Frozen
-        // We expect [1, 2] to be flushed. [3] stays in RAM.
-        let partitions = index.flush_frozen().expect("Should return partition data");
-
-        // 5. Verify Partitioning
-        assert_eq!(partitions.len(), 2, "Should partition into 2 buckets");
-
-        let b0 = partitions.get(&0).unwrap();
-        assert!(b0.ids.contains(&1));
-        assert!(!b0.ids.contains(&3)); // 3 is active, not frozen!
-        assert_eq!(b0.count, 1);
-
-        let b1 = partitions.get(&1).unwrap();
-        assert!(b1.ids.contains(&2));
-        assert_eq!(b1.count, 1);
-
-        // 6. Verify Frozen Cleared
-        assert!(index.flush_frozen().is_none());
     }
 
     // --- TEST 3: UNIFIED SEARCH (RAM + DISK) ---
@@ -544,5 +503,47 @@ mod tests {
         assert!(results[1].1 > 0.0); // Distance should be ~0.01
 
         // ID 300 should be truncated
+    }
+
+    // --- TEST 2: FLUSH FROZEN LOGIC ---
+    #[test]
+    fn test_flush_frozen_partitioning() {
+        let dir = tempdir().unwrap();
+        // Capacity 2: Forces rotation ON the 2nd insert.
+        let (index, _) = create_index(&dir, 2);
+
+        // 1. Fill Active Table
+        index.insert(1, vec![-9.0, -9.0]).unwrap(); // Bucket 0
+
+        // 2. Trigger Rotation
+        let rotated = index.insert(2, vec![9.0, 9.0]).unwrap(); // Bucket 1
+        assert!(rotated, "Should have triggered rotation at capacity limit");
+
+        // 3. New Active Table
+        let rotated_again = index.insert(3, vec![-8.0, -8.0]).unwrap(); // Bucket 0
+        assert!(!rotated_again, "New table should not rotate yet");
+
+        // 4. Flush Frozen (Peek)
+        let partitions = index.flush_frozen().expect("Should return partition data");
+
+        // 5. Verify Partitioning
+        assert_eq!(partitions.len(), 2, "Should partition into 2 buckets");
+
+        let b0 = partitions.get(&0).unwrap();
+        assert!(b0.ids.contains(&1));
+        assert!(!b0.ids.contains(&3)); // 3 is active, not frozen!
+        assert_eq!(b0.count, 1);
+
+        let b1 = partitions.get(&1).unwrap();
+        assert!(b1.ids.contains(&2));
+        assert_eq!(b1.count, 1);
+
+        // ⚡ NEW STEP: Acknowledge Flush (Clear Memory & WAL)
+        index
+            .acknowledge_flush()
+            .expect("Failed to acknowledge flush");
+
+        // 6. Verify Frozen Cleared
+        assert!(index.flush_frozen().is_none());
     }
 }

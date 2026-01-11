@@ -280,6 +280,7 @@ mod stress_tests {
 
     // (KV consistency and duplicate centroid tests remain unchanged)
     #[tokio::test]
+    // #[ignore]
     async fn kv_consistency_torture() {
         let dir = tempdir().unwrap();
 

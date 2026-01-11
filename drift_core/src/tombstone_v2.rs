@@ -71,6 +71,13 @@ impl TombstoneTracker for InMemoryTombstoneTracker {
         self.delta.write().insert(id);
     }
 
+    fn mark_delete_batch(&self, ids: &[u64]) {
+        let mut delta = self.delta.write();
+        for &id in ids {
+            delta.insert(id);
+        }
+    }
+
     fn is_deleted(&self, id: u64) -> bool {
         if self.delta.read().contains(&id) {
             return true;
@@ -110,6 +117,32 @@ impl TombstoneTracker for InMemoryTombstoneTracker {
             let mut base_guard = self.base.write();
             let mut new_base = (**base_guard).clone();
             new_base.remove(&id);
+            *base_guard = Arc::new(new_base);
+        }
+    }
+
+    fn unmark_delete_batch(&self, ids: &[u64]) {
+        // 1. Clear from Delta (Fast)
+        {
+            let mut delta = self.delta.write();
+            for &id in ids {
+                delta.remove(&id);
+            }
+        }
+
+        // 2. Clear from Base (Expensive COW - do it once)
+        // Check if ANY need removal to avoid cloning if possible
+        let needs_cow = {
+            let base = self.base.read();
+            ids.iter().any(|id| base.contains(id))
+        };
+
+        if needs_cow {
+            let mut base_guard = self.base.write();
+            let mut new_base = (**base_guard).clone();
+            for &id in ids {
+                new_base.remove(&id);
+            }
             *base_guard = Arc::new(new_base);
         }
     }

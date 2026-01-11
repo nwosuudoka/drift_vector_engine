@@ -5,10 +5,11 @@ use crate::format::{DriftHeader, HEADER_SIZE, MAGIC_V2, ROW_GROUP_HEADER_SIZE, R
 use byteorder::{LittleEndian, ReadBytesExt};
 use drift_core::bucket::compute_distance_lut;
 use drift_core::quantizer::Quantizer;
-use drift_traits::{PageId, PageManager, SearchCandidate, TombstoneView};
+use drift_traits::{IoContext, PageId, PageManager, SearchCandidate, TombstoneView};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
+use std::path::Path;
 use std::sync::Arc;
 use zerocopy::{FromBytes, FromZeros};
 
@@ -351,5 +352,34 @@ impl BucketFileReader {
         }
 
         Ok((all_ids, all_vecs))
+    }
+
+    pub fn get_quantizer(path: &Path) -> io::Result<Quantizer> {
+        let mut file = std::fs::File::open(path)?;
+        let mut head_buf = [0u8; HEADER_SIZE];
+        file.read_exact(&mut head_buf)?;
+
+        // Offset 48 is quantizer_offset (u64), 56 is length (u32) based on our layout.
+        // Let's rely on `DriftHeader` being Pod/ZeroCopy.
+        // let header = DriftHeader::ref_from_bytes(&head_buf).map_err(io::Error::other)?;
+        let header = DriftHeader::force_copy(&head_buf);
+
+        // Validate
+        if header.magic != MAGIC_V2 {
+            tracing::error!("Invalid magic bytes {} != {}", header.magic, MAGIC_V2);
+            panic!("Invalid magic bytes")
+        }
+
+        // Read Quantizer Blob
+        file.seek(SeekFrom::Start(header.quantizer_offset))?;
+        let mut q_buf = vec![0u8; header.quantizer_length as usize];
+        file.read_exact(&mut q_buf)?;
+
+        let (q, _): (Quantizer, usize) =
+            bincode::decode_from_slice(&q_buf, bincode::config::standard())
+                .map_err(io::Error::other)
+                .context("Failed to decode quantizer")?;
+
+        Ok(q)
     }
 }

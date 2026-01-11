@@ -23,14 +23,11 @@ mod tests {
         let router = Router::new(&centroids, &counts, 2, "L2").unwrap();
 
         // 2. Create Mixed Batch
-        let batch = vec![
-            (100, vec![0.1, 0.1]), // -> Bucket 1
-            (101, vec![9.9, 9.9]), // -> Bucket 2
-            (102, vec![0.2, 0.2]), // -> Bucket 1
-        ];
+        let batch_ids = vec![100, 101, 102];
+        let flat_vecs = vec![0.1, 0.1, 9.9, 9.9, 0.2, 0.2];
 
         // 3. Partition
-        let result = IncrementalPartitioner::partition(&batch, &router);
+        let result = IncrementalPartitioner::partition(&batch_ids, &flat_vecs, 2, &router);
 
         // 4. Verify
         assert_eq!(result.len(), 2);

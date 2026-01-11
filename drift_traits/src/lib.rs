@@ -102,9 +102,11 @@ pub trait DataProvider: Send + Sync {
 pub trait TombstoneTracker: Send + Sync + Debug {
     /// Marks a vector ID as deleted.
     fn mark_delete(&self, id: u64);
+    fn mark_delete_batch(&self, id: &[u64]);
 
     /// Allow resurrection
     fn unmark_delete(&self, id: u64);
+    fn unmark_delete_batch(&self, id: &[u64]);
 
     /// Checks if a single ID is deleted (Fast path for MemTable/Ingest).
     fn is_deleted(&self, id: u64) -> bool;
@@ -122,4 +124,14 @@ pub trait TombstoneView: Send + Sync + Debug {
     fn contains(&self, id: u64) -> bool;
     /// Optional: Approximate count for statistics
     fn len(&self) -> usize;
+}
+
+pub trait IoContext<T> {
+    fn context(self, msg: &str) -> std::io::Result<T>;
+}
+
+impl<T> IoContext<T> for std::io::Result<T> {
+    fn context(self, msg: &str) -> std::io::Result<T> {
+        self.map_err(|e| std::io::Error::new(e.kind(), format!("{msg}: {e}")))
+    }
 }
