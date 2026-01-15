@@ -10,7 +10,7 @@ mod tests {
 
         // 2. Mutate (Add Bucket)
         let centroid = vec![0.1; 128];
-        manifest.add_bucket(100, "run_abc_123".to_string(), centroid.clone());
+        manifest.add_bucket(100, "run_abc_123".to_string(), Some(centroid.clone()));
 
         // 3. Serialize
         let bytes = manifest.to_bytes();
@@ -41,7 +41,7 @@ mod tests {
 
         // 1. Add Bucket
         let centroid = vec![0.1; 128];
-        manifest.add_bucket(100, "run_A".to_string(), centroid.clone());
+        manifest.add_bucket(100, "run_A".to_string(), Some(centroid.clone()));
 
         let buckets = manifest.get_buckets();
         assert_eq!(buckets.len(), 1);
@@ -61,7 +61,7 @@ mod tests {
 
         // 3. Replace Bucket (Simulating Split/Update)
         // Adding the same ID should overwrite the old entry
-        manifest.add_bucket(100, "run_B".to_string(), centroid.clone());
+        manifest.add_bucket(100, "run_B".to_string(), Some(centroid.clone()));
         let buckets_after = manifest.get_buckets();
         assert_eq!(buckets_after.len(), 1); // Still 1
         assert_eq!(buckets_after[0].run_id, "run_B"); // Updated run_id
@@ -71,8 +71,8 @@ mod tests {
     #[test]
     fn test_bucket_removal() {
         let mut manifest = ManifestWrapper::new(128, "L2");
-        manifest.add_bucket(1, "run_1".to_string(), vec![0.0; 128]);
-        manifest.add_bucket(2, "run_2".to_string(), vec![1.0; 128]);
+        manifest.add_bucket(1, "run_1".to_string(), Some(vec![0.0; 128]));
+        manifest.add_bucket(2, "run_2".to_string(), Some(vec![1.0; 128]));
 
         assert_eq!(manifest.get_buckets().len(), 2);
 
@@ -106,7 +106,7 @@ mod tests {
 
         // Populate with some complex state
         for i in 0..10 {
-            manifest.add_bucket(i, format!("run_{}", i), vec![i as f32; 64]);
+            manifest.add_bucket(i, format!("run_{}", i), Some(vec![i as f32; 64]));
             manifest.update_bucket_stats(i, i as u64 * 100, i);
         }
         manifest.bump_version();

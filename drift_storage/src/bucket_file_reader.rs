@@ -1,20 +1,32 @@
 use crate::compression::wrapper::{
     CompressionStrategy, decompress_vectors, transpose_from_columns,
 };
-use crate::format::{DriftHeader, HEADER_SIZE, MAGIC_V2, ROW_GROUP_HEADER_SIZE, RowGroupHeader};
+use crate::disk_manager::DiskManager;
+use crate::format::{
+    DriftFooter, DriftHeader, HEADER_SIZE, MAGIC_V2, ROW_GROUP_HEADER_SIZE, RowGroupHeader,
+};
 use byteorder::{LittleEndian, ReadBytesExt};
 use drift_core::bucket::compute_distance_lut;
 use drift_core::quantizer::Quantizer;
-use drift_traits::{IoContext, PageId, PageManager, SearchCandidate, TombstoneView};
+use drift_traits::{IoContext, SearchCandidate, TombstoneView};
+use fastbloom::BloomFilter;
+use opendal::Operator;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
-use zerocopy::{FromBytes, FromZeros};
+use zerocopy::FromBytes;
 
+/// Wrapper to make SearchCandidate sortable in a BinaryHeap (MaxHeap).
 #[derive(PartialEq)]
 struct CandidateWrapper(SearchCandidate);
+
+struct ScanParams<'a> {
+    lut: &'a [f32],
+    dim: usize,
+    k: usize,
+    tombstones: &'a dyn TombstoneView,
+}
 
 impl Eq for CandidateWrapper {}
 
@@ -34,20 +46,91 @@ impl PartialOrd for CandidateWrapper {
 }
 
 pub struct BucketFileReader {
-    storage: Arc<dyn PageManager>,
-    file_id: u32,
-    quantizer: Option<Quantizer>,
-    data_start_offset: u64,
+    manager: DiskManager,
+    pub footer: DriftFooter,
+    pub row_groups: Vec<RowGroupHeader>, // Cached headers
+    pub quantizer: Option<Quantizer>,
+    pub bloom: Option<BloomFilter>,
 }
 
 impl BucketFileReader {
-    pub fn new(storage: Arc<dyn PageManager>, file_id: u32) -> Self {
-        Self {
-            storage,
-            file_id,
-            quantizer: None,
-            data_start_offset: HEADER_SIZE as u64,
+    /// Opens a bucket file from an Operator.
+    /// Reads Footer, Index, and Header (Quantizer) immediately.
+    pub async fn open(op: Operator, path: &str) -> io::Result<Self> {
+        let manager = DiskManager::new(op, path.to_string());
+        let file_len = manager.len().await?;
+
+        if file_len < crate::format::FOOTER_SIZE as u64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "File too small"));
         }
+
+        // 1. Read Footer
+        let footer_pos = file_len - crate::format::FOOTER_SIZE as u64;
+        let footer_bytes = manager
+            .read_at(footer_pos, crate::format::FOOTER_SIZE)
+            .await?;
+        let footer = DriftFooter::read_from_bytes(&footer_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid Footer"))?;
+
+        if footer.magic != MAGIC_V2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad Magic"));
+        }
+
+        // 2. Read Index (RowGroup Headers)
+        // Format: [Count: u32] [Header 1] [Header 2] ...
+        // We trust the footer's row_group_count and index_start_offset.
+        // Size = 4 bytes (count) + (N * 64 bytes)
+        let index_size = 4 + (footer.row_group_count as usize * ROW_GROUP_HEADER_SIZE);
+        let index_bytes = manager
+            .read_at(footer.index_start_offset, index_size)
+            .await?;
+
+        let mut cursor = Cursor::new(index_bytes);
+        let _stored_count = cursor.read_u32::<LittleEndian>()?;
+
+        let mut row_groups = Vec::with_capacity(footer.row_group_count as usize);
+        let mut rg_buf = [0u8; ROW_GROUP_HEADER_SIZE];
+
+        for _ in 0..footer.row_group_count {
+            cursor.read_exact(&mut rg_buf)?;
+            let rg = RowGroupHeader::read_from_bytes(&rg_buf)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad RG Header"))?;
+            row_groups.push(rg);
+        }
+
+        // 3. Read Header & Quantizer
+        // We need the header to find the Quantizer offset.
+        let head_bytes = manager.read_at(0, HEADER_SIZE).await?;
+        let header = DriftHeader::read_from_bytes(&head_bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid Header"))?;
+
+        // We load the quantizer eagerly or lazy?
+        // Let's load Lazy to keep open() fast, but we need data_start_offset.
+        let _data_start_offset = header.quantizer_offset + header.quantizer_length as u64;
+
+        // 4. Read Bloom (Optional)
+        let bloom = if footer.bloom_filter_length > 0 {
+            let b_bytes = manager
+                .read_at(
+                    footer.bloom_filter_offset,
+                    footer.bloom_filter_length as usize,
+                )
+                .await?;
+            let (b, _): (BloomFilter, usize) =
+                bincode::serde::decode_from_slice(&b_bytes, bincode::config::standard())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            Some(b)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            manager,
+            footer,
+            row_groups,
+            quantizer: None,
+            bloom,
+        })
     }
 
     pub async fn load_quantizer(&mut self) -> io::Result<()> {
@@ -55,54 +138,25 @@ impl BucketFileReader {
             return Ok(());
         }
 
-        // 1. Read Header
-        let head_page = PageId {
-            file_id: self.file_id,
-            offset: 0,
-            length: HEADER_SIZE as u32,
-        };
-        let head_bytes = self.storage.read_page(head_page).await?;
+        // Re-read header to get offset (or we could have stored it).
+        // Since HEADER_SIZE is small, re-reading is negligible.
+        let head_bytes = self.manager.read_at(0, HEADER_SIZE).await?;
         let header = DriftHeader::read_from_bytes(&head_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid Header"))?;
 
-        if header.magic != MAGIC_V2 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid Magic"));
-        }
-
-        // 2. Read Quantizer
-        let q_page = PageId {
-            file_id: self.file_id,
-            offset: header.quantizer_offset,
-            length: header.quantizer_length,
-        };
-        let q_bytes = self.storage.read_page(q_page).await?;
-
+        let q_bytes = self
+            .manager
+            .read_at(header.quantizer_offset, header.quantizer_length as usize)
+            .await?;
         let (q, _): (Quantizer, usize) =
             bincode::decode_from_slice(&q_bytes, bincode::config::standard())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         self.quantizer = Some(q);
-
-        // ⚡ Update Start Offset so Scans Skip the Quantizer
-        self.data_start_offset = header.quantizer_offset + header.quantizer_length as u64;
-
         Ok(())
     }
 
-    fn get_row_header(buf: Vec<u8>) -> RowGroupHeader {
-        let mut header = RowGroupHeader::new_zeroed();
-        // This is safe because both are raw bytes and size is checked above.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                &mut header as *mut _ as *mut u8,
-                ROW_GROUP_HEADER_SIZE,
-            );
-        }
-        header
-    }
-
-    /// Step 1: Scan Hot Index
+    /// ⚡ SCAN PATH: Approx Search using SQ8
     pub async fn scan(
         &mut self,
         query: &[f32],
@@ -117,41 +171,33 @@ impl BucketFileReader {
         let dim = query.len();
 
         let mut heap: BinaryHeap<CandidateWrapper> = BinaryHeap::with_capacity(k + 1);
-        let mut current_offset = self.data_start_offset;
 
-        loop {
-            // A. Read RG Header
-            let head_page = PageId {
-                file_id: self.file_id,
-                offset: current_offset,
-                length: ROW_GROUP_HEADER_SIZE as u32,
-            };
+        let params = ScanParams {
+            lut: &lut,
+            dim,
+            k,
+            tombstones,
+        };
 
-            let head_bytes = match self.storage.read_page(head_page).await {
-                Ok(b) if b.len() == ROW_GROUP_HEADER_SIZE => b,
-                _ => break, // EOF
-            };
+        // Iterate Cached RowGroups
+        for rg in &self.row_groups {
+            // Read Hot Index Blob
+            // Hot Layout: [IDs: u64 * N] [Codes: u8 * N * D] [Tombstones...]
+            // We read just enough for IDs + Codes.
+            // ID Size: N * 8
+            // Code Size: N * D
+            let count = rg.vector_count as usize;
+            let _hot_size = (count * 8) + (count * dim); // Roughly. 
+            // Better: Read the whole hot_length as defined in header.
 
-            // let rg = *RowGroupHeader::ref_from_bytes(&head_bytes)
-            // .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let rg = Self::get_row_header(head_bytes);
+            let hot_blob = self
+                .manager
+                .read_at(rg.hot_offset, rg.hot_length as usize)
+                .await?;
 
-            // B. Read Hot Index
-            let hot_page = PageId {
-                file_id: self.file_id,
-                offset: rg.hot_offset,
-                length: rg.hot_length,
-            };
-            let hot_blob = self.storage.read_page(hot_page).await?;
-
-            // C. Scan
-            self.scan_row_group_filtered(&rg, &hot_blob, &lut, dim, k, tombstones, &mut heap);
-
-            // D. Advance
-            current_offset = rg.cold_offset.clone() + rg.cold_length as u64;
+            self.scan_row_group_filtered(rg, &hot_blob, &params, &mut heap);
         }
 
-        // Return sorted candidates
         let mut results: Vec<SearchCandidate> = heap.into_vec().into_iter().map(|w| w.0).collect();
         results.sort_by(|a, b| {
             a.approx_dist
@@ -165,16 +211,12 @@ impl BucketFileReader {
         &self,
         header: &RowGroupHeader,
         hot_blob: &[u8],
-        lut: &[f32],
-        dim: usize,
-        k: usize,
-        tombstones: &dyn TombstoneView,
+        params: &ScanParams,
         heap: &mut BinaryHeap<CandidateWrapper>,
     ) {
         let count = header.vector_count as usize;
         let mut cursor = Cursor::new(hot_blob);
 
-        // 1. Decode IDs
         let mut ids = Vec::with_capacity(count);
         for _ in 0..count {
             if let Ok(id) = cursor.read_u64::<LittleEndian>() {
@@ -182,51 +224,49 @@ impl BucketFileReader {
             }
         }
 
-        // 2. Decode Codes
         let ids_size = cursor.position() as usize;
         if ids_size >= hot_blob.len() {
             return;
         }
         let codes = &hot_blob[ids_size..];
 
-        // 3. Scan
-        let lut_ptr = lut.as_ptr();
+        let lut_ptr = params.lut.as_ptr();
         let codes_ptr = codes.as_ptr();
 
         for (i, &id) in ids.iter().enumerate() {
-            if tombstones.contains(id) {
+            if params.tombstones.contains(id) {
                 continue;
             }
 
-            let offset = i * dim;
-            if offset + dim > codes.len() {
+            let offset = i * params.dim;
+            if offset + params.dim > codes.len() {
                 break;
             }
 
-            let dist = unsafe { compute_distance_lut(codes_ptr.add(offset), lut_ptr, dim) };
+            let dist = unsafe { compute_distance_lut(codes_ptr.add(offset), lut_ptr, params.dim) };
 
             let candidate = SearchCandidate {
                 id,
                 approx_dist: dist,
-                file_id: self.file_id,
+                file_id: 0, // Managed by BucketManager
                 cold_offset: header.cold_offset,
                 cold_length: header.cold_length,
                 index_in_rg: i as u16,
-                vector_count: count as u16, // ⚡ The size of THIS block
+                vector_count: count as u16,
             };
 
-            if heap.len() < k {
+            if heap.len() < params.k {
                 heap.push(CandidateWrapper(candidate));
-            } else if let Some(worst) = heap.peek() {
-                if dist < worst.0.approx_dist {
-                    heap.pop();
-                    heap.push(CandidateWrapper(candidate));
-                }
+            } else if let Some(worst) = heap.peek()
+                && dist < worst.0.approx_dist
+            {
+                heap.pop();
+                heap.push(CandidateWrapper(candidate));
             }
         }
     }
 
-    /// Step 2: Refine (Batch Fetch Cold Data)
+    /// REFINE PATH: Fetch & Decompress Cold Data
     pub async fn refine(
         &self,
         candidates: Vec<SearchCandidate>,
@@ -236,11 +276,7 @@ impl BucketFileReader {
         let mut results = Vec::with_capacity(candidates.len());
         let mut groups: BTreeMap<u64, (u32, u16, Vec<SearchCandidate>)> = BTreeMap::new();
 
-        // Group by RowGroup
         for c in candidates {
-            if c.file_id != self.file_id {
-                continue;
-            }
             groups
                 .entry(c.cold_offset)
                 .or_insert_with(|| (c.cold_length, c.vector_count, Vec::new()))
@@ -248,14 +284,23 @@ impl BucketFileReader {
                 .push(c);
         }
 
-        // Fetch & Compute
         for (offset, (length, count, group)) in groups {
-            let page = PageId {
-                file_id: self.file_id,
+            tracing::info!(
+                "🔍 Refine: Reading Cold Blob at Offset {} (Len {}). Expecting {} vectors.",
                 offset,
                 length,
-            };
-            let cold_blob = self.storage.read_page(page).await?;
+                count
+            );
+            let cold_blob = self.manager.read_at(offset, length as usize).await?;
+
+            if !cold_blob.is_empty() && cold_blob.iter().all(|&b| b == 0) {
+                tracing::error!(
+                    "🚨 DATA LOSS: Read {} bytes at offset {}, but ALL were zeros! path={}",
+                    length,
+                    offset,
+                    self.manager.path
+                );
+            }
 
             let vectors = self.decompress_row_group(&cold_blob, dim, count as usize)?;
 
@@ -272,7 +317,51 @@ impl BucketFileReader {
         Ok(results)
     }
 
-    /// Helper: Decompresses a raw cold blob (ALP/LZ4) into flat f32s
+    /// Returns (IDs, Vectors)
+    pub async fn read_all_vectors(&mut self) -> io::Result<(Vec<u64>, Vec<Vec<f32>>)> {
+        if self.quantizer.is_none() {
+            self.load_quantizer().await?;
+        }
+        let dim = self.quantizer.as_ref().unwrap().min.len();
+
+        let mut all_ids = Vec::new();
+        let mut all_vecs = Vec::new();
+
+        for rg in &self.row_groups {
+            let count = rg.vector_count as usize;
+
+            // 1. IDs (Hot)
+            let id_block_size = count * 8;
+            let id_bytes = self.manager.read_at(rg.hot_offset, id_block_size).await?;
+            let mut id_cursor = Cursor::new(id_bytes);
+            for _ in 0..count {
+                all_ids.push(id_cursor.read_u64::<LittleEndian>()?);
+            }
+
+            // 2. Vectors (Cold)
+            let cold_bytes = self
+                .manager
+                .read_at(rg.cold_offset, rg.cold_length as usize)
+                .await?;
+            let mut col_cursor = Cursor::new(&cold_bytes);
+            let mut columns = Vec::with_capacity(dim);
+
+            for _ in 0..dim {
+                let len = col_cursor.read_u32::<LittleEndian>()? as usize;
+                let mut col_data = vec![0u8; len];
+                col_cursor.read_exact(&mut col_data)?;
+
+                let floats = decompress_vectors(&col_data, count, CompressionStrategy::AlpRd);
+                columns.push(floats);
+            }
+
+            let rows = transpose_from_columns(&columns, count);
+            all_vecs.extend(rows);
+        }
+
+        Ok((all_ids, all_vecs))
+    }
+
     fn decompress_row_group(&self, blob: &[u8], dim: usize, count: usize) -> io::Result<Vec<f32>> {
         let mut cursor = Cursor::new(blob);
         let mut columns = Vec::with_capacity(dim);
@@ -283,6 +372,16 @@ impl BucketFileReader {
             cursor.read_exact(&mut chunk)?;
 
             let col_floats = decompress_vectors(&chunk, count, CompressionStrategy::AlpRd);
+            if col_floats.len() != count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ALP Decode Mismatch: Expected {} items, got {}",
+                        count,
+                        col_floats.len()
+                    ),
+                ));
+            }
             columns.push(col_floats);
         }
 
@@ -292,66 +391,6 @@ impl BucketFileReader {
             flat.extend_from_slice(&row);
         }
         Ok(flat)
-    }
-
-    /// Reads ALL high-fidelity vectors. Used for Maintenance.
-    pub async fn read_all_vectors(&mut self, dim: usize) -> io::Result<(Vec<u64>, Vec<f32>)> {
-        if self.quantizer.is_none() {
-            // In read_all, we might need quantizer info to verify file structure,
-            // but technically we can read header without it.
-            // However, to know where data starts, we MUST read the header.
-            self.load_quantizer().await?;
-        }
-
-        let mut all_ids = Vec::new();
-        let mut all_vecs = Vec::new();
-        let mut current_offset = self.data_start_offset;
-
-        loop {
-            // 1. RG Header
-            let head_page = PageId {
-                file_id: self.file_id,
-                offset: current_offset,
-                length: ROW_GROUP_HEADER_SIZE as u32,
-            };
-            let head_bytes = match self.storage.read_page(head_page).await {
-                Ok(b) if b.len() == ROW_GROUP_HEADER_SIZE => b,
-                _ => break,
-            };
-            let rg = RowGroupHeader::read_from_bytes(&head_bytes)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad RG Header"))?;
-
-            // 2. Hot Index (Get IDs)
-            let count = rg.vector_count as usize;
-            let id_bytes_len = count * 8;
-            let id_page = PageId {
-                file_id: self.file_id,
-                offset: rg.hot_offset,
-                length: id_bytes_len as u32,
-            };
-            let id_blob = self.storage.read_page(id_page).await?;
-            let mut cursor = Cursor::new(id_blob);
-            for _ in 0..count {
-                all_ids.push(cursor.read_u64::<LittleEndian>()?);
-            }
-
-            // 3. Cold Data (High Fidelity)
-            let cold_page = PageId {
-                file_id: self.file_id,
-                offset: rg.cold_offset,
-                length: rg.cold_length,
-            };
-            let cold_blob = self.storage.read_page(cold_page).await?;
-
-            // 4. Decompress using Helper (⚡ DRY Fix)
-            let vectors = self.decompress_row_group(&cold_blob, dim, count)?;
-            all_vecs.extend(vectors);
-
-            // 5. Advance
-            current_offset = rg.cold_offset + rg.cold_length as u64;
-        }
-
-        Ok((all_ids, all_vecs))
     }
 
     pub fn get_quantizer(path: &Path) -> io::Result<Quantizer> {

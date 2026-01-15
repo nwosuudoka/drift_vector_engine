@@ -1,9 +1,9 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // OpCodes
 const OP_INSERT: u8 = 0x01;
@@ -26,11 +26,7 @@ pub struct WalWriter {
 
 impl WalWriter {
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         Ok(Self {
             writer: BufWriter::new(file),
@@ -134,12 +130,8 @@ impl WalReader {
         let mut pending_entries = Vec::new();
         let mut active_tx_id: Option<u64> = None;
 
-        loop {
+        while let Ok(crc_expected) = self.reader.read_u32::<LittleEndian>() {
             // 1. Read Frame
-            let crc_expected = match self.reader.read_u32::<LittleEndian>() {
-                Ok(c) => c,
-                Err(_) => break, // EOF
-            };
             let len = match self.reader.read_u32::<LittleEndian>() {
                 Ok(l) => l as usize,
                 Err(_) => break, // Truncated header
@@ -168,12 +160,12 @@ impl WalReader {
                         active_tx_id = Some(tx_id);
                     }
                     WalEntry::Commit { tx_id } => {
-                        if let Some(active) = active_tx_id {
-                            if active == tx_id {
-                                // ⚡ COMMIT: Move pending to finalized
-                                committed_entries.append(&mut pending_entries);
-                                active_tx_id = None;
-                            }
+                        if let Some(active) = active_tx_id
+                            && active == tx_id
+                        {
+                            // ⚡ COMMIT: Move pending to finalized
+                            committed_entries.append(&mut pending_entries);
+                            active_tx_id = None;
                         }
                         // Ignore commit if no matching begin (or mismatch ID)
                     }
@@ -223,5 +215,73 @@ impl WalReader {
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown OpCode")),
         }
+    }
+}
+
+pub struct WalManager {
+    base_dir: PathBuf,
+    current_writer: Option<WalWriter>,
+    current_id: u64,
+}
+
+impl WalManager {
+    pub fn new(base_dir: impl AsRef<Path>) -> io::Result<Self> {
+        let base_dir = base_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&base_dir)?;
+
+        let mut max_id = 0;
+        if let Ok(entries) = fs::read_dir(&base_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with("wal_") && name.ends_with(".log") {
+                        if let Ok(id) = name[4..name.len() - 4].parse::<u64>() {
+                            if id > max_id {
+                                max_id = id;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let start_id = max_id + 1;
+        let start_path = base_dir.join(format!("wal_{}.log", start_id));
+
+        // EAGERLY INITIALIZE WRITER
+        let writer = WalWriter::new(&start_path)?;
+
+        Ok(Self {
+            base_dir,
+            current_writer: Some(writer),
+            current_id: start_id,
+        })
+    }
+
+    pub fn current(&mut self) -> &mut WalWriter {
+        self.current_writer
+            .as_mut()
+            .expect("WalManager not initialized (call rotate first)")
+    }
+
+    pub fn rotate(&mut self) -> io::Result<u64> {
+        let old_id = self.current_id;
+
+        if let Some(mut w) = self.current_writer.take() {
+            w.sync()?;
+        }
+
+        self.current_id += 1;
+        let new_path = self.base_dir.join(format!("wal_{}.log", self.current_id));
+        self.current_writer = Some(WalWriter::new(&new_path)?);
+
+        Ok(old_id)
+    }
+
+    pub fn delete_wal(&self, id: u64) -> io::Result<()> {
+        let path = self.base_dir.join(format!("wal_{}.log", id));
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        Ok(())
     }
 }

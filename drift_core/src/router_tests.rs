@@ -20,7 +20,7 @@ mod tests {
         // Dummy counts for L2 routing test
         let counts = vec![100, 100];
 
-        let router = Router::new(&centroids, &counts, 2, "L2").unwrap();
+        let router = Router::new(&centroids, &counts, 2, crate::router::Metric::L2).unwrap();
 
         // Query: [1, 1] -> Should be closer to C1
         let q1 = vec![1.0, 1.0];
@@ -48,7 +48,7 @@ mod tests {
         ];
         let counts = vec![100, 100];
 
-        let router = Router::new(&centroids, &counts, 2, "COSINE").unwrap();
+        let router = Router::new(&centroids, &counts, 2, crate::router::Metric::Cosine).unwrap();
 
         // Query: [0.9, 0.1] -> Closer angle to X-axis (C1)
         assert_eq!(router.route(&vec![0.9, 0.1]), 1);
@@ -68,6 +68,26 @@ mod tests {
         ];
         let counts = vec![100];
         // Init with Dim 2 -> Panic
-        Router::new(&centroids, &counts, 2, "L2");
+        Router::new(&centroids, &counts, 2, crate::router::Metric::L2);
+    }
+
+    #[test]
+    fn test_get_centroid() {
+        let centroids = vec![
+            Centroid {
+                id: 10,
+                vector: vec![1.0, 2.0],
+            },
+            Centroid {
+                id: 20,
+                vector: vec![3.0, 4.0],
+            },
+        ];
+        let counts = vec![0, 0];
+        let router = Router::new(&centroids, &counts, 2, crate::router::Metric::L2).unwrap();
+
+        assert_eq!(router.get_centroid(10), Some(vec![1.0, 2.0]));
+        assert_eq!(router.get_centroid(20), Some(vec![3.0, 4.0]));
+        assert_eq!(router.get_centroid(99), None);
     }
 }

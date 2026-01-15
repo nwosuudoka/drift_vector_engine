@@ -13,12 +13,12 @@
 - **Two-Stage Search:** Implemented `Scatter-Gather` (Hot Scan) + `Refine` (Cold Fetch) architecture.
 - **Tombstone Resurrection:** Added `unmark_delete` to `TombstoneTracker` to fix "Zombie" insert bugs.
 - **Parallel Scanning:** Updated `DiskSearcher` to use `Arc<dyn TombstoneView>`, enabling `tokio::spawn` for parallel bucket scans.
-- **VectorIndex Integration:** `VectorIndexV2::search` now orchestrates the full RAM -> Disk (Approx) -> Disk (Exact) pipeline.
+- **VectorIndex Integration:** `VectorIndex::search` now orchestrates the full RAM -> Disk (Approx) -> Disk (Exact) pipeline.
 
 ### Changed
 
-- **Architecture:** `VectorIndexV2` now relies on `dyn DiskSearcher` trait for disk access, enabling dependency injection of the Storage Layer.
-- **Search:** Implemented Scatter-Gather search (MemTable + Disk) in `VectorIndexV2`.
+- **Architecture:** `VectorIndex` now relies on `dyn DiskSearcher` trait for disk access, enabling dependency injection of the Storage Layer.
+- **Search:** Implemented Scatter-Gather search (MemTable + Disk) in `VectorIndex`.
 
 ### Added
 

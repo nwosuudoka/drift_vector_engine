@@ -34,6 +34,7 @@ mod wal_tests;
 
 // v2
 pub mod index_v2;
+pub mod lock_manager;
 pub mod maintainance;
 pub mod memtable_v2;
 pub mod partitioner;

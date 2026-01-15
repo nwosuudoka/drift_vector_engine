@@ -52,24 +52,32 @@ impl ManifestWrapper {
 
     // --- State Mutation Methods (The "Brain" Logic) ---
 
-    pub fn add_bucket(&mut self, id: u32, run_id: String, centroid: Vec<f32>) {
-        // 1. Update Registry
-        // Remove existing if replacing
-        self.inner.buckets.retain(|b| b.id != id);
-        self.inner.buckets.push(Bucket {
+    /// Adds a new bucket to the registry.
+    /// Updates BOTH the physical registry (Bucket list) and the routing table (Centroid list).
+    pub fn add_bucket(&mut self, id: u32, run_id: String, centroid: Option<Vec<f32>>) {
+        // 1. Update Physical Registry
+        // Remove existing entry if present (Upsert)
+        if let Some(pos) = self.inner.buckets.iter().position(|b| b.id == id) {
+            self.inner.buckets.remove(pos);
+        }
+
+        self.inner.buckets.push(pb::Bucket {
             id,
             run_id,
-            vector_count: 0, // Initial count, update later
+            vector_count: 0, // Reset count on new run? Or pass it in. Usually 0 start.
             tombstone_count: 0,
             radius: 0.0,
         });
 
-        // 2. Update Router
-        self.inner.centroids.retain(|c| c.id != id);
-        self.inner.centroids.push(Centroid {
-            id,
-            vector: centroid,
-        });
+        // 2. Update Routing Table (if centroid provided)
+        if let Some(vec) = centroid {
+            // Remove existing centroid for this ID
+            if let Some(pos) = self.inner.centroids.iter().position(|c| c.id == id) {
+                self.inner.centroids.remove(pos);
+            }
+
+            self.inner.centroids.push(pb::Centroid { id, vector: vec });
+        }
     }
 
     pub fn update_bucket_stats(&mut self, id: u32, count: u64, tombstones: u32) {
@@ -94,5 +102,11 @@ impl ManifestWrapper {
 
     pub fn get_dim(&self) -> u32 {
         self.inner.dim
+    }
+
+    pub fn update_bucket_run_id(&mut self, id: u32, new_run_id: String) {
+        if let Some(b) = self.inner.buckets.iter_mut().find(|b| b.id == id) {
+            b.run_id = new_run_id;
+        }
     }
 }

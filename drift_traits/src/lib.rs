@@ -1,3 +1,5 @@
+pub mod mock;
+
 use async_trait::async_trait;
 use std::fmt::Debug;
 use std::io::Result;
@@ -69,23 +71,16 @@ pub struct SearchCandidate {
 /// Implemented by `BucketManager` in the storage layer.
 #[async_trait]
 pub trait DiskSearcher: Send + Sync {
-    /// Searches specific buckets on disk.
-    ///
-    /// # Arguments
-    /// * `bucket_ids`: The list of buckets to query (determined by Router).
-    /// * `query`: The vector to search for.
-    /// * `k`: Number of results.
-    ///
-    /// Returns a flat list of (id, distance).
-    async fn search(
+    /// Performs a complete search: Scan Index (Hot) -> Fetch Data (Cold) -> Refine.
+    /// Guarantees consistency by holding locks across both phases.
+    async fn search_and_refine(
         &self,
         bucket_ids: &[u32],
         query: &[f32],
-        k: usize,
+        k: usize,                 // Top-K to return
+        oversample_factor: usize, // How many candidates to scan (e.g. k * 3)
         tombstones: Arc<dyn TombstoneView>,
-    ) -> Vec<SearchCandidate>;
-
-    async fn refine(&self, candidates: Vec<SearchCandidate>, query: &[f32]) -> Vec<(u64, f32)>;
+    ) -> Vec<(u64, f32)>; // Returns (ID, Exact Distance)
 }
 
 /// Represents a component capable of retrieving full bucket data.

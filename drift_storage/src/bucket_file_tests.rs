@@ -38,13 +38,14 @@ mod tests {
         writer.write_batch(&ids_2, &vecs_2_flat).unwrap();
 
         // 5. Finalize
-        let total_size = writer.finalize().unwrap();
+        let (total_size, count) = writer.finalize().unwrap();
 
         // --- VERIFICATION ---
 
         // A. Check Size
         let written_data = buffer.into_inner();
         assert_eq!(written_data.len() as u64, total_size);
+        assert_eq!(count, 150);
 
         // B. Check Header (Start)
         let header_bytes = &written_data[0..HEADER_SIZE];
@@ -77,11 +78,12 @@ mod tests {
 #[cfg(test)]
 mod writer_tests {
     use crate::bucket_file_writer::BucketFileWriter;
-    use crate::format::HEADER_SIZE;
+    use crate::format::{DriftFooter, HEADER_SIZE};
     use drift_core::quantizer::Quantizer;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
     use tempfile::NamedTempFile;
+    use zerocopy::FromBytes;
 
     // Helper to generate mock data
     fn mock_batch(start_id: u64, count: usize, dim: usize) -> (Vec<u64>, Vec<f32>) {
@@ -200,7 +202,7 @@ mod writer_tests {
 
         // Use byteorder/zerocopy to decode struct if needed, or just check basic fields
         // Let's assume DriftFooter layout: [RowGroupCount (u32), ...]
-        let rg_count = u32::from_le_bytes(footer_buf[0..4].try_into().unwrap());
+        let rg_count = u32::from_le_bytes(footer_buf[28..32].try_into().unwrap());
 
         // CRITICAL CHECK: We wrote 1 batch in Phase 1, 1 batch in Phase 2.
         // Total RowGroups should be 2.
@@ -212,6 +214,79 @@ mod writer_tests {
         assert_eq!(
             current_pos, total_size,
             "File should end exactly after footer"
+        );
+    }
+
+    #[test]
+    fn test_vector_count_integrity() {
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path().to_owned();
+        let dim = 8;
+
+        // 1. Initial Write (50 vectors)
+        let (ids_1, vecs_1) = mock_batch(0, 50, dim);
+        let q = Quantizer::train(&vecs_1, dim);
+
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&path)
+                .unwrap();
+
+            let mut writer = BucketFileWriter::new_streaming(file, [1u8; 16], q.clone(), dim)
+                .expect("Failed to create new writer");
+
+            writer.write_batch(&ids_1, &vecs_1).unwrap();
+            let (_, count) = writer.finalize().unwrap();
+
+            assert_eq!(count, 50, "Initial count should be 50");
+        }
+
+        // 2. Append (25 vectors)
+        let (ids_2, vecs_2) = mock_batch(50, 25, dim);
+
+        {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let initial_len = file.metadata().unwrap().len();
+
+            let mut writer =
+                BucketFileWriter::new_append(file, [1u8; 16], q.clone(), dim, initial_len)
+                    .expect("Failed to open append writer");
+
+            // Verify count was recovered correctly from existing RowGroups
+            assert_eq!(
+                writer.get_total_count(),
+                50,
+                "Writer should recover existing count"
+            );
+
+            writer.write_batch(&ids_2, &vecs_2).unwrap();
+
+            // Finalize returns the NEW cumulative total
+            let (_, total_count) = writer.finalize_and_truncate().unwrap();
+            assert_eq!(total_count, 75, "Total count should be 50 + 25 = 75");
+        }
+
+        // 3. Verify Footer Persisted Correctly
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::End(-(crate::format::FOOTER_SIZE as i64)))
+            .unwrap();
+
+        let mut footer_buf = [0u8; crate::format::FOOTER_SIZE];
+        file.read_exact(&mut footer_buf).unwrap();
+
+        let footer = DriftFooter::read_from_bytes(&footer_buf).unwrap();
+
+        assert_eq!(footer.row_group_count, 2, "Should have 2 RowGroups");
+        assert_eq!(
+            footer.total_vector_count, 75,
+            "Footer should record total vector count"
         );
     }
 }

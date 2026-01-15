@@ -94,7 +94,7 @@ _Goal: Stop "Centroid Proliferation". Assign vectors to fixed buckets._
   - [x] Create `drift_storage/src/bucket_manager.rs`.
   - [x] Implement `search` (Iterate local/S3 readers).
   - [ ] Implement `reconcile` (Sync open files with Manifest).
-- [ ] **3.5. Update VectorIndexV2** (The Migration)
+- [ ] **3.5. Update VectorIndex** (The Migration)
   - [ ] Integrate `WAL` (Safety).
   - [ ] Integrate `Arc<dyn DiskSearcher>` (Disk Search).
   - [ ] Implement Unified Search (RAM + Disk).

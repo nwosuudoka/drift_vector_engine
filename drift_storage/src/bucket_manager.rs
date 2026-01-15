@@ -1,153 +1,234 @@
 use crate::bucket_file_reader::BucketFileReader;
-use drift_traits::{DiskSearcher, PageManager, SearchCandidate, TombstoneView};
+use drift_core::lock_manager::BucketCoordinator;
+use drift_traits::{DiskSearcher, TombstoneView};
 use futures::future::join_all;
+use opendal::Operator;
 use parking_lot::RwLock;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Semaphore; // For concurrency control
+use tokio::sync::Semaphore;
 
-/// Manages the mapping between Logical Buckets and Physical Files.
-/// Orchestrates parallel scans and refinement.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StorageClass {
+    Local,
+    Remote,
+    Tiered {
+        remote_path: String,
+        local_path: String,
+    },
+    Promoting {
+        local_active: String,
+        local_frozen: String,
+        remote_path: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+pub struct BucketVersion {
+    pub bucket_id: u32,
+    pub path: String,
+    pub class: StorageClass,
+}
+
 pub struct BucketManager {
-    storage: Arc<dyn PageManager>,
-
-    // Mapping: BucketID -> FileID (In V2, this comes from the Manifest)
-    // For now, we assume a direct mapping or simple lookup.
-    bucket_map: RwLock<HashMap<u32, u32>>,
-
-    // Concurrency Limiter: Don't open 1000 files at once.
+    local_op: Operator,
+    remote_op: Operator,
+    registry: Arc<RwLock<HashMap<u32, Arc<BucketVersion>>>>,
     scan_semaphore: Arc<Semaphore>,
+    coordinator: Arc<BucketCoordinator>,
 }
 
 impl BucketManager {
-    pub fn new(storage: Arc<dyn PageManager>, max_concurrent_scans: usize) -> Self {
+    pub fn new(
+        local_op: Operator,
+        remote_op: Operator,
+        max_concurrent_scans: usize,
+        coordinator: Arc<BucketCoordinator>,
+    ) -> Self {
         Self {
-            storage,
-            bucket_map: RwLock::new(HashMap::new()),
+            local_op,
+            remote_op,
+            registry: Arc::new(RwLock::new(HashMap::new())),
             scan_semaphore: Arc::new(Semaphore::new(max_concurrent_scans)),
+            coordinator,
         }
     }
 
-    pub fn update_mapping(&self, bucket_id: u32, file_id: u32) {
-        self.bucket_map.write().insert(bucket_id, file_id);
+    pub fn register_bucket(
+        &self,
+        bucket_id: u32,
+        path: String,
+        class: StorageClass,
+    ) -> Option<Arc<BucketVersion>> {
+        let version = Arc::new(BucketVersion {
+            bucket_id,
+            path,
+            class,
+        });
+        self.registry.write().insert(bucket_id, version)
     }
 
-    pub fn get_file_id(&self, bucket_id: u32) -> Option<u32> {
-        self.bucket_map.read().get(&bucket_id).copied()
+    pub fn deregister_bucket(&self, bucket_id: u32) -> Option<Arc<BucketVersion>> {
+        self.registry.write().remove(&bucket_id)
+    }
+
+    pub fn get_version(&self, bucket_id: u32) -> Option<Arc<BucketVersion>> {
+        self.registry.read().get(&bucket_id).cloned()
+    }
+
+    pub fn get_location(&self, bucket_id: u32) -> Option<(String, StorageClass)> {
+        self.get_version(bucket_id)
+            .map(|v| (v.path.clone(), v.class.clone()))
     }
 }
 
-// Wrapper for Heap Sorting (same as in Reader)
-#[derive(PartialEq)]
-struct CandidateWrapper(SearchCandidate);
-impl Eq for CandidateWrapper {}
-impl Ord for CandidateWrapper {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // MaxHeap: Pop largest distance
-        self.0
-            .approx_dist
-            .partial_cmp(&other.0.approx_dist)
-            .unwrap_or(Ordering::Equal)
-    }
-}
-impl PartialOrd for CandidateWrapper {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+// #[derive(PartialEq)]
+// struct CandidateWrapper(SearchCandidate);
+// impl Eq for CandidateWrapper {}
+// impl Ord for CandidateWrapper {
+//     fn cmp(&self, other: &Self) -> Ordering {
+//         self.0
+//             .approx_dist
+//             .partial_cmp(&other.0.approx_dist)
+//             .unwrap_or(Ordering::Equal)
+//     }
+// }
+// impl PartialOrd for CandidateWrapper {
+//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+//         Some(self.cmp(other))
+//     }
+// }
 
 #[async_trait::async_trait]
 impl DiskSearcher for BucketManager {
-    async fn search(
+    async fn search_and_refine(
         &self,
         bucket_ids: &[u32],
         query: &[f32],
         k: usize,
-        tombstones: Arc<dyn TombstoneView>, // ⚡ Now owned Arc
-    ) -> Vec<SearchCandidate> {
+        oversample_factor: usize,
+        tombstones: Arc<dyn TombstoneView>,
+    ) -> Vec<(u64, f32)> {
         let mut handles = Vec::with_capacity(bucket_ids.len());
 
-        // 1. Scatter: Spawn Scan Tasks
         for &bid in bucket_ids {
-            let file_id = match self.get_file_id(bid) {
-                Some(f) => f,
-                None => continue,
-            };
-
-            // Clone dependencies for the 'static task
-            let storage = self.storage.clone();
-            let query = query.to_vec(); // Vector query must be owned by task
+            let local_op = self.local_op.clone();
+            let remote_op = self.remote_op.clone();
             let sem = self.scan_semaphore.clone();
-            let tombstones = tombstones.clone(); // ⚡ Cheap Arc clone
+            let query = query.to_vec();
+            let tombstones = tombstones.clone();
+            let coordinator = self.coordinator.clone();
+            let registry_ref = self.registry.clone();
 
-            // Spawn concurrent task
             handles.push(tokio::spawn(async move {
-                // Rate limit concurrency
                 let _permit = sem.acquire().await.unwrap();
 
-                let mut reader = BucketFileReader::new(storage, file_id);
-                // Reader expects &dyn, so we deref the Arc
-                match reader.scan(&query, k, tombstones.as_ref()).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Error scanning bucket {}: {}", bid, e);
-                        Vec::new()
+                //  CRITICAL: Acquire Lock ONCE
+                // This lock is held for both the Scan AND Refine phases.
+                // The Janitor cannot swap the file underneath us.
+                let _lock_guard = coordinator.read(bid).await;
+
+                // 2. Get Version
+                let version = {
+                    let reg = registry_ref.read();
+                    reg.get(&bid).cloned()
+                };
+
+                let version = match version {
+                    Some(v) => v,
+                    None => return Vec::new(),
+                };
+
+                // 3. Resolve Paths
+                let ops_to_scan = match &version.class {
+                    StorageClass::Local => vec![(local_op, version.path.clone(), "Local")],
+                    StorageClass::Remote => vec![(remote_op, version.path.clone(), "Remote")],
+                    StorageClass::Tiered {
+                        remote_path,
+                        local_path,
+                    } => vec![
+                        (remote_op, remote_path.clone(), "Tiered-Base"),
+                        (local_op, local_path.clone(), "Tiered-Delta"),
+                    ],
+                    StorageClass::Promoting {
+                        local_active,
+                        local_frozen,
+                        remote_path,
+                    } => {
+                        let mut ops = vec![
+                            (local_op.clone(), local_active.clone(), "Promoting-Active"),
+                            (local_op.clone(), local_frozen.clone(), "Promoting-Frozen"),
+                        ];
+                        if let Some(rp) = remote_path {
+                            ops.push((remote_op, rp.clone(), "Promoting-Base"));
+                        }
+                        ops
+                    }
+                };
+
+                let mut refined_results = Vec::new();
+                let scan_k = oversample_factor; // Scan more than we need
+
+                for (op, path, label) in ops_to_scan {
+                    match BucketFileReader::open(op, &path).await {
+                        Ok(mut reader) => {
+                            // A. SCAN (Approximate)
+                            if let Ok(candidates) =
+                                reader.scan(&query, scan_k, tombstones.as_ref()).await
+                            {
+                                // B. REFINE (Exact) - IMMEDIATELY
+                                // Since we still hold _lock_guard and the reader is open on the correct file,
+                                // the offsets in 'candidates' are guaranteed to be valid for this 'reader'.
+                                let dim = reader
+                                    .quantizer
+                                    .as_ref()
+                                    .map(|q| q.min.len())
+                                    .unwrap_or(query.len());
+
+                                match reader.refine(candidates, &query, dim).await {
+                                    Ok(exact_matches) => refined_results.extend(exact_matches),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Refine failed for {} ({}): {}",
+                                            path,
+                                            label,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if !e.to_string().contains("File too small") {
+                                tracing::warn!("⚠️ Open Failed for {} ({}): {}", path, label, e);
+                            }
+                        }
                     }
                 }
+
+                // _lock_guard is dropped HERE.
+                // It is safe for the Janitor to delete the file now, because we have extracted the data.
+                refined_results
             }));
         }
 
-        // 2. Gather: Wait for all tasks
+        // 4. Merge Results
         let results_list = join_all(handles).await;
 
-        // 3. Merge Results (Top-K Reduction)
-        let mut heap: BinaryHeap<CandidateWrapper> = BinaryHeap::with_capacity(k + 1);
-
-        for candidates in results_list.into_iter().flatten() {
-            for c in candidates {
-                if heap.len() < k {
-                    heap.push(CandidateWrapper(c));
-                } else if let Some(worst) = heap.peek() {
-                    if c.approx_dist < worst.0.approx_dist {
-                        heap.pop();
-                        heap.push(CandidateWrapper(c));
-                    }
-                }
-            }
+        let mut all_results = Vec::new();
+        for res in results_list.into_iter().flatten() {
+            all_results.extend(res);
         }
 
-        // 4. Sort
-        let mut results: Vec<SearchCandidate> = heap.into_vec().into_iter().map(|w| w.0).collect();
-        results.sort_by(|a, b| {
-            a.approx_dist
-                .partial_cmp(&b.approx_dist)
-                .unwrap_or(Ordering::Equal)
-        });
+        // 5. Global Sort & Top-K
+        // Sort by distance ascending
+        all_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
 
-        results
-    }
-
-    /// Step 2: Batched Refinement
-    async fn refine(&self, candidates: Vec<SearchCandidate>, query: &[f32]) -> Vec<(u64, f32)> {
-        // Group by FileID
-        let mut file_groups: HashMap<u32, Vec<SearchCandidate>> = HashMap::new();
-        for c in candidates {
-            file_groups.entry(c.file_id).or_default().push(c);
+        if all_results.len() > k {
+            all_results.truncate(k);
         }
 
-        let mut final_results = Vec::new();
-
-        // Process each file
-        for (file_id, group) in file_groups {
-            let reader = BucketFileReader::new(self.storage.clone(), file_id);
-            // We use the same 'refine' logic we put in the Reader
-            match reader.refine(group, query, query.len()).await {
-                Ok(refined) => final_results.extend(refined),
-                Err(e) => eprintln!("Error refining file {}: {}", file_id, e),
-            }
-        }
-
-        final_results
+        all_results
     }
 }

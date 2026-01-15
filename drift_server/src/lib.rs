@@ -43,3 +43,16 @@ mod manifest_tests;
 pub mod drift_proto {
     tonic::include_proto!("drift");
 }
+
+// V2 implementation
+pub mod drift_server;
+pub mod janitor_v2;
+pub mod persistence_v2;
+pub mod reaper;
+pub mod recovery;
+
+#[cfg(test)]
+mod janitor_v2_tests;
+
+#[cfg(test)]
+mod server_integration_tests;

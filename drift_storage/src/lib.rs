@@ -12,6 +12,9 @@ pub mod segment_reader;
 pub mod segment_writer;
 
 #[cfg(test)]
+mod bucket_integration_test;
+
+#[cfg(test)]
 mod bucket_file_tests;
 #[cfg(test)]
 mod bucket_manager_tests;
@@ -25,6 +28,9 @@ mod open_dal_integration;
 mod row_group_tests;
 #[cfg(test)]
 mod segment_test;
+
+#[cfg(test)]
+mod merge_repo_tests;
 
 // SHARED CONSTANTS (Single Source of Truth)
 pub const MAGIC_BYTES: &[u8; 8] = b"DRIFT_V1";

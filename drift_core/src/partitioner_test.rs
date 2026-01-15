@@ -2,7 +2,7 @@
 mod tests {
     use crate::manifest::pb::Centroid;
     use crate::partitioner::IncrementalPartitioner;
-    use crate::router::Router;
+    use crate::router::{Metric, Router};
 
     #[test]
     fn test_partitioning_logic() {
@@ -20,7 +20,7 @@ mod tests {
             },
         ];
         let counts = vec![0, 0]; // Counts don't affect simple routing
-        let router = Router::new(&centroids, &counts, 2, "L2").unwrap();
+        let router = Router::new(&centroids, &counts, 2, Metric::L2).unwrap();
 
         // 2. Create Mixed Batch
         let batch_ids = vec![100, 101, 102];

@@ -18,6 +18,7 @@ impl DiskManager {
     /// Create a manager using an existing Operator.
     /// The 'path' is relative to the Operator's root.
     pub fn new(op: Operator, path: String) -> Self {
+        tracing::debug!("DiskManager: Attached to {}", path);
         Self { op, path }
     }
 

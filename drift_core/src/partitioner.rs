@@ -9,14 +9,16 @@ pub struct PartitionGroup {
     pub ids: Vec<u64>,
     pub flat_vectors: Vec<f32>, // Flattened for efficient writing
     pub count: usize,
+    pub centroid: Option<Vec<f32>>,
 }
 
 impl PartitionGroup {
-    fn new(_dim: usize) -> Self {
+    pub fn new(_dim: usize, centroid: Option<Vec<f32>>) -> Self {
         Self {
             ids: Vec::new(),
             flat_vectors: Vec::new(), // Pre-allocating is hard without guessing count
             count: 0,
+            centroid,
         }
     }
 }
@@ -59,9 +61,10 @@ impl IncrementalPartitioner {
             let bucket_id = router.route(vec);
 
             // 2. Get or Create Group Buffer
-            let group = groups
-                .entry(bucket_id)
-                .or_insert_with(|| PartitionGroup::new(dim));
+            let group = groups.entry(bucket_id).or_insert_with(|| {
+                let centroid = router.get_centroid(bucket_id);
+                PartitionGroup::new(dim, centroid)
+            });
 
             // 3. Append
             group.ids.push(id);

@@ -2,8 +2,10 @@ use std::cmp::Ordering;
 
 use crate::manifest::pb::Centroid;
 
+#[derive(PartialEq, Debug, Clone)]
 pub enum Metric {
     L2,
+    Cosine,
 }
 
 /// The Router determines which Bucket a vector belongs to.
@@ -13,19 +15,31 @@ pub enum Metric {
 #[derive(Debug, Clone)]
 pub struct Router {
     dim: usize,
-    metric: String,
+    metric: Metric,
     // Flat storage for cache locaclity
     // [centroid1_dim1, centroid1_dim2, ..., centroid2_dim1, ...]
     flat_centroids: Vec<f32>,
     bucket_ids: Vec<u32>,
-
     bucket_counts: Vec<u32>,
 }
 
 impl Router {
-    /// Creates a new Router from centroids
-    pub fn new(centroids: &[Centroid], counts: &[u32], dim: usize, metric: &str) -> Option<Self> {
-        if centroids.is_empty() || centroids.len() != counts.len() {
+    /// Creates an empty router (Day 0 state).
+    pub fn empty(dim: usize, metric: Metric) -> Self {
+        Self {
+            dim,
+            metric,
+            flat_centroids: Vec::new(),
+            bucket_ids: Vec::new(),
+            bucket_counts: Vec::new(),
+        }
+    }
+
+    /// Creates a new Router from centroids.
+    /// Now allows empty input for "Day 0" initialization.
+    pub fn new(centroids: &[Centroid], counts: &[u32], dim: usize, metric: Metric) -> Option<Self> {
+        // Allow empty, but still enforce length match if not empty
+        if centroids.len() != counts.len() {
             return None;
         }
 
@@ -35,8 +49,6 @@ impl Router {
 
         for (i, c) in centroids.iter().enumerate() {
             if c.vector.len() != dim {
-                // Skip invalid centroids or panic? For prod, we skip and log, or fail hard.
-                // Failing hard is safer for data integrity.
                 panic!(
                     "Router init: Centroid {} dim mismatch (expected {}, got {})",
                     c.id,
@@ -51,11 +63,24 @@ impl Router {
 
         Some(Self {
             dim,
-            metric: metric.to_string(),
+            metric,
             flat_centroids,
             bucket_ids,
             bucket_counts,
         })
+    }
+
+    /// Retrieves the centroid vector for a specific bucket ID.
+    pub fn get_centroid(&self, bucket_id: u32) -> Option<Vec<f32>> {
+        // Find the index of the bucket_id in our parallel array
+        let idx = self.bucket_ids.iter().position(|&id| id == bucket_id)?;
+
+        // Calculate the slice range in the flat buffer
+        let start = idx * self.dim;
+        let end = start + self.dim;
+
+        // Return a copy of the centroid
+        Some(self.flat_centroids[start..end].to_vec())
     }
 
     /// ⚡ THE ALGORITHM: Drift-Aware Bucket Selection
@@ -129,8 +154,8 @@ impl Router {
         let mut by_dist = scores.clone();
         by_dist.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal));
 
-        for i in 0..3.min(by_dist.len()) {
-            selected_indices.insert(by_dist[i].0);
+        for item in by_dist.iter().take(3) {
+            selected_indices.insert(item.0);
         }
 
         // 5. Map indices to Bucket IDs
@@ -152,7 +177,7 @@ impl Router {
         let mut min_dist = f32::MAX;
         let mut max_sim = f32::MIN;
 
-        let is_l2 = self.metric == "L2";
+        let is_l2 = self.metric == Metric::L2;
         let count = self.bucket_ids.len();
 
         for i in 0..count {

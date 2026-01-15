@@ -3,20 +3,17 @@ use drift_core::quantizer::Quantizer;
 use drift_storage::bucket_file_reader::BucketFileReader;
 use drift_storage::bucket_file_writer::BucketFileWriter;
 use drift_traits::IoContext;
+use opendal::{Operator, services};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
-/// Manages local .drift files on NVMe/Disk.
-/// Handles locking and append operations.
 pub struct LocalStagingManager {
     base_path: PathBuf,
-    // Locks per BucketID to ensure serial appends
-    locks: RwLock<HashMap<u32, Arc<Mutex<()>>>>,
+    // ⚡ Active Generation Map: BucketID -> Filename
+    active_files: RwLock<HashMap<u32, String>>,
 }
 
 impl LocalStagingManager {
@@ -25,107 +22,184 @@ impl LocalStagingManager {
         fs::create_dir_all(&p).context("Failed to create staging dir")?;
         Ok(Self {
             base_path: p,
-            locks: RwLock::new(HashMap::new()),
+            active_files: RwLock::new(HashMap::new()),
         })
     }
 
-    /// Gets or creates a lock for a specific bucket.
-    fn get_lock(&self, bucket_id: u32) -> Arc<Mutex<()>> {
-        // Optimistic read
-        if let Some(lock) = self.locks.read().get(&bucket_id) {
-            return lock.clone();
-        }
-
-        // Write path
-        let mut map = self.locks.write();
-        map.entry(bucket_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    /// Returns the currently active filename for this bucket.
+    pub fn get_active_filename(&self, bucket_id: u32) -> String {
+        self.active_files
+            .read()
+            .get(&bucket_id)
+            .cloned()
+            .unwrap_or_else(|| format!("bucket_{}.drift", bucket_id))
     }
 
-    /// Appends a batch of vectors to the local bucket file.
-    /// If the file doesn't exist, it creates it and trains a new Quantizer.
-    pub async fn append_batch(&self, bucket_id: u32, batch: &PartitionGroup) -> io::Result<()> {
-        let dim = if !batch.flat_vectors.is_empty() {
-            batch.flat_vectors.len() / batch.ids.len()
-        } else {
-            return Ok(()); // Nothing to write
-        };
+    /// ⚡ ATOMIC ROTATION (Caller holds Write Lock via Coordinator)
+    pub async fn rotate_bucket_for_promotion(
+        &self,
+        bucket_id: u32,
+        staging_name: &str,
+        new_active_name: &str,
+    ) -> io::Result<bool> {
+        // No internal lock needed - Janitor holds the BucketCoordinator lock.
 
-        // 1. Acquire Bucket Lock
-        let lock = self.get_lock(bucket_id);
-        let _guard = lock.lock().await;
+        let current_filename = self.get_active_filename(bucket_id);
+        let src = self.base_path.join(&current_filename);
+        let dst = self.base_path.join(staging_name);
 
-        let file_path = self.base_path.join(format!("bucket_{}.drift", bucket_id));
-        let file_exists = file_path.exists();
+        if !src.exists() {
+            return Ok(false);
+        }
 
-        // 2. Open File
+        // 1. Rotate
+        fs::rename(&src, &dst).context("Failed to rotate bucket file")?;
+
+        // 2. Create New Active File (Empty)
+        let new_path = self.base_path.join(new_active_name);
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&new_path)
+            .context("Failed to create new active file")?;
+
+        // 3. Update Pointer
+        self.active_files
+            .write()
+            .insert(bucket_id, new_active_name.to_string());
+
+        Ok(true)
+    }
+
+    /// Sets the active filename manually (used in tests or recovery).
+    pub fn set_active_filename(&self, bucket_id: u32, filename: String) {
+        self.active_files.write().insert(bucket_id, filename);
+    }
+
+    /// Creates an empty file to initialize a new generation.
+    pub async fn create_empty_file(&self, filename: &str) -> io::Result<()> {
+        let path = self.base_path.join(filename);
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        Ok(())
+    }
+
+    pub async fn append_batch(&self, bucket_id: u32, batch: &PartitionGroup) -> io::Result<u64> {
+        if batch.count == 0 {
+            return Ok(0);
+        }
+        let dim = batch.flat_vectors.len() / batch.ids.len();
+
+        // ⚡ No internal lock needed.
+
+        // Resolve Dynamic Filename
+        let filename = self.get_active_filename(bucket_id);
+        let path = self.base_path.join(&filename);
+        let exists = path.exists();
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&file_path)
+            .open(&path)
             .context("Failed to open bucket file")?;
 
-        let file_len = file.metadata()?.len();
+        let initial_len = file.metadata()?.len();
 
-        // 3. Initialize Writer
-        let mut writer = if file_exists && file_len > 0 {
-            let q = BucketFileReader::get_quantizer(&file_path)?;
-            BucketFileWriter::new_append(
-                file, [0u8; 16], // RunID (TODO: Manage RunIDs properly)
-                q, dim, file_len,
-            )?
+        let mut writer = if exists && initial_len > 0 {
+            let op = self.create_local_op()?;
+            let mut reader = BucketFileReader::open(op, &filename).await?;
+            reader.load_quantizer().await?;
+            let q = reader
+                .quantizer
+                .ok_or_else(|| io::Error::other("Quantizer missing"))?;
+            BucketFileWriter::new_append(file, [0u8; 16], q, dim, initial_len)?
         } else {
-            // --- NEW FILE MODE ---
-            // Train Quantizer on this batch
-            // Note: If batch is tiny, this is suboptimal, but acceptable for MVP.
             let q = Quantizer::train(&batch.flat_vectors, dim);
             BucketFileWriter::new_streaming(file, [0u8; 16], q, dim)?
         };
 
-        // 4. Write Data
         writer.write_batch(&batch.ids, &batch.flat_vectors)?;
+        let (_, total_count) = writer.finalize_and_truncate()?;
 
-        // 5. Finalize (Flush + Truncate)
-        // If we are appending, this safely updates the footer.
-        if file_exists {
-            writer.finalize_and_truncate()?;
-        } else {
-            writer.finalize()?;
+        Ok(total_count)
+    }
+
+    pub async fn read_file_content(&self, filename: &str) -> io::Result<(Vec<u64>, Vec<Vec<f32>>)> {
+        let path = self.base_path.join(filename);
+        if !path.exists() {
+            return Ok((vec![], vec![]));
         }
+        let op = self.create_local_op()?;
+        let mut reader = BucketFileReader::open(op, filename).await?;
+        reader.load_quantizer().await?;
+        reader.read_all_vectors().await
+    }
 
+    /// Reads the current active file for the bucket.
+    /// ⚡ This method is lock-free (unsafe if concurrent writes happen, but fine for tests).
+    pub async fn read_full_bucket(&self, bucket_id: u32) -> io::Result<(Vec<u64>, Vec<Vec<f32>>)> {
+        let filename = self.get_active_filename(bucket_id);
+        self.read_file_content(&filename).await
+    }
+
+    pub async fn delete_file(&self, filename: &str) -> io::Result<()> {
+        let path = self.base_path.join(filename);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
         Ok(())
     }
 
-    // /// Helper to extract the immutable Quantizer from a file's header.
-    // fn recover_quantizer(&self, path: &Path) -> io::Result<Quantizer> {
-    //     let mut file = std::fs::File::open(path)?;
-    //     let mut head_buf = [0u8; HEADER_SIZE];
-    //     file.read_exact(&mut head_buf)?;
+    // Deletes the active file (used during total bucket removal)
+    pub async fn delete_bucket(&self, bucket_id: u32) -> io::Result<()> {
+        // No lock.
+        let filename = self.get_active_filename(bucket_id);
+        self.delete_file(&filename).await
+    }
 
-    //     // Offset 48 is quantizer_offset (u64), 56 is length (u32) based on our layout.
-    //     // Let's rely on `DriftHeader` being Pod/ZeroCopy.
-    //     // let header = DriftHeader::ref_from_bytes(&head_buf).map_err(io::Error::other)?;
-    //     let header = DriftHeader::force_copy(&head_buf);
+    pub fn list_large_buckets(&self, threshold: u64) -> io::Result<Vec<u32>> {
+        let mut res = Vec::new();
+        let map = self.active_files.read();
 
-    //     // Validate
-    //     if header.magic != MAGIC_V2 {
-    //         tracing::error!("Invalid magic bytes {} != {}", header.magic, MAGIC_V2);
-    //         panic!("Invalid magic bytes")
-    //     }
+        if map.is_empty() {
+            for entry in fs::read_dir(&self.base_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    if name.starts_with("bucket_") && name.ends_with(".drift") {
+                        let id_part = name
+                            .trim_start_matches("bucket_")
+                            .trim_end_matches(".drift");
+                        if let Ok(id) = id_part.parse::<u32>() {
+                            if entry.metadata()?.len() >= threshold {
+                                res.push(id);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (&id, filename) in map.iter() {
+                let path = self.base_path.join(filename);
+                if let Ok(meta) = fs::metadata(path) {
+                    if meta.len() >= threshold {
+                        res.push(id);
+                    }
+                }
+            }
+        }
+        Ok(res)
+    }
 
-    //     // Read Quantizer Blob
-    //     file.seek(SeekFrom::Start(header.quantizer_offset))?;
-    //     let mut q_buf = vec![0u8; header.quantizer_length as usize];
-    //     file.read_exact(&mut q_buf)?;
-
-    //     let (q, _): (Quantizer, usize) =
-    //         bincode::decode_from_slice(&q_buf, bincode::config::standard())
-    //             .map_err(io::Error::other)
-    //             .context("Failed to decode quantizer")?;
-
-    //     Ok(q)
-    // }
+    fn create_local_op(&self) -> io::Result<Operator> {
+        let root = self.base_path.to_str().unwrap();
+        let builder = services::Fs::default().root(root);
+        Ok(Operator::new(builder)?.finish())
+    }
 }

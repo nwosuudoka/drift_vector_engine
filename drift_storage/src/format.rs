@@ -111,30 +111,29 @@ impl RowGroupHeader {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable, KnownLayout)]
 pub struct DriftFooter {
-    pub row_group_count: u32,     // 0..4
-    pub _pad_1: u32,              // 4..8
+    pub total_vector_count: u64,  // 0..8
     pub index_start_offset: u64,  // 8..16
     pub bloom_filter_offset: u64, // 16..24
     pub bloom_filter_length: u32, // 24..28
-    pub _pad_2: u32,
-    pub padding: [u8; 88], // 40..120 (Reduced from 92 to 80)
-    pub magic: u64,        // 120..128
+    pub row_group_count: u32,     // 28..32
+    pub padding: [u8; 88],        // 32..120 (Reduced from 92 to 80)
+    pub magic: u64,               // 120..128
 }
 
 impl DriftFooter {
     pub fn new(
+        total_vector_count: u64,
         row_group_count: u32,
         index_start_offset: u64,
         bloom_offset: u64,
         bloom_length: u32,
     ) -> Self {
         Self {
+            total_vector_count,
             row_group_count,
-            _pad_1: 0,
             index_start_offset,
             bloom_filter_offset: bloom_offset,
             bloom_filter_length: bloom_length,
-            _pad_2: 0,
             padding: [0u8; 88],
             magic: MAGIC_V2,
         }

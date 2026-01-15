@@ -11,7 +11,7 @@ mod tests {
         // 1. Initial State: Bucket 1 exists
         manager
             .apply_atomic(|m| {
-                m.add_bucket(1, "run_A".into(), vec![0.0; 128]);
+                m.add_bucket(1, "run_A".into(), Some(vec![0.0; 128]));
                 m.update_bucket_stats(1, 100, 0);
             })
             .unwrap();
@@ -21,11 +21,11 @@ mod tests {
         manager
             .apply_atomic(|m| {
                 // Update Bucket 1 (Left Child)
-                m.add_bucket(1, "run_B_Left".into(), vec![-1.0; 128]);
+                m.add_bucket(1, "run_B_Left".into(), Some(vec![-1.0; 128]));
                 m.update_bucket_stats(1, 50, 0);
 
                 // Create Bucket 2 (Right Child)
-                m.add_bucket(2, "run_B_Right".into(), vec![1.0; 128]);
+                m.add_bucket(2, "run_B_Right".into(), Some(vec![1.0; 128]));
                 m.update_bucket_stats(2, 50, 0);
             })
             .unwrap();
