@@ -56,7 +56,7 @@ impl RecoveryManager {
             counts.push(count as u32);
         }
 
-        // ⚡ FIX: Use Router::empty() for Day 0 logic
+        //  Use Router::empty() for Day 0 logic
         let router = if pb_centroids.is_empty() {
             info!("Recovery: No existing state found (Day 0). Bootstrapping empty router.");
             Arc::new(RwLock::new(Router::empty(

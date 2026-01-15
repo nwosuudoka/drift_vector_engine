@@ -168,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir = tempdir()?;
 
-    // ⚡ FIX: Use the new Configuration Strategy Pattern
+    //  Use the new Configuration Strategy Pattern
     let config = Config {
         port: 50052,
         wal_dir: dir.path().join("wal"),
@@ -252,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             k: k as u32,
             target_confidence: 0.95,
 
-            // FIX: Lower Lambda to allow "fuzzier" matching as data drifts away
+            // Lower Lambda to allow "fuzzier" matching as data drifts away
             lambda: 0.1,
 
             tau: 100.0,

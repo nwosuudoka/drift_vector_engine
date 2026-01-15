@@ -329,7 +329,7 @@ impl PersistenceManager {
             partitions.len()
         );
 
-        // ⚡ FIX: We introduce this block to restrict the lifetime of the locks.
+        //  We introduce this block to restrict the lifetime of the locks.
         // The locks (frozen_guard, data_guard) will be dropped at the closing brace '};'
         let prepared_buckets: Vec<(u32, Vec<u8>, Vec<u8>, Vec<u64>)> = {
             // 1. Acquire Locks

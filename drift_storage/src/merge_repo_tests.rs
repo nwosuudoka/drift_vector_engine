@@ -70,7 +70,6 @@ mod mix_node_test {
     use drift_core::quantizer::Quantizer;
     use opendal::{Operator, services};
     use std::fs::{File, OpenOptions};
-    use std::io::{Seek, SeekFrom};
     use tempfile::tempdir;
 
     // --- Helpers ---
@@ -101,7 +100,7 @@ mod mix_node_test {
         let dim = 8;
 
         // Shared Quantizer (Must be consistent across appends)
-        let (train_ids, train_vecs) = mock_vectors(0, 100, dim, 0.0);
+        let (_train_ids, train_vecs) = mock_vectors(0, 100, dim, 0.0);
         let train_flat: Vec<f32> = train_vecs.into_iter().flatten().collect();
         let quantizer = Quantizer::train(&train_flat, dim);
 

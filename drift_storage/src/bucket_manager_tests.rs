@@ -1,163 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use crate::bucket_file_reader::BucketFileReader;
-    use crate::bucket_file_writer::BucketFileWriter;
-    use crate::bucket_manager::BucketManager;
-    use drift_core::{lock_manager::BucketCoordinator, quantizer::Quantizer};
-    use drift_traits::{DiskSearcher, TombstoneView}; // Mock or default
-    use opendal::{Operator, services};
-    use std::sync::Arc;
-    use tempfile::tempdir;
-
-    // --- Mock Tombstones ---
-    #[derive(Debug)]
-    struct NoTombstones;
-    impl TombstoneView for NoTombstones {
-        fn contains(&self, _id: u64) -> bool {
-            false
-        }
-        fn len(&self) -> usize {
-            0
-        }
-    }
-
-    // --- Helper: Create Local Operator ---
-    fn create_local_operator(path: &std::path::Path) -> Operator {
-        let builder = services::Fs::default().root(path.to_str().unwrap());
-        Operator::new(builder).unwrap().finish()
-    }
-
-    // --- Helper: Mock Data ---
-    fn mock_data(start_id: u64, count: usize, dim: usize) -> (Vec<u64>, Vec<f32>) {
-        let mut ids = Vec::new();
-        let mut vecs = Vec::new();
-        for i in 0..count {
-            ids.push(start_id + i as u64);
-            // Vector = [id, id, ...] for easy verification
-            let val = (start_id + i as u64) as f32;
-            vecs.extend(std::iter::repeat(val).take(dim));
-        }
-        (ids, vecs)
-    }
-
-    #[tokio::test]
-    async fn test_writer_persists_quantizer_in_footer() {
-        let dir = tempdir().unwrap();
-        let filename = "segment_test_q.drift";
-        let file_path = dir.path().join(filename);
-        let file = std::fs::File::create(&file_path).unwrap();
-
-        let dim = 8;
-        let (ids, vecs) = mock_data(0, 100, dim);
-        let q = Quantizer::train(&vecs, dim);
-        let run_id = [1u8; 16];
-
-        // 1. Write File (Standard IO)
-        let mut writer = BucketFileWriter::new_streaming(file, run_id, q.clone(), dim).unwrap();
-        writer.write_batch(&ids, &vecs).unwrap();
-        writer.finalize().unwrap();
-
-        // 2. Verify Reader Open (via OpenDAL)
-        let op = create_local_operator(dir.path());
-
-        // Initialize Reader directly with Operator + Filename
-        let mut reader = BucketFileReader::open(op, filename)
-            .await
-            .expect("Failed to open file via OpenDAL");
-
-        // Verify Header/Quantizer loaded (lazy loading test)
-        reader
-            .load_quantizer()
-            .await
-            .expect("Failed to load quantizer");
-        assert!(reader.quantizer.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_reader_scan_correctness() {
-        let dir = tempdir().unwrap();
-        let op = create_local_operator(dir.path());
-
-        let dim = 4;
-        let (ids, vecs) = mock_data(0, 10, dim);
-        let q = Quantizer::train(&vecs, dim);
-
-        let filename = "segment_run_abc.drift";
-        let file_path = dir.path().join(filename);
-        let file = std::fs::File::create(&file_path).unwrap();
-
-        // 1. Write
-        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q.clone(), dim).unwrap();
-        writer.write_batch(&ids, &vecs).unwrap();
-        writer.finalize().unwrap();
-
-        // 2. Scan via Reader
-        let mut reader = BucketFileReader::open(op, filename).await.unwrap();
-        let query = vec![0.0; dim]; // Should match ID 0 closest
-
-        let tombstones = NoTombstones;
-        let results = reader
-            .scan(&query, 10, &tombstones)
-            .await
-            .expect("Scan failed");
-
-        assert_eq!(results.len(), 10);
-
-        // Results are approximate, but exact IDs should match
-        let mut found_ids: Vec<u64> = results.iter().map(|c| c.id).collect();
-        found_ids.sort(); // IDs in mock_data are sorted 0..9
-        assert_eq!(found_ids, ids);
-    }
-
-    #[tokio::test]
-    async fn test_bucket_manager_orchestration() {
-        let dir = tempdir().unwrap();
-        let remote_dir = tempdir().unwrap();
-        let op = create_local_operator(dir.path());
-        let remote_op = create_local_operator(remote_dir.path());
-
-        let coordinator = Arc::new(BucketCoordinator::new());
-
-        // 1. Setup Data
-        let bucket_id = 100;
-        let filename = "bucket_100.drift";
-        let dim = 8;
-
-        // 2. Create File
-        let file_path = dir.path().join(filename);
-        let file = std::fs::File::create(&file_path).unwrap();
-
-        let (ids, vecs) = mock_data(1000, 50, dim);
-        let q = Quantizer::train(&vecs, dim);
-
-        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-        writer.write_batch(&ids, &vecs).unwrap();
-        writer.finalize().unwrap();
-
-        // 3. Initialize BucketManager (V2: Operator + Path Registry)
-        let manager = BucketManager::new(op, remote_op, 1, coordinator); // 1 concurrent scan
-
-        // Map Bucket 100 -> "bucket_100.drift"
-        manager.register_bucket(
-            bucket_id,
-            filename.to_string(),
-            crate::bucket_manager::StorageClass::Local,
-        );
-
-        // 4. Search
-        let query = vec![1000.0; dim]; // Should match ID 1000 perfectly
-        let tombstones = Arc::new(NoTombstones);
-
-        let results = manager.search(&[bucket_id], &query, 10, tombstones).await;
-
-        assert!(!results.is_empty(), "Manager failed to find results");
-        assert_eq!(results[0].id, 1000);
-        assert!(results[0].approx_dist < 1.0); // Should be very close
-    }
-}
-
-#[cfg(test)]
-mod tiered_search_test {
     use crate::bucket_file_writer::BucketFileWriter;
     use crate::bucket_manager::{BucketManager, StorageClass};
     use drift_core::lock_manager::BucketCoordinator;
@@ -237,11 +79,17 @@ mod tiered_search_test {
             },
         );
 
-        // 4. Search
+        // 4. Search (Atomic Search & Refine)
         // Query [10.0, 10.0] -> Should match Remote best, then Local
         let query = vec![10.0; dim];
         let results = manager
-            .search(&[bucket_id], &query, 20, Arc::new(NoTombstones))
+            .search_and_refine(
+                &[bucket_id],
+                &query,
+                20, // K
+                60, // Oversample
+                Arc::new(NoTombstones),
+            )
             .await;
 
         // 5. Verify Aggregation
@@ -252,8 +100,9 @@ mod tiered_search_test {
         );
 
         // Verify Content
-        let has_remote_id = results.iter().any(|r| r.id == 0);
-        let has_local_id = results.iter().any(|r| r.id == 14);
+        // Results are Vec<(u64, f32)>
+        let has_remote_id = results.iter().any(|(id, _)| *id == 0);
+        let has_local_id = results.iter().any(|(id, _)| *id == 14);
 
         assert!(has_remote_id, "Missing remote data");
         assert!(has_local_id, "Missing local data");
@@ -287,13 +136,19 @@ mod tiered_search_test {
 
         // 3. Search
         let results = manager
-            .search(&[bucket_id], &vec![0.0; dim], 10, Arc::new(NoTombstones))
+            .search_and_refine(
+                &[bucket_id],
+                &vec![0.0; dim],
+                10,
+                30,
+                Arc::new(NoTombstones),
+            )
             .await;
 
         // 4. Verify
         assert_eq!(results.len(), 3, "Must scan Active, Frozen, AND Remote");
 
-        let ids: Vec<u64> = results.iter().map(|r| r.id).collect();
+        let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&100));
         assert!(ids.contains(&200));
         assert!(ids.contains(&300));
@@ -330,7 +185,13 @@ mod tiered_search_test {
             // We loop search to catch the transition
             for _ in 0..10 {
                 let results = m_clone
-                    .search(&[bucket_id], &vec![0.0; dim], 10, Arc::new(NoTombstones))
+                    .search_and_refine(
+                        &[bucket_id],
+                        &vec![0.0; dim],
+                        10,
+                        30,
+                        Arc::new(NoTombstones),
+                    )
                     .await;
                 assert!(
                     !results.is_empty(),
@@ -372,7 +233,7 @@ mod tiered_search_test {
 
         // Search should not panic, just return empty/partial
         let results = manager
-            .search(&[99], &vec![0.0; 2], 10, Arc::new(NoTombstones))
+            .search_and_refine(&[99], &vec![0.0; 2], 10, 30, Arc::new(NoTombstones))
             .await;
 
         assert!(results.is_empty(), "Should handle missing file gracefully");

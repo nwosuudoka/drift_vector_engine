@@ -331,7 +331,7 @@ impl<W: Write> Write for StreamWriter<W> {
     }
 }
 
-// ⚡ FIX: Implement Truncatable for StreamWriter so we can sync underlying files
+//  Implement Truncatable for StreamWriter so we can sync underlying files
 impl<W: Write + Truncatable> Truncatable for StreamWriter<W> {
     fn set_len(&mut self, size: u64) -> io::Result<()> {
         self.0.set_len(size)

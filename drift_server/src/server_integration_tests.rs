@@ -80,7 +80,7 @@ mod tests {
         let coordinator = Arc::new(BucketCoordinator::new());
 
         // C. Recover
-        // ⚡ FIX: Pass both operators (Local/Remote) to BucketManager
+        //  Pass both operators (Local/Remote) to BucketManager
         let bucket_manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator.clone());
         let recovery = RecoveryManager::new(dir.path(), manifest.clone());
 
@@ -102,7 +102,7 @@ mod tests {
         // We drop the router lock before await to be safe
         drop(router);
 
-        // ⚡ FIX: Use search_and_refine (Atomic API)
+        //  Use search_and_refine (Atomic API)
         let results = bucket_manager
             .search_and_refine(
                 &[bucket_id],
@@ -159,7 +159,7 @@ mod tests {
             .unwrap();
 
         // 4. Recover
-        // ⚡ FIX: Pass dual operators
+        //  Pass dual operators
         let coordinator = Arc::new(BucketCoordinator::new());
         let bucket_manager = BucketManager::new(op.clone(), op.clone(), 1, coordinator.clone());
         let recovery = RecoveryManager::new(dir.path(), manifest.clone());
@@ -172,7 +172,7 @@ mod tests {
 
         let query = vec![200.0; dim];
 
-        // ⚡ FIX: Use search_and_refine
+        //  Use search_and_refine
         let results = bucket_manager
             .search_and_refine(
                 &[bucket_id],
@@ -198,7 +198,7 @@ mod tests {
         let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
         let op = create_fs_operator(dir.path());
 
-        // ⚡ FIX: Use Dual Operator constructor (Mocking same op for both)
+        //  Use Dual Operator constructor (Mocking same op for both)
         let coordinator = Arc::new(BucketCoordinator::new());
         let bucket_manager = BucketManager::new(op.clone(), op.clone(), 1, coordinator.clone());
 
@@ -253,13 +253,11 @@ mod wal_tests_tests {
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        // 1. Setup Index with Small Capacity (5) to force rotation
         let dim = 2;
-        let cap = 5;
+        let cap = 5; // Capacity 5
 
         let op = create_fs_operator(&data_dir);
         let coordinator = Arc::new(BucketCoordinator::new());
-
         let storage = Arc::new(BucketManager::new(
             op.clone(),
             op.clone(),
@@ -267,9 +265,7 @@ mod wal_tests_tests {
             coordinator.clone(),
         ));
 
-        // ⚡ Use WalManager
         let wal_mgr = Arc::new(Mutex::new(WalManager::new(&wal_dir).unwrap()));
-
         let centroids = vec![drift_core::manifest::pb::Centroid {
             id: 0,
             vector: vec![0.0; dim],
@@ -286,45 +282,46 @@ mod wal_tests_tests {
             storage.clone(),
         ));
 
-        // 2. Insert Batch 1 (Fill Active) -> WAL 1
+        // 2. Insert Batch 1 (5 Items)
+        // ⚡ insert() triggers rotate_active() immediately when len >= cap.
+        // So after the 5th insert, rotation happens.
         for i in 0..5 {
             index.insert(i, vec![0.0; dim]).unwrap();
         }
 
-        // *State check:* Active Full. WAL_1 should exist.
-        // We can't easily check internal ID without exposing it, but we check files.
+        // *State check:*
+        // 1 WAL file (Closed/Frozen) containing the 5 items.
+        // 1 WAL file (Active) that is empty.
         let files_1 = std::fs::read_dir(&wal_dir).unwrap().count();
-        assert_eq!(files_1, 1, "Should have 1 WAL file initially");
+        assert_eq!(
+            files_1, 2,
+            "Should have rotated: 1 frozen WAL + 1 active WAL"
+        );
 
-        // 3. Force Rotation (Insert 6th item) -> Triggers Rotation -> WAL 2
+        // 3. Force Rotation (Insert 6th item)
+        // This goes into the NEW active table/WAL.
+        // It does not trigger another rotation until that table hits 5 items.
         index.insert(5, vec![0.0; dim]).unwrap();
 
-        // *State check:* WAL_1 Closed (Frozen). WAL_2 Active.
         let files_2 = std::fs::read_dir(&wal_dir).unwrap().count();
-        assert_eq!(files_2, 2, "Should have 2 WAL files (1 Frozen, 1 Active)");
+        assert_eq!(files_2, 2, "Still 2 files (Frozen + Active)");
 
         // 4. Flush Frozen
-        // This mimics Janitor. It flushes Frozen (WAL 1 data).
+        // This takes the Old WAL (ID 1) and flushes it.
         let (_parts, wal_ids) = index.flush_frozen().expect("Should have frozen data");
-
-        // We expect exactly 1 WAL ID to be flushed (the old one)
         assert_eq!(wal_ids.len(), 1);
 
         // 5. Confirm Flush (Deletes WAL 1)
         index.acknowledge_flush(&wal_ids).unwrap();
 
         // 6. Verify Files on Disk
-        // We expect only 1 file remaining (WAL 2), and it should NOT be the one we flushed.
         let files_after = std::fs::read_dir(&wal_dir).unwrap();
         let filenames: Vec<String> = files_after
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
 
+        // We expect only the ACTIVE WAL (ID 2 or greater) to remain.
         assert_eq!(filenames.len(), 1, "Old WAL should be deleted");
-
-        // Check that the remaining file is NOT the flushed ID (simplified check)
-        // Ideally we check ID, but filename check is good proxy.
-        // The new file ID should be > flushed ID.
         println!("Remaining WAL: {}", filenames[0]);
     }
 }

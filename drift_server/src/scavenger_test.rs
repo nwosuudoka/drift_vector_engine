@@ -92,7 +92,7 @@ mod tests {
             index.insert(i, &vec![1.0, 1.0]).unwrap();
         }
 
-        // ⚡ FIX: Capture the specific Bucket ID containing our data
+        //  Capture the specific Bucket ID containing our data
         let target_bucket = flush_to_bucket(&index).await;
 
         // 2. Delete 20 items (40%)
@@ -153,7 +153,7 @@ mod tests {
             index.insert(i, &vec![0.5, 0.5]).unwrap();
         }
 
-        // ⚡ FIX: Capture ID
+        //  Capture ID
         let old_bucket_id = flush_to_bucket(&index).await;
 
         // Verify KV points to this bucket
@@ -197,7 +197,7 @@ mod tests {
             index.insert(i, &vec![0.0, 0.0]).unwrap();
         }
 
-        // ⚡ FIX: Capture ID
+        //  Capture ID
         let target_bucket_id = flush_to_bucket(&index).await;
 
         // 2. Delete only 1 item (10% - below 20% threshold)

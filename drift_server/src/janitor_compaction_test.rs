@@ -71,7 +71,7 @@ mod tests {
             num_centroids: 1,
             training_sample_size: 10,
 
-            // ⚡ FIX: Set capacity to 1 so our small test buckets are considered "100% Full".
+            //  Set capacity to 1 so our small test buckets are considered "100% Full".
             // This prevents the Janitor from seeing them as "Urgent" and merging them away.
             max_bucket_capacity: 1,
 

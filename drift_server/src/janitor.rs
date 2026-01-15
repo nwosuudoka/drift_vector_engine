@@ -247,7 +247,7 @@ impl Janitor {
 
         info!("Janitor: Flush Step 3 - Partitioning (CPU Offload)");
 
-        // ⚡ FIX: Offload synchronous CPU-heavy work to blocking thread.
+        //  Offload synchronous CPU-heavy work to blocking thread.
         // This avoids holding !Send locks across await points in the main task.
         let index_clone = self.index.clone();
         let memtable_clone = memtable_arc.clone();

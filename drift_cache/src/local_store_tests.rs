@@ -88,7 +88,7 @@ mod tests {
         let manager = LocalDiskManager::new(dir.path());
 
         // A. Read Unknown File
-        // ⚡ FIX: We now expect NotFound, because we stopped auto-creating empty files on read.
+        // We now expect NotFound, because we stopped auto-creating empty files on read.
         let bad_page = PageId {
             file_id: 999,
             offset: 0,
@@ -117,7 +117,7 @@ mod tests {
         manager.write_page(33, 0, b"Magic").await.unwrap();
 
         // 2. Verify file exists on disk
-        // ⚡ FIX: Check for .bin (matches LocalDiskManager impl)
+        // Check for .bin (matches LocalDiskManager impl)
         let expected_path = dir.path().join("33.bin");
         assert!(expected_path.exists(), "File 33.bin was not auto-created");
 

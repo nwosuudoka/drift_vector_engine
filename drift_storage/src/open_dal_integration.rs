@@ -56,7 +56,7 @@ mod tests {
         let manager = DiskManager::new(op.clone(), filename.to_string());
         let mut writer = SegmentWriter::new(manager, vec![0x01, 0x02]).await.unwrap();
 
-        // ⚡ FIX: Use write_partition with BucketData
+        //  Use write_partition with BucketData
         let bucket = wrap_in_bucket(&ids, &codes);
         writer
             .write_partition(1, &bucket, &vecs, dim)
@@ -122,7 +122,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            // ⚡ FIX: Wrap all in BucketData and use write_partition
+            //  Wrap all in BucketData and use write_partition
             let b1 = wrap_in_bucket(&b1_ids, &b1_codes);
             writer
                 .write_partition(b1_id, &b1, &b1_vecs, dim)

@@ -485,7 +485,7 @@ mod tests {
         // 5. Verify Partitioning
         assert_eq!(partitions.len(), 2, "Should partition into 2 buckets");
 
-        // Fix: Access partitions using .get() or by iterating since it's a HashMap now
+        // Access partitions using .get() or by iterating since it's a HashMap now
         // Assuming partitions is a HashMap<u32, PartitionGroup>
         // We know bucket IDs from Router (C1 is 0, C2 is 1)
 

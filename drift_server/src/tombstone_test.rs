@@ -56,7 +56,7 @@ mod tests {
             .await
             .unwrap();
 
-        // ⚡ FIX: We assert that ID 1 is missing. We do NOT check is_empty() because ID 0 exists.
+        //  We assert that ID 1 is missing. We do NOT check is_empty() because ID 0 exists.
         assert!(
             !res.iter().any(|r| r.id == 1),
             "ID 1 should be deleted in RAM check"

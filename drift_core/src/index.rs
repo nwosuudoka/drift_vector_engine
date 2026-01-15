@@ -251,7 +251,7 @@ impl VectorIndex {
 
         let dim = self.config.dim;
 
-        // ⚡ FIX: Scope the locks!
+        //  Scope the locks!
         // We acquire locks, copy the sample, and release them immediately inside this block.
         let sample_data = {
             let (_ids_guard, data_guard, _tomb_guard) = memtable.get_data_guards();

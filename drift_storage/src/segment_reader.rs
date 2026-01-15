@@ -24,7 +24,7 @@ impl SegmentReader {
         // 1. Check Size
         let file_len = manager.len().await?;
 
-        // ⚡ FIX: Explicit check preventing underflow in subtraction
+        //  Explicit check preventing underflow in subtraction
         if file_len < FOOTER_SIZE as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "File too small"));
         }

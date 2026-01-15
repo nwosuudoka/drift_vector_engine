@@ -102,7 +102,7 @@ mod tests {
             "Manifest should reflect ONLY flushed frozen items"
         );
 
-        // ⚡ FIX: Expect None, because Janitor should have cleared it!
+        //  Expect None, because Janitor should have cleared it!
         assert!(
             index.flush_frozen().is_none(),
             "Frozen slot should be cleared after flush"

@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let storage_root = dir.path().join("storage");
     let wal_path = dir.path().join("wal");
 
-    // ⚡ FIX: Use StorageCommand strategy
+    //  Use StorageCommand strategy
     let config = drift_server::config::Config {
         port: 50053,
         wal_dir: wal_path.clone(),
