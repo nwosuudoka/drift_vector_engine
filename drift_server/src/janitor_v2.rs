@@ -15,7 +15,7 @@ pub struct JanitorConfig {
     pub index: Arc<VectorIndex>,
     pub manifest: Arc<ServerManifestManager>,
     pub staging: Arc<LocalStagingManager>,
-    pub persistence: PersistenceManager,
+    pub persistence: Arc<PersistenceManager>,
     pub bucket_manager: Arc<BucketManager>,
     pub check_interval: Duration,
     pub promotion_threshold_bytes: u64,
@@ -26,7 +26,7 @@ pub struct Janitor {
     index: Arc<VectorIndex>,
     manifest: Arc<ServerManifestManager>,
     staging: Arc<LocalStagingManager>,
-    persistence: PersistenceManager,
+    persistence: Arc<PersistenceManager>,
     bucket_manager: Arc<BucketManager>,
     check_interval: Duration,
     promotion_threshold_bytes: u64,
@@ -78,43 +78,64 @@ impl Janitor {
     }
 
     async fn perform_flush(&self) -> io::Result<()> {
-        // 1. Flush Frozen Logic
-        // Returns (partitions, wal_ids)
+        // 1. Data Flush Logic (Unchanged from previous plan)
         let (partitions, wal_ids) = match self.index.flush_frozen() {
-            Some((p, w)) if !p.is_empty() => (p, w),
-            _ => return Ok(()),
+            Some((p, w)) => (p, w),
+            // Important: Even if no data to flush, we should occasionally flush tombstones?
+            // For simplicity, we couple them. If no data flush, no tombstone flush yet.
+            None => return Ok(()),
         };
 
-        info!(
-            "Janitor: Flushing {} buckets (WALs: {:?})",
-            partitions.len(),
-            wal_ids
-        );
-
         let mut updates = Vec::new();
-
-        // 2. Write to Local Staging
         for (bucket_id, group) in &partitions {
             let new_count = self.staging.append_batch(*bucket_id, group).await?;
             updates.push((*bucket_id, new_count, group.centroid.clone()));
-
-            // ⚡ CRITICAL FIX: SMART REGISTRY UPDATE ⚡
-            // Do NOT blindly overwrite with StorageClass::Local.
-            // Only register if it's a NEW bucket.
-            // Existing buckets (Local or Tiered) keep their state because the filename implies the active local file.
-
-            let current_version = self.bucket_manager.get_version(*bucket_id);
-            if current_version.is_none() {
-                // New Bucket: Register as Local
+            if self.bucket_manager.get_version(*bucket_id).is_none() {
                 let filename = self.staging.get_active_filename(*bucket_id);
-                self.bucket_manager
-                    .register_bucket(*bucket_id, filename, StorageClass::Local);
+                self.bucket_manager.register_bucket(
+                    *bucket_id,
+                    filename,
+                    drift_storage::bucket_manager::StorageClass::Local,
+                );
             }
-            // Else: It exists. We just appended to the file it already points to.
-            // If it was Tiered, it stays Tiered. If Local, stays Local.
         }
 
-        // 3. Update Manifest
+        // 2. TOMBSTONE PERSISTENCE (Merged L0 + L1)
+        let mut all_tombstones = Vec::new();
+
+        // A. Collect L0 (MemTable Deletes)
+        {
+            // Lock, Clone Arc (cheap), iterate
+            let l0_arc = self.index.get_tombstones();
+            all_tombstones.extend(l0_arc.iter());
+        }
+
+        // B. Collect L1 (Bucket Deletes)
+        let l1_deletes = self.bucket_manager.collect_all_tombstones();
+        all_tombstones.extend(l1_deletes);
+
+        let mut tombstone_file_opt = None;
+
+        if !all_tombstones.is_empty() {
+            // Deduplicate
+            all_tombstones.sort_unstable();
+            all_tombstones.dedup();
+
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let ts_file = self
+                .persistence
+                .flush_tombstones(&all_tombstones, &run_id)
+                .await?;
+
+            info!(
+                "Janitor: Persisted {} cumulative tombstones to {}",
+                all_tombstones.len(),
+                &ts_file
+            );
+            tombstone_file_opt = Some(ts_file);
+        }
+
+        // 3. Update Manifest (Atomic)
         self.manifest.apply_atomic(|m| {
             for (id, count, centroid_opt) in updates {
                 let exists = m.get_buckets().iter().any(|b| b.id == id);
@@ -123,9 +144,14 @@ impl Janitor {
                 }
                 m.update_bucket_stats(id, count, 0);
             }
+
+            // ⚡ Update Pointer to NEW cumulative file
+            if let Some(tf) = tombstone_file_opt {
+                m.inner.tombstone_files = vec![tf];
+            }
         })?;
 
-        // 4. Acknowledge Flush
+        // 4. Acknowledge
         self.index.acknowledge_flush(&wal_ids)?;
 
         Ok(())
@@ -185,11 +211,8 @@ impl Janitor {
 
             // We do NOT need to send the old version to Reaper here because we hold the lock!
             // No one else can be reading the old version.
-            let _old_version = self.bucket_manager.register_bucket(
-                bucket_id,
-                new_filename.clone(),
-                promoting_class,
-            );
+            self.bucket_manager
+                .register_bucket(bucket_id, new_filename.clone(), promoting_class);
 
             // 4. UPLOAD (Slow IO - blocking search on this bucket)
             let (ids, vecs) = self.staging.read_file_content(&staging_filename).await?;

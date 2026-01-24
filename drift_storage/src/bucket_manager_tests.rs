@@ -4,24 +4,12 @@ mod tests {
     use crate::bucket_manager::{BucketManager, StorageClass};
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::quantizer::Quantizer;
-    use drift_traits::{DiskSearcher, TombstoneView};
+    use drift_traits::StorageEngine;
     use opendal::{Operator, services};
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::tempdir;
-    use tokio::time::{Duration, sleep};
-
-    // --- Mocks & Helpers ---
-
-    #[derive(Debug)]
-    struct NoTombstones;
-    impl TombstoneView for NoTombstones {
-        fn contains(&self, _id: u64) -> bool {
-            false
-        }
-        fn len(&self) -> usize {
-            0
-        }
-    }
+    use tokio::time::sleep;
 
     fn create_local_operator(path: &std::path::Path) -> Operator {
         let builder = services::Fs::default().root(path.to_str().unwrap());
@@ -32,21 +20,17 @@ mod tests {
     async fn create_bucket_file(
         dir: &std::path::Path,
         filename: &str,
-        start_id: u64,
-        count: usize,
+        ids: &[u64],
+        vecs: &[Vec<f32>],
         dim: usize,
-        val: f32,
     ) {
         let path = dir.join(filename);
         let file = std::fs::File::create(&path).unwrap();
 
-        let ids: Vec<u64> = (0..count as u64).map(|i| start_id + i).collect();
-        let vecs: Vec<Vec<f32>> = (0..count).map(|_| vec![val; dim]).collect();
-        let flat_vecs: Vec<f32> = vecs.into_iter().flatten().collect();
-
-        let q = Quantizer::train(&flat_vecs, dim);
+        let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
+        let q = Quantizer::train(&flat, dim);
         let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-        writer.write_batch(&ids, &flat_vecs).unwrap();
+        writer.write_batch(ids, &flat).unwrap();
         writer.finalize().unwrap();
     }
 
@@ -63,20 +47,35 @@ mod tests {
 
         // 1. Create Remote Base File (IDs 0-9, Value 10.0)
         let remote_file = "remote_base.drift";
-        create_bucket_file(dir.path(), remote_file, 0, 10, dim, 10.0).await;
+        create_bucket_file(
+            dir.path(),
+            remote_file,
+            &(0..10).collect::<Vec<_>>(),
+            &vec![vec![10.0; dim]; 10],
+            dim,
+        )
+        .await;
 
         // 2. Create Local Delta File (IDs 10-14, Value 20.0)
         let local_file = "local_delta.drift";
-        create_bucket_file(dir.path(), local_file, 10, 5, dim, 20.0).await;
+        create_bucket_file(
+            dir.path(),
+            local_file,
+            &(10..15).collect::<Vec<_>>(),
+            &vec![vec![20.0; dim]; 5],
+            dim,
+        )
+        .await;
 
         // 3. Register as Tiered
-        manager.register_bucket(
+        manager.register_bucket_with_count(
             bucket_id,
             "ignored_primary_path".to_string(), // Tiered ignores the main path
             StorageClass::Tiered {
                 remote_path: remote_file.to_string(),
                 local_path: local_file.to_string(),
             },
+            15,
         );
 
         // 4. Search (Atomic Search & Refine)
@@ -88,7 +87,6 @@ mod tests {
                 &query,
                 20, // K
                 60, // Oversample
-                Arc::new(NoTombstones),
             )
             .await;
 
@@ -119,12 +117,12 @@ mod tests {
         let bucket_id = 2;
 
         // 1. Setup 3 Files simulating the Promotion transition
-        create_bucket_file(dir.path(), "active.drift", 100, 1, dim, 1.0).await; // ID 100
-        create_bucket_file(dir.path(), "frozen.drift", 200, 1, dim, 2.0).await; // ID 200
-        create_bucket_file(dir.path(), "remote.drift", 300, 1, dim, 3.0).await; // ID 300
+        create_bucket_file(dir.path(), "active.drift", &[100], &[vec![1.0; dim]], dim).await; // ID 100
+        create_bucket_file(dir.path(), "frozen.drift", &[200], &[vec![2.0; dim]], dim).await; // ID 200
+        create_bucket_file(dir.path(), "remote.drift", &[300], &[vec![3.0; dim]], dim).await; // ID 300
 
         // 2. Register Promoting State
-        manager.register_bucket(
+        manager.register_bucket_with_count(
             bucket_id,
             "active.drift".to_string(),
             StorageClass::Promoting {
@@ -132,17 +130,12 @@ mod tests {
                 local_frozen: "frozen.drift".to_string(),
                 remote_path: Some("remote.drift".to_string()),
             },
+            3,
         );
 
         // 3. Search
         let results = manager
-            .search_and_refine(
-                &[bucket_id],
-                &vec![0.0; dim],
-                10,
-                30,
-                Arc::new(NoTombstones),
-            )
+            .search_and_refine(&[bucket_id], &vec![0.0; dim], 10, 30)
             .await;
 
         // 4. Verify
@@ -171,13 +164,28 @@ mod tests {
         let dim = 2;
 
         // Initial State: Just Local
-        create_bucket_file(dir.path(), "initial.drift", 0, 100, dim, 0.0).await;
+        create_bucket_file(
+            dir.path(),
+            "initial.drift",
+            &(0..100).collect::<Vec<_>>(),
+            &vec![vec![0.0; dim]; 100],
+            dim,
+        )
+        .await;
         manager.register_bucket(bucket_id, "initial.drift".to_string(), StorageClass::Local);
 
         // Next State: Remote (Simulating completion of promotion)
-        create_bucket_file(dir.path(), "final.drift", 0, 100, dim, 0.0).await;
+        create_bucket_file(
+            dir.path(),
+            "final.drift",
+            &(0..100).collect::<Vec<_>>(),
+            &vec![vec![0.0; dim]; 100],
+            dim,
+        )
+        .await;
 
         let m_clone = manager.clone();
+        let m_clone_2 = manager.clone();
         let c_clone = coordinator.clone();
 
         // Task A: Searcher (Simulate a long running search)
@@ -185,13 +193,7 @@ mod tests {
             // We loop search to catch the transition
             for _ in 0..10 {
                 let results = m_clone
-                    .search_and_refine(
-                        &[bucket_id],
-                        &vec![0.0; dim],
-                        10,
-                        30,
-                        Arc::new(NoTombstones),
-                    )
+                    .search_and_refine(&[bucket_id], &vec![0.0; dim], 10, 30)
                     .await;
                 assert!(
                     !results.is_empty(),
@@ -209,7 +211,7 @@ mod tests {
             let _guard = c_clone.write(bucket_id).await;
 
             // Update Registry
-            manager.register_bucket(bucket_id, "final.drift".to_string(), StorageClass::Remote);
+            m_clone_2.register_bucket(bucket_id, "final.drift".to_string(), StorageClass::Remote);
 
             // Verify lock works: Search shouldn't run here
             sleep(Duration::from_millis(20)).await;
@@ -233,9 +235,80 @@ mod tests {
 
         // Search should not panic, just return empty/partial
         let results = manager
-            .search_and_refine(&[99], &vec![0.0; 2], 10, 30, Arc::new(NoTombstones))
+            .search_and_refine(&[99], &vec![0.0; 2], 10, 30)
             .await;
 
         assert!(results.is_empty(), "Should handle missing file gracefully");
+    }
+
+    // --- TEST: Local Tombstone Filtering ---
+    #[tokio::test]
+    async fn test_bucket_manager_local_delete() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let dim = 2;
+        let bucket_id = 1;
+
+        // 1. Setup Data: IDs 10, 20, 30
+        let ids = vec![10, 20, 30];
+        let vecs = vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]];
+        create_bucket_file(dir.path(), "b1.drift", &ids, &vecs, dim).await;
+
+        manager.register_bucket_with_count(
+            bucket_id,
+            "b1.drift".to_string(),
+            StorageClass::Local,
+            3,
+        );
+
+        // 2. Verify Initial Search (All present)
+        let query = vec![1.0, 1.0];
+        let res_1 = manager
+            .search_and_refine(&[bucket_id], &query, 10, 10)
+            .await;
+        assert_eq!(res_1.len(), 3);
+
+        // 3. Mark Delete (ID 20)
+        manager.mark_delete(bucket_id, 20).unwrap();
+
+        // 4. Verify Search Filters ID 20
+        let res_2 = manager
+            .search_and_refine(&[bucket_id], &query, 10, 10)
+            .await;
+        assert_eq!(res_2.len(), 2);
+        assert!(res_2.iter().any(|(id, _)| *id == 10));
+        assert!(!res_2.iter().any(|(id, _)| *id == 20)); // Gone
+        assert!(res_2.iter().any(|(id, _)| *id == 30));
+
+        // 5. Verify Stats Update
+        let stats = manager.get_bucket_stats(bucket_id).unwrap();
+        assert_eq!(stats.tombstone_count, 1);
+        assert_eq!(stats.total_count, 3);
+    }
+
+    // --- TEST: Shadowing via Explicit Delete (V2 Style) ---
+    #[tokio::test]
+    async fn test_bucket_manager_shadowing_view() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+
+        // 1. Setup Data (ID 100 exists on disk)
+        create_bucket_file(dir.path(), "b1.drift", &[100], &[vec![0.0, 0.0]], 2).await;
+        manager.register_bucket(1, "b1.drift".to_string(), StorageClass::Local);
+
+        // 2. SHADOW ACTION
+        // In V2, "Shadowing" means marking the disk version as deleted because a newer one exists in RAM.
+        manager.mark_delete(1, 100).expect("Failed to mark delete");
+
+        // 3. Search
+        // Note: No "GlobalView" passed here anymore. The Manager checks its own internal state.
+        let res = manager.search_and_refine(&[1], &[0.0, 0.0], 10, 10).await;
+
+        // 4. Verify ID 100 is filtered
+        assert!(res.is_empty(), "Shadowing failed to hide ID 100");
     }
 }

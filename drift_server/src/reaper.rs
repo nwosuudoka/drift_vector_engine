@@ -8,11 +8,11 @@ use tracing::{info, warn};
 pub struct Reaper {
     queue: VecDeque<Arc<BucketVersion>>,
     staging: Arc<LocalStagingManager>,
-    persistence: PersistenceManager, // ⚡ Add field
+    persistence: Arc<PersistenceManager>, // ⚡ Add field
 }
 
 impl Reaper {
-    pub fn new(staging: Arc<LocalStagingManager>, persistence: PersistenceManager) -> Self {
+    pub fn new(staging: Arc<LocalStagingManager>, persistence: Arc<PersistenceManager>) -> Self {
         Self {
             queue: VecDeque::new(),
             staging,

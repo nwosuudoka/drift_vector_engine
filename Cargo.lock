@@ -1287,6 +1287,7 @@ dependencies = [
 name = "drift_server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
@@ -1297,6 +1298,7 @@ dependencies = [
  "crossbeam-epoch",
  "drift_cache",
  "drift_core",
+ "drift_kv",
  "drift_storage",
  "drift_traits",
  "opendal",
@@ -1328,6 +1330,7 @@ name = "drift_storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "atomic_float",
  "bincode 2.0.1",
  "bit-set",
  "byteorder",

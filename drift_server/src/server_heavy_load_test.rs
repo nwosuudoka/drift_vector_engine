@@ -31,6 +31,7 @@ mod tests {
         let config = Config {
             port: 50051,
             wal_dir: dir.path().join("wal"),
+            data_dir: dir.path().join("data"),
 
             // New Storage Strategy
             storage: StorageCommand::File(FileConfig {
@@ -203,6 +204,7 @@ mod pretrained_tests {
         let config = Config {
             port: 50051,
             wal_dir: dir.path().join("wal"),
+            data_dir: dir.path().join("data"),
 
             // New Storage Strategy
             storage: StorageCommand::File(FileConfig {

@@ -60,3 +60,18 @@ pub fn calculate_drift(data: &[f32], target_centroid: &[f32], dim: usize) -> f32
     let current_mean = calculate_mean(data, dim);
     l2_sq(&current_mean, target_centroid).sqrt()
 }
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum Metric {
+    L2,
+    COSINE,
+}
+
+impl std::fmt::Display for Metric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Metric::COSINE => write!(f, "COSINE"),
+            Metric::L2 => write!(f, "L2"),
+        }
+    }
+}

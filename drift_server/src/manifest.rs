@@ -1,4 +1,5 @@
 use drift_core::manifest::ManifestWrapper;
+use drift_core::math::Metric;
 use drift_traits::IoContext;
 use parking_lot::RwLock;
 use std::fs;
@@ -21,20 +22,27 @@ impl ServerManifestManager {
         fs::create_dir_all(&base).context("Failed to create manifest dir")?;
         let path = base.join("manifest.pb");
 
-        let wrapper = if path.exists() {
+        if path.exists() {
             let bytes = fs::read(&path).context("Failed to read manifest file")?;
-            ManifestWrapper::from_bytes(&bytes)
-                .map_err(|e| io::Error::other(format!("Protobuf decode error: {}", e)))?
+            let wrapper = ManifestWrapper::from_bytes(&bytes)
+                .map_err(|e| io::Error::other(format!("Protobuf decode error: {}", e)))?;
+            Ok(Self {
+                base_path: base,
+                manifest_path: path,
+                state: RwLock::new(wrapper),
+            })
         } else {
-            // Initialize new manifest
-            ManifestWrapper::new(dim, "L2")
-        };
+            let wrapper = ManifestWrapper::new(dim, Metric::L2);
+            let manager = Self {
+                base_path: base,
+                manifest_path: path,
+                state: RwLock::new(wrapper),
+            };
 
-        Ok(Self {
-            base_path: base,
-            manifest_path: path,
-            state: RwLock::new(wrapper),
-        })
+            // Force write to disk so RecoveryManager finds it later
+            manager.save_atomic(&manager.state.read())?;
+            Ok(manager)
+        }
     }
 
     /// Returns a clone of the inner wrapper (cheap if using Arc internally,

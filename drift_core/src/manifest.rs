@@ -6,6 +6,7 @@ pub mod pb {
     include!(concat!(env!("OUT_DIR"), "/manifest.rs"));
 }
 
+use crate::math::Metric;
 use pb::{Bucket, Centroid, Manifest};
 
 #[derive(Debug, Clone)]
@@ -14,7 +15,7 @@ pub struct ManifestWrapper {
 }
 
 impl ManifestWrapper {
-    pub fn new(dim: u32, metric: &str) -> Self {
+    pub fn new(dim: u32, metric: Metric) -> Self {
         Self {
             inner: Manifest {
                 version: 1,

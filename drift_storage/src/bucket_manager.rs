@@ -1,12 +1,16 @@
 use crate::bucket_file_reader::BucketFileReader;
+use async_trait::async_trait;
+use atomic_float::AtomicF32;
 use drift_core::lock_manager::BucketCoordinator;
-use drift_traits::{DiskSearcher, TombstoneView};
+use drift_traits::{BucketStats, DataProvider, StorageEngine, TombstoneView};
 use futures::future::join_all;
 use opendal::Operator;
 use parking_lot::RwLock;
-use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::cmp;
+use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::Semaphore;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,10 +35,57 @@ pub struct BucketVersion {
     pub class: StorageClass,
 }
 
+#[derive(Debug)]
+struct LiveBucketState {
+    version: Arc<BucketVersion>,
+    total_count: AtomicU32,
+    tombstone_count: AtomicU32,
+    temperature: AtomicF32,
+    tombstones: RwLock<Arc<HashSet<u64>>>,
+}
+
+impl LiveBucketState {
+    fn new(version: Arc<BucketVersion>, count: u32) -> Self {
+        Self {
+            version,
+            total_count: AtomicU32::new(count),
+            tombstone_count: AtomicU32::new(0),
+            temperature: AtomicF32::new(0.5),
+            tombstones: RwLock::new(Arc::new(HashSet::new())),
+        }
+    }
+
+    fn touch(&self) {
+        const ALPHA: f32 = 0.05;
+        let _ = self
+            .temperature
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                if current >= 1.0 {
+                    None
+                } else {
+                    Some(current + ALPHA * (1.0 - current))
+                }
+            });
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalTombstoneView {
+    inner: Arc<HashSet<u64>>,
+}
+impl TombstoneView for LocalTombstoneView {
+    fn contains(&self, id: u64) -> bool {
+        self.inner.contains(&id)
+    }
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
 pub struct BucketManager {
     local_op: Operator,
     remote_op: Operator,
-    registry: Arc<RwLock<HashMap<u32, Arc<BucketVersion>>>>,
+    registry: Arc<RwLock<HashMap<u32, Arc<LiveBucketState>>>>,
     scan_semaphore: Arc<Semaphore>,
     coordinator: Arc<BucketCoordinator>,
 }
@@ -55,26 +106,40 @@ impl BucketManager {
         }
     }
 
-    pub fn register_bucket(
+    pub fn collect_all_tombstones(&self) -> Vec<u64> {
+        let reg = self.registry.read();
+        let mut all_deletes = Vec::new();
+        for state in reg.values() {
+            all_deletes.extend(state.tombstones.read().iter());
+        }
+        all_deletes
+    }
+
+    pub fn register_bucket(&self, bucket_id: u32, path: String, class: StorageClass) {
+        self.register_bucket_with_count(bucket_id, path, class, 0);
+    }
+
+    pub fn register_bucket_with_count(
         &self,
         bucket_id: u32,
         path: String,
         class: StorageClass,
-    ) -> Option<Arc<BucketVersion>> {
+        count: u32,
+    ) {
         let version = Arc::new(BucketVersion {
             bucket_id,
             path,
             class,
         });
-        self.registry.write().insert(bucket_id, version)
-    }
-
-    pub fn deregister_bucket(&self, bucket_id: u32) -> Option<Arc<BucketVersion>> {
-        self.registry.write().remove(&bucket_id)
+        let state = Arc::new(LiveBucketState::new(version, count));
+        self.registry.write().insert(bucket_id, state);
     }
 
     pub fn get_version(&self, bucket_id: u32) -> Option<Arc<BucketVersion>> {
-        self.registry.read().get(&bucket_id).cloned()
+        self.registry
+            .read()
+            .get(&bucket_id)
+            .map(|s| s.version.clone())
     }
 
     pub fn get_location(&self, bucket_id: u32) -> Option<(String, StorageClass)> {
@@ -83,32 +148,62 @@ impl BucketManager {
     }
 }
 
-// #[derive(PartialEq)]
-// struct CandidateWrapper(SearchCandidate);
-// impl Eq for CandidateWrapper {}
-// impl Ord for CandidateWrapper {
-//     fn cmp(&self, other: &Self) -> Ordering {
-//         self.0
-//             .approx_dist
-//             .partial_cmp(&other.0.approx_dist)
-//             .unwrap_or(Ordering::Equal)
-//     }
-// }
-// impl PartialOrd for CandidateWrapper {
-//     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-//         Some(self.cmp(other))
-//     }
-// }
-
 #[async_trait::async_trait]
-impl DiskSearcher for BucketManager {
+impl StorageEngine for BucketManager {
+    fn mark_delete(&self, bucket_id: u32, vector_id: u64) -> io::Result<()> {
+        let reg = self.registry.read();
+        if let Some(state) = reg.get(&bucket_id) {
+            // let mut set = state.tombstones.write();
+            // if set.insert(vector_id) {
+            //     state.tombstone_count.fetch_add(1, Ordering::Relaxed);
+            // }
+            let mut guard = state.tombstones.write();
+            if guard.contains(&vector_id) {
+                return Ok(());
+            }
+
+            // let mut new_set =
+            let mut new_set = (**guard).clone();
+            new_set.insert(vector_id);
+            *guard = Arc::new(new_set);
+
+            state.tombstone_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn get_bucket_stats(&self, bucket_id: u32) -> Option<BucketStats> {
+        let reg = self.registry.read();
+        let state = reg.get(&bucket_id)?;
+        Some(BucketStats {
+            tombstone_count: state.tombstone_count.load(Ordering::Relaxed),
+            total_count: state.total_count.load(Ordering::Relaxed),
+            temperature: state.temperature.load(Ordering::Relaxed),
+            active: true,
+        })
+    }
+
+    fn register_bucket(&self, bucket_id: u32, path: String, count: u32) {
+        self.register_bucket_with_count(bucket_id, path, StorageClass::Local, count);
+    }
+
+    fn tick_cooling(&self, decay_rate: f32) {
+        let reg = self.registry.read();
+        for state in reg.values() {
+            let _ = state
+                .temperature
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                    Some(t * decay_rate)
+                });
+        }
+    }
+
     async fn search_and_refine(
         &self,
         bucket_ids: &[u32],
         query: &[f32],
         k: usize,
         oversample_factor: usize,
-        tombstones: Arc<dyn TombstoneView>,
     ) -> Vec<(u64, f32)> {
         let mut handles = Vec::with_capacity(bucket_ids.len());
 
@@ -117,30 +212,32 @@ impl DiskSearcher for BucketManager {
             let remote_op = self.remote_op.clone();
             let sem = self.scan_semaphore.clone();
             let query = query.to_vec();
-            let tombstones = tombstones.clone();
+
+            let registry = self.registry.clone(); // ⚡ Clone Arc to pass into task
             let coordinator = self.coordinator.clone();
-            let registry_ref = self.registry.clone();
 
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
 
-                //  CRITICAL: Acquire Lock ONCE
-                // This lock is held for both the Scan AND Refine phases.
-                // The Janitor cannot swap the file underneath us.
+                // 1. Acquire Lock (Prevents Janitor from modifying/deleting this bucket)
                 let _lock_guard = coordinator.read(bid).await;
 
-                // 2. Get Version
-                let version = {
-                    let reg = registry_ref.read();
-                    reg.get(&bid).cloned()
+                // 2. ⚡ Fetch State INSIDE the lock (Guaranteed consistent)
+                let (version, local_tombstones) = {
+                    let reg = registry.read();
+                    match reg.get(&bid) {
+                        Some(state) => {
+                            state.touch();
+                            (state.version.clone(), state.tombstones.read().clone())
+                        }
+                        None => return Vec::new(), // Bucket deleted while we waited
+                    }
                 };
 
-                let version = match version {
-                    Some(v) => v,
-                    None => return Vec::new(),
-                };
+                let bucket_view = Arc::new(LocalTombstoneView {
+                    inner: local_tombstones,
+                });
 
-                // 3. Resolve Paths
                 let ops_to_scan = match &version.class {
                     StorageClass::Local => vec![(local_op, version.path.clone(), "Local")],
                     StorageClass::Remote => vec![(remote_op, version.path.clone(), "Remote")],
@@ -168,67 +265,90 @@ impl DiskSearcher for BucketManager {
                 };
 
                 let mut refined_results = Vec::new();
-                let scan_k = oversample_factor; // Scan more than we need
-
                 for (op, path, label) in ops_to_scan {
                     match BucketFileReader::open(op, &path).await {
                         Ok(mut reader) => {
-                            // A. SCAN (Approximate)
-                            if let Ok(candidates) =
-                                reader.scan(&query, scan_k, tombstones.as_ref()).await
+                            if let Ok(candidates) = reader
+                                .scan(&query, oversample_factor, bucket_view.as_ref())
+                                .await
                             {
-                                // B. REFINE (Exact) - IMMEDIATELY
-                                // Since we still hold _lock_guard and the reader is open on the correct file,
-                                // the offsets in 'candidates' are guaranteed to be valid for this 'reader'.
                                 let dim = reader
                                     .quantizer
                                     .as_ref()
                                     .map(|q| q.min.len())
                                     .unwrap_or(query.len());
-
-                                match reader.refine(candidates, &query, dim).await {
-                                    Ok(exact_matches) => refined_results.extend(exact_matches),
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "Refine failed for {} ({}): {}",
-                                            path,
-                                            label,
-                                            e
-                                        );
-                                    }
+                                if let Ok(matches) = reader.refine(candidates, &query, dim).await {
+                                    refined_results.extend(matches);
                                 }
                             }
                         }
                         Err(e) => {
+                            // If file missing inside lock, it's a real error (unless empty bucket edge case)
                             if !e.to_string().contains("File too small") {
-                                tracing::warn!("⚠️ Open Failed for {} ({}): {}", path, label, e);
+                                tracing::warn!(
+                                    "⚠️ BucketManager: Failed to open {} ({}): {}",
+                                    path,
+                                    label,
+                                    e
+                                );
                             }
                         }
                     }
                 }
-
-                // _lock_guard is dropped HERE.
-                // It is safe for the Janitor to delete the file now, because we have extracted the data.
                 refined_results
             }));
         }
 
-        // 4. Merge Results
         let results_list = join_all(handles).await;
-
         let mut all_results = Vec::new();
         for res in results_list.into_iter().flatten() {
             all_results.extend(res);
         }
-
-        // 5. Global Sort & Top-K
-        // Sort by distance ascending
-        all_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
+        all_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal));
         if all_results.len() > k {
             all_results.truncate(k);
         }
-
         all_results
+    }
+}
+
+#[async_trait]
+impl DataProvider for BucketManager {
+    async fn fetch_bucket(&self, bucket_id: u32) -> io::Result<(Vec<u64>, Vec<f32>)> {
+        // 1. Get Location
+        let version = self
+            .get_version(bucket_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Bucket not found"))?;
+
+        let ops_to_try = match &version.class {
+            StorageClass::Local => vec![(self.local_op.clone(), version.path.clone())],
+            StorageClass::Remote => vec![(self.remote_op.clone(), version.path.clone())],
+            // For Tiered, we ideally need the merged view.
+            // MVP: Just fetch Remote (Base) + Local (Delta) and merge in memory.
+            // For now, let's implement the simple case (Remote or Local).
+            StorageClass::Tiered { remote_path, .. } => {
+                vec![(self.remote_op.clone(), remote_path.clone())]
+            }
+            StorageClass::Promoting { local_active, .. } => {
+                vec![(self.local_op.clone(), local_active.clone())]
+            }
+        };
+
+        for (op, path) in ops_to_try {
+            if let Ok(mut reader) = BucketFileReader::open(op, &path).await {
+                // We need a method on Reader to get EVERYTHING (IDs + Floats)
+                // BucketFileReader already has read_all_vectors() -> (Vec<u64>, Vec<Vec<f32>>)
+                // We need flattened floats.
+                if let Ok((ids, vecs)) = reader.read_all_vectors().await {
+                    let flat: Vec<f32> = vecs.into_iter().flatten().collect();
+                    return Ok((ids, flat));
+                }
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Failed to read bucket data",
+        ))
     }
 }

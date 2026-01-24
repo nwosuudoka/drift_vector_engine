@@ -94,7 +94,7 @@ impl LocalStagingManager {
         }
         let dim = batch.flat_vectors.len() / batch.ids.len();
 
-        // ⚡ No internal lock needed.
+        // No internal lock needed.
 
         // Resolve Dynamic Filename
         let filename = self.get_active_filename(bucket_id);

@@ -91,6 +91,7 @@ mod s3_tests {
         let drift_config = Config {
             port: 50099,
             wal_dir: dir.path().join("wal"),
+            data_dir: dir.path().join("data"),
             storage: StorageCommand::S3(S3Config {
                 bucket: "drift-test".to_string(),
                 region: "us-east-1".to_string(),

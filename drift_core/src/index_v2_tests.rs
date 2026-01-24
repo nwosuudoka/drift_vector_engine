@@ -2,13 +2,18 @@
 mod tests {
     use crate::index_v2::VectorIndex;
     use crate::manifest::pb::Centroid;
-    use crate::router::Metric;
+    use crate::math::Metric;
     use crate::router::Router;
+    use crate::wal_v2::WalEntry;
     use crate::wal_v2::WalManager;
+    use crate::wal_v2::WalReader;
     use async_trait::async_trait;
-    use drift_traits::{DiskSearcher, TombstoneView}; // Removed SearchCandidate
+    use drift_kv::bitstore::BitStore;
+    use drift_traits::BucketStats;
+    use drift_traits::StorageEngine; // Removed SearchCandidate
     use parking_lot::{Mutex, RwLock};
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -64,21 +69,18 @@ mod tests {
         );
     }
 
-    // --- MOCK DISK SEARCHER ---
-    // Simulates the Storage Layer returning results from S3/Disk
+    // --- Mock Engine ---
     #[derive(Debug)]
-    struct MockDisk {
-        // Map BucketID -> List of (VectorID, Distance)
+    struct MockEngine {
         data: RwLock<HashMap<u32, Vec<(u64, f32)>>>,
     }
 
-    impl MockDisk {
+    impl MockEngine {
         fn new() -> Self {
             Self {
                 data: RwLock::new(HashMap::new()),
             }
         }
-
         fn insert(&self, bucket_id: u32, id: u64, distance: f32) {
             self.data
                 .write()
@@ -89,37 +91,46 @@ mod tests {
     }
 
     #[async_trait]
-    impl DiskSearcher for MockDisk {
-        // ⚡ Updated to implement search_and_refine
+    impl StorageEngine for MockEngine {
         async fn search_and_refine(
             &self,
             bucket_ids: &[u32],
             _query: &[f32],
             _k: usize,
             _oversample: usize,
-            tv: Arc<dyn TombstoneView>,
         ) -> Vec<(u64, f32)> {
             let data = self.data.read();
             let mut results = Vec::new();
             for bid in bucket_ids {
                 if let Some(items) = data.get(bid) {
                     for (id, dist) in items {
-                        if !tv.contains(*id) {
-                            // Mock: return ID and approx_dist as exact_dist
-                            results.push((*id, *dist));
-                        }
+                        results.push((*id, *dist));
                     }
                 }
             }
             results
         }
+
+        fn mark_delete(&self, _bucket_id: u32, _vector_id: u64) -> std::io::Result<()> {
+            // Mock delete logic if needed
+            Ok(())
+        }
+
+        fn get_bucket_stats(&self, _bucket_id: u32) -> Option<BucketStats> {
+            None
+        }
+
+        fn register_bucket(&self, _bucket_id: u32, _path: String, _count: u32) {}
+        fn tick_cooling(&self, _decay_rate: f32) {}
     }
 
     // --- SETUP HELPER ---
-    fn create_index(dir: &tempfile::TempDir, cap: usize) -> (Arc<VectorIndex>, Arc<MockDisk>) {
+    fn create_index(dir: &tempfile::TempDir, cap: usize) -> (Arc<VectorIndex>, Arc<MockEngine>) {
         let dim = 2;
         let wal_dir = dir.path().join("wal_dir");
+        let kv_dir = dir.path().join("kv_dir"); // ⚡ KV Dir
         std::fs::create_dir_all(&wal_dir).unwrap();
+        std::fs::create_dir_all(&kv_dir).unwrap();
 
         let centroids = vec![
             Centroid {
@@ -137,10 +148,12 @@ mod tests {
             Router::new(&centroids, &counts, dim, Metric::L2).unwrap(),
         ));
         let wal = Arc::new(Mutex::new(WalManager::new(&wal_dir).unwrap()));
-        let disk = Arc::new(MockDisk::new());
 
-        let index = Arc::new(VectorIndex::new(dim, cap, router, wal, disk.clone()));
-        (index, disk)
+        let storage = Arc::new(MockEngine::new());
+        let kv = Arc::new(BitStore::new(&kv_dir).unwrap()); // ⚡ Init KV
+
+        let index = Arc::new(VectorIndex::new(dim, cap, router, wal, storage.clone(), kv));
+        (index, storage)
     }
 
     // --- TEST 1: WAL INTEGRATION ---
@@ -150,7 +163,7 @@ mod tests {
         let (index, _) = create_index(&dir, 100);
 
         // Insert Item
-        index.insert(1, vec![1.0, 1.0]).unwrap();
+        index.insert(1, &[1.0, 1.0]).unwrap();
 
         // Verify WAL file grew
         let wal_path = dir.path().join("wal_dir");
@@ -175,9 +188,9 @@ mod tests {
 
         // B. Setup Frozen Data (ID 200) -> Bucket 0
         // Insert enough to rotate
-        index.insert(200, vec![-10.0, -10.0]).unwrap(); // Exact match centroid
-        index.insert(999, vec![10.0, 10.0]).unwrap(); // Noise (Bucket 1)
-        index.insert(300, vec![-10.1, -10.1]).unwrap(); // Triggers Rotation. 300 is Active.
+        index.insert(200, &[-10.0, -10.0]).unwrap(); // Exact match centroid
+        index.insert(999, &[10.0, 10.0]).unwrap(); // Noise (Bucket 1)
+        index.insert(300, &[-10.1, -10.1]).unwrap(); // Triggers Rotation. 300 is Active.
 
         // Now:
         // Disk:   [100]
@@ -223,13 +236,13 @@ mod tests {
         let (index, disk) = create_index(&dir, 2);
 
         // 1. Insert & Rotate
-        index.insert(1, vec![1.0, 1.0]).unwrap();
+        index.insert(1, &[1.0, 1.0]).unwrap();
         // Rotation happens here (Capacity hit)
-        let rotate = index.insert(2, vec![2.0, 2.0]).unwrap();
+        let rotate = index.insert(2, &[2.0, 2.0]).unwrap();
         assert!(rotate, "Should have triggered rotation");
 
         // Active table
-        index.insert(3, vec![3.0, 3.0]).unwrap();
+        index.insert(3, &[3.0, 3.0]).unwrap();
 
         // 2. Setup Mock Disk Data (ID 999)
         disk.insert(0, 999, 0.1);
@@ -262,7 +275,7 @@ mod tests {
         disk.insert(0, 100, 0.1);
 
         // MemTable has ID 200
-        index.insert(200, vec![-10.0, -10.0]).unwrap();
+        index.insert(200, &[-10.0, -10.0]).unwrap();
 
         // 2. Verify both exist
         let results = index
@@ -300,7 +313,7 @@ mod tests {
         let (index, _disk) = create_index(&dir, 10);
 
         // 1. Insert & Delete
-        index.insert(100, vec![1.0, 1.0]).unwrap();
+        index.insert(100, &[1.0, 1.0]).unwrap();
         index.delete(100).unwrap();
 
         // Verify it's gone
@@ -308,7 +321,7 @@ mod tests {
         assert!(res.is_empty(), "Should be deleted");
 
         // 2. Resurrection (Re-insert)
-        index.insert(100, vec![1.0, 1.0]).unwrap();
+        index.insert(100, &[1.0, 1.0]).unwrap();
 
         // 3. Verify it's back
         let res_back = index.search(&[1.0, 1.0], 5, 0.0, 1.0, 100.0).await.unwrap();
@@ -340,37 +353,32 @@ mod tests {
         // The search should use the OLD view (Snapshot Isolation).
 
         let dir = tempdir().unwrap();
-        let (index, _disk) = create_index(&dir, 10);
+        // Use the standard helper (assumes it returns index + storage)
+        let (index, _storage) = create_index(&dir, 10);
 
         // Data Setup
-        index.insert(1, vec![1.0, 1.0]).unwrap();
-        index.insert(2, vec![1.0, 1.0]).unwrap();
+        index.insert(1, &[1.0, 1.0]).unwrap();
+        index.insert(2, &[1.0, 1.0]).unwrap();
 
         // 1. Manually grab a view (Simulate start of search query)
-        // We need to access the internal tracker to do this test properly,
-        // or just rely on the public API behavior.
-        // Let's use the public API but simulate the timing.
-
-        // Since we can't pause the 'search' function in a unit test easily without mocks,
-        // we test the Tracker behavior directly here as a proxy.
-        let tracker = &index.tombstones;
-
-        let view_before_delete = tracker.get_view();
+        // NEW API: We clone the Arc directly. This is our "View".
+        let view_before_delete = index.get_tombstones();
 
         // 2. Perform Delete
+        // This triggers COW: it creates a NEW HashSet and swaps the Arc in the index.
         index.delete(1).unwrap();
 
-        // 3. Check View (Should still see 1 as ALIVE if it was empty before)
-        // Wait, 'view_before_delete' was created when 1 was NOT deleted.
-        // So view.contains(1) should be FALSE.
+        // 3. Check View (Should be Snapshot Isolated)
+        // The 'view_before_delete' Arc points to the OLD HashSet.
         assert!(
-            !view_before_delete.contains(1),
-            "Old snapshot should not know about new delete"
+            !view_before_delete.contains(&1),
+            "Old snapshot should NOT see the new delete"
         );
 
         // 4. New View
-        let view_after = tracker.get_view();
-        assert!(view_after.contains(1), "New snapshot MUST see the delete");
+        // We grab the Arc again. This points to the NEW HashSet.
+        let view_after = index.get_tombstones();
+        assert!(view_after.contains(&1), "New snapshot MUST see the delete");
     }
 
     #[tokio::test]
@@ -393,7 +401,7 @@ mod tests {
         index.delete(10).unwrap();
 
         // 3. Re-insert ID 10 (Better distance 0.1)
-        index.insert(10, vec![-10.0, -10.0]).unwrap(); // Matches query perfectly
+        index.insert(10, &[-10.0, -10.0]).unwrap(); // Matches query perfectly
 
         let res = index
             .search(&[-10.0, -10.0], 5, 0.0, 1.0, 100.0)
@@ -413,7 +421,7 @@ mod tests {
 
         // 1. SETUP L0 (RAM)
         // Insert ID 100: Exactly at [-10, -10] (Dist 0.0)
-        index.insert(100, vec![-10.0, -10.0]).unwrap();
+        index.insert(100, &[-10.0, -10.0]).unwrap();
 
         // 2. SETUP L1 (MOCK DISK)
         // Insert ID 200: Slightly offset [-10.1, -10.0] (Dist ~0.01)
@@ -469,14 +477,14 @@ mod tests {
         let (index, _) = create_index(&dir, 2);
 
         // 1. Fill Active Table
-        index.insert(1, vec![-9.0, -9.0]).unwrap(); // Bucket 0
+        index.insert(1, &[-9.0, -9.0]).unwrap(); // Bucket 0
 
         // 2. Trigger Rotation
-        let rotated = index.insert(2, vec![9.0, 9.0]).unwrap(); // Bucket 1
+        let rotated = index.insert(2, &[9.0, 9.0]).unwrap(); // Bucket 1
         assert!(rotated, "Should have triggered rotation at capacity limit");
 
         // 3. New Active Table
-        let rotated_again = index.insert(3, vec![-8.0, -8.0]).unwrap(); // Bucket 0
+        let rotated_again = index.insert(3, &[-8.0, -8.0]).unwrap(); // Bucket 0
         assert!(!rotated_again, "New table should not rotate yet");
 
         // 4. Flush Frozen (Peek)
@@ -508,5 +516,150 @@ mod tests {
         // Actually flush_frozen() snapshots. The previous call returned Some.
         // Calling it again immediately should still return Some unless we acknowledged the specific WAL IDs.
         // The mock flush_frozen implementation in the test might differ from reality if we don't have WAL IDs.
+    }
+
+    // --- Mock Storage Engine ---
+    #[derive(Debug)]
+    struct MockStorage {
+        // Map BucketID -> Set of Deleted IDs
+        deletes: RwLock<HashMap<u32, HashSet<u64>>>,
+    }
+
+    impl MockStorage {
+        fn new() -> Self {
+            Self {
+                deletes: RwLock::new(HashMap::new()),
+            }
+        }
+        fn is_deleted(&self, bucket_id: u32, id: u64) -> bool {
+            self.deletes
+                .read()
+                .get(&bucket_id)
+                .map(|s| s.contains(&id))
+                .unwrap_or(false)
+        }
+    }
+
+    #[async_trait]
+    impl StorageEngine for MockStorage {
+        fn mark_delete(&self, bucket_id: u32, vector_id: u64) -> std::io::Result<()> {
+            self.deletes
+                .write()
+                .entry(bucket_id)
+                .or_default()
+                .insert(vector_id);
+            Ok(())
+        }
+        // ... (Stub other methods) ...
+        async fn search_and_refine(
+            &self,
+            _b: &[u32],
+            _q: &[f32],
+            _k: usize,
+            _o: usize,
+        ) -> Vec<(u64, f32)> {
+            vec![]
+        }
+        fn get_bucket_stats(&self, _b: u32) -> Option<BucketStats> {
+            None
+        }
+        fn register_bucket(&self, _b: u32, _p: String, _c: u32) {}
+        fn tick_cooling(&self, _d: f32) {}
+    }
+
+    fn create_index_with_components(
+        _dir: &tempfile::TempDir,
+        wal: Arc<Mutex<WalManager>>,
+        storage: Arc<dyn StorageEngine>,
+        kv: Arc<BitStore>,
+    ) -> (Arc<VectorIndex>, Arc<dyn StorageEngine>) {
+        let dim = 2;
+        let cap = 100; // Default test capacity
+
+        // Create a simple router
+        let centroids = vec![Centroid {
+            id: 0,
+            vector: vec![0.0, 0.0],
+        }];
+        let counts = vec![0];
+        let router = Arc::new(RwLock::new(
+            Router::new(&centroids, &counts, dim, Metric::L2).unwrap(),
+        ));
+
+        let index = Arc::new(VectorIndex::new(dim, cap, router, wal, storage.clone(), kv));
+
+        (index, storage)
+    }
+
+    #[tokio::test]
+    async fn test_delete_writes_wal_before_storage() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir(&wal_dir).unwrap();
+
+        // 1. Setup
+        let wal = Arc::new(Mutex::new(WalManager::new(&wal_dir).unwrap()));
+        let storage = Arc::new(MockStorage::new());
+        let kv = Arc::new(BitStore::new(dir.path().join("kv")).unwrap());
+
+        let (index, _) =
+            create_index_with_components(&dir, wal.clone(), storage.clone(), kv.clone());
+
+        // 2. Pre-populate KV (Simulate ID 100 in Bucket 5)
+        kv.put(&100u64.to_le_bytes(), &5u32.to_le_bytes()).unwrap();
+
+        // 3. Perform Delete
+        index.delete(100).unwrap();
+
+        // ⚡ FIX: Force data from RAM buffer to Disk
+        wal.lock().current().sync().unwrap();
+
+        // 4. Verify WAL
+        let reader = WalReader::open(wal_dir.join("wal_1.log")).unwrap();
+        let entries = reader.read_committed();
+
+        // Now this assertion will pass
+        assert!(!entries.is_empty(), "WAL should contain the delete entry");
+        assert!(matches!(
+            entries.last().unwrap(),
+            WalEntry::Delete { id: 100 }
+        ));
+
+        // 5. Verify Storage
+        assert!(
+            storage.is_deleted(5, 100),
+            "Storage should be notified of delete"
+        );
+    }
+
+    // --- TEST: Shadowing on Insert ---
+    #[tokio::test]
+    async fn test_insert_shadows_existing_disk_item() {
+        let dir = tempdir().unwrap();
+        let wal_dir = dir.path().join("wal");
+        std::fs::create_dir(&wal_dir).unwrap();
+
+        let wal = Arc::new(Mutex::new(WalManager::new(&wal_dir).unwrap()));
+        let storage = Arc::new(MockStorage::new());
+        let kv = Arc::new(BitStore::new(dir.path().join("kv")).unwrap());
+        let (index, _) =
+            create_index_with_components(&dir, wal.clone(), storage.clone(), kv.clone());
+
+        // 1. Simulate ID 99 exists on disk in Bucket 2
+        index
+            .get_kv()
+            .put(&99u64.to_le_bytes(), &2u32.to_le_bytes())
+            .unwrap();
+
+        // 2. Insert ID 99 (New Version)
+        index.insert(99, &[1.0, 1.0]).unwrap();
+
+        // 3. Verify:
+        // A. Storage marked ID 99 in Bucket 2 as dead
+        assert!(storage.is_deleted(2, 99), "Old disk version must be killed");
+
+        // B. MemTable contains new version
+        let res = index.search(&[1.0, 1.0], 1, 0.9, 1.0, 100.0).await.unwrap();
+        assert_eq!(res[0].0, 99);
     }
 }

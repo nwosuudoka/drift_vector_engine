@@ -1,8 +1,9 @@
 #[cfg(test)]
 mod tests {
     use crate::manifest::pb::Centroid;
+    use crate::math::Metric;
     use crate::partitioner::IncrementalPartitioner;
-    use crate::router::{Metric, Router};
+    use crate::router::Router;
 
     #[test]
     fn test_partitioning_logic() {

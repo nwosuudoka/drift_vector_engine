@@ -8,6 +8,7 @@ use drift_cache::tiered_store::TieredPageManager;
 use drift_core::index::{IndexOptions, VectorIndex};
 use drift_storage::disk_manager::DriftPageManager;
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -38,7 +39,7 @@ impl CollectionManager {
         &self,
         name: &str,
         dim_hint: Option<usize>,
-    ) -> std::io::Result<Arc<Collection>> {
+    ) -> io::Result<Arc<Collection>> {
         // 1. Fast Path
         {
             let map = self.collections.read().await;

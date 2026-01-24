@@ -67,8 +67,32 @@ pub struct SearchCandidate {
     pub vector_count: u16, // Index of this vector inside the RG
 }
 
-/// Represents a component capable of searching stored vectors.
-/// Implemented by `BucketManager` in the storage layer.
+// ⚡ NEW: Shared Stats Struct
+#[derive(Debug, Clone, Copy)]
+pub struct BucketStats {
+    pub tombstone_count: u32,
+    pub total_count: u32,
+    pub temperature: f32, // 0.0 (Cold) to 1.0 (hot)
+    pub active: bool,
+}
+
+impl Default for BucketStats {
+    fn default() -> Self {
+        Self {
+            tombstone_count: 0,
+            total_count: 0,
+            temperature: 0.5, // Start warm
+            active: true,
+        }
+    }
+}
+
+impl BucketStats {
+    pub fn cool(&mut self, decay_rate: f32) {
+        self.temperature *= decay_rate;
+    }
+}
+
 #[async_trait]
 pub trait DiskSearcher: Send + Sync {
     /// Performs a complete search: Scan Index (Hot) -> Fetch Data (Cold) -> Refine.
@@ -81,6 +105,30 @@ pub trait DiskSearcher: Send + Sync {
         oversample_factor: usize, // How many candidates to scan (e.g. k * 3)
         tombstones: Arc<dyn TombstoneView>,
     ) -> Vec<(u64, f32)>; // Returns (ID, Exact Distance)
+}
+
+/// Represents a component capable of searching stored vectors.
+/// Implemented by `BucketManager` in the storage layer.
+#[async_trait]
+pub trait StorageEngine: Send + Sync {
+    /// Performs a complete search: Scan Index (Hot) -> Fetch Data (Cold) -> Refine.
+    /// Guarantees consistency by holding locks across both phases.
+    async fn search_and_refine(
+        &self,
+        bucket_ids: &[u32],
+        query: &[f32],
+        k: usize,                 // Top-K to return
+        oversample_factor: usize, // How many candidates to scan (e.g. k * 3)
+    ) -> Vec<(u64, f32)>; // Returns (ID, Exact Distance)
+
+    fn mark_delete(&self, bucket_id: u32, vector_id: u64) -> Result<()>;
+    fn get_bucket_stats(&self, bucket_id: u32) -> Option<BucketStats>;
+
+    // Called by Janitor to simulate cooling over time
+    fn tick_cooling(&self, decay_rate: f32);
+
+    // Registers a new bucket (e.g. from Split/Flush)
+    fn register_bucket(&self, bucket_id: u32, path: String, count: u32);
 }
 
 /// Represents a component capable of retrieving full bucket data.

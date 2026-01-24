@@ -1,12 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::manifest::pb::Centroid;
-
-#[derive(PartialEq, Debug, Clone)]
-pub enum Metric {
-    L2,
-    Cosine,
-}
+use crate::{manifest::pb::Centroid, math::Metric};
 
 /// The Router determines which Bucket a vector belongs to.
 ///

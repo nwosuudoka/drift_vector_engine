@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         port: 50099,
         wal_dir: dir.path().join("wal"),
+        data_dir: dir.path().join("data"),
         storage: StorageCommand::File(FileConfig { path: storage_path }),
         default_dim: DIM,
         max_bucket_capacity: optimal_capacity,

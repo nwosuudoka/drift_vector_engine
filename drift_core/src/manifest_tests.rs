@@ -1,11 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use crate::manifest::ManifestWrapper;
+    use crate::{manifest::ManifestWrapper, math::Metric};
 
     #[test]
     fn test_manifest_lifecycle() {
         // 1. Create
-        let mut manifest = ManifestWrapper::new(128, "L2");
+        let metric = Metric::L2;
+        let mut manifest = ManifestWrapper::new(128, metric);
         assert_eq!(manifest.version(), 1);
 
         // 2. Mutate (Add Bucket)
@@ -27,7 +28,8 @@ mod tests {
 
     #[test]
     fn test_manifest_initialization() {
-        let manifest = ManifestWrapper::new(128, "L2");
+        let metric = Metric::L2;
+        let manifest = ManifestWrapper::new(128, metric);
         assert_eq!(manifest.version(), 1);
         assert_eq!(manifest.inner.dim, 128);
         assert_eq!(manifest.inner.metric, "L2");
@@ -37,7 +39,8 @@ mod tests {
 
     #[test]
     fn test_bucket_management() {
-        let mut manifest = ManifestWrapper::new(128, "L2");
+        let metric = Metric::L2;
+        let mut manifest = ManifestWrapper::new(128, metric);
 
         // 1. Add Bucket
         let centroid = vec![0.1; 128];
@@ -70,7 +73,8 @@ mod tests {
 
     #[test]
     fn test_bucket_removal() {
-        let mut manifest = ManifestWrapper::new(128, "L2");
+        let metric = Metric::L2;
+        let mut manifest = ManifestWrapper::new(128, metric);
         manifest.add_bucket(1, "run_1".to_string(), Some(vec![0.0; 128]));
         manifest.add_bucket(2, "run_2".to_string(), Some(vec![1.0; 128]));
 
@@ -90,7 +94,8 @@ mod tests {
 
     #[test]
     fn test_versioning() {
-        let mut manifest = ManifestWrapper::new(128, "L2");
+        let metric = Metric::L2;
+        let mut manifest = ManifestWrapper::new(128, metric);
         assert_eq!(manifest.version(), 1);
 
         manifest.bump_version();
@@ -102,7 +107,8 @@ mod tests {
 
     #[test]
     fn test_serialization_roundtrip() {
-        let mut manifest = ManifestWrapper::new(64, "COSINE");
+        let metric = Metric::COSINE;
+        let mut manifest = ManifestWrapper::new(64, metric);
 
         // Populate with some complex state
         for i in 0..10 {

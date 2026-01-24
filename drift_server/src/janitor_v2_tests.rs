@@ -6,8 +6,10 @@ mod tests {
     use crate::persistence_v2::PersistenceManager;
     use drift_core::index_v2::VectorIndex;
     use drift_core::lock_manager::BucketCoordinator;
-    use drift_core::router::{Metric, Router};
+    use drift_core::math::Metric;
+    use drift_core::router::Router;
     use drift_core::wal_v2::WalManager;
+    use drift_kv::bitstore::BitStore;
     use drift_storage::bucket_manager::BucketManager;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
@@ -30,7 +32,7 @@ mod tests {
         let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
         let staging = Arc::new(LocalStagingManager::new(&data_dir).unwrap());
         let op = create_fs_operator(&data_dir);
-        let persistence = PersistenceManager::new(op.clone());
+        let persistence = Arc::new(PersistenceManager::new(op.clone()));
         let coordinator = Arc::new(BucketCoordinator::new());
 
         let bucket_manager = Arc::new(BucketManager::new(
@@ -57,12 +59,15 @@ mod tests {
             Router::new(&centroids, &[0], dim, Metric::L2).unwrap(),
         ));
 
+        let kv = Arc::new(BitStore::new(dir.path().join("kv")).unwrap());
+
         let index = Arc::new(VectorIndex::new(
             dim,
             10,
             router,
             wal_mgr,
             bucket_manager.clone(),
+            kv,
         ));
 
         let janitor = Janitor::new(JanitorConfig {
@@ -123,8 +128,10 @@ mod stress_tests {
     use crate::persistence_v2::PersistenceManager;
     use drift_core::index_v2::VectorIndex;
     use drift_core::lock_manager::BucketCoordinator;
-    use drift_core::router::{Metric, Router};
+    use drift_core::math::Metric;
+    use drift_core::router::Router;
     use drift_core::wal_v2::WalManager;
+    use drift_kv::bitstore::BitStore;
     use drift_storage::bucket_manager::BucketManager;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
@@ -159,7 +166,7 @@ mod stress_tests {
         let manifest = Arc::new(ServerManifestManager::new(dir, dim as u32).unwrap());
         let staging = Arc::new(LocalStagingManager::new(&data_dir).unwrap());
         let op = create_fs_operator(&data_dir);
-        let persistence = PersistenceManager::new(op.clone());
+        let persistence = Arc::new(PersistenceManager::new(op.clone()));
 
         let coordinator = Arc::new(BucketCoordinator::new());
 
@@ -187,12 +194,15 @@ mod stress_tests {
             Router::new(&centroids, &[0], dim, Metric::L2).unwrap(),
         ));
 
+        let bit_store = Arc::new(BitStore::new(dir.join("kv")).unwrap());
+
         let index = Arc::new(VectorIndex::new(
             dim,
             capacity,
             router,
             wal_mgr,
             bucket_manager.clone(),
+            bit_store,
         ));
 
         // Low threshold to force S3 promotion
@@ -223,7 +233,7 @@ mod stress_tests {
 
         // 1. Insert Target Data (ID 999)
         let target_vec = vec![100.0; dim];
-        index.insert(999, target_vec.clone()).unwrap();
+        index.insert(999, &target_vec).unwrap();
 
         // 2. Spawn Reader Thread
         let index_ref = index.clone();
@@ -256,7 +266,7 @@ mod stress_tests {
         // 3. Trigger Tiering Moves (Flush -> Promote)
         for i in 0..100 {
             let vec = vec![i as f32; dim];
-            index.insert(i, vec).unwrap();
+            index.insert(i, &vec).unwrap();
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 

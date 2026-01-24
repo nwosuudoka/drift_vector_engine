@@ -232,14 +232,13 @@ impl WalManager {
         let mut max_id = 0;
         if let Ok(entries) = fs::read_dir(&base_dir) {
             for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.starts_with("wal_") && name.ends_with(".log") {
-                        if let Ok(id) = name[4..name.len() - 4].parse::<u64>() {
-                            if id > max_id {
-                                max_id = id;
-                            }
-                        }
-                    }
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with("wal_")
+                    && name.ends_with(".log")
+                    && let Ok(id) = name[4..name.len() - 4].parse::<u64>()
+                    && id > max_id
+                {
+                    max_id = id;
                 }
             }
         }

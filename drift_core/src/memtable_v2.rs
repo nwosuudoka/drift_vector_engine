@@ -1,3 +1,4 @@
+use drift_traits::TombstoneView;
 use parking_lot::{RwLock, RwLockReadGuard};
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -91,7 +92,7 @@ impl MemTableV2 {
     }
 
     /// Parallel Scan Search
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+    pub fn search<TV: TombstoneView>(&self, query: &[f32], k: usize, view: &TV) -> Vec<(u64, f32)> {
         let ids = self.ids.read();
         let data = self.data.read();
         let dim = self.options.dim;
@@ -105,6 +106,10 @@ impl MemTableV2 {
                 || BinaryHeap::with_capacity(k + 1),
                 |mut heap, i| {
                     let id = ids[i];
+
+                    if view.contains(id) {
+                        return heap;
+                    }
 
                     let start = i * chunk_size;
                     let vector = &data[start..start + chunk_size];

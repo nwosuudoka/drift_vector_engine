@@ -116,12 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
     // Important: We look inside the collection folder for size
     let storage_root = dir.path().join("storage");
-    let wal_path = dir.path().join("wal");
+    let wal_dir = dir.path().join("wal");
+    let data_dir = dir.path().join("data");
 
     //  Use StorageCommand strategy
     let config = drift_server::config::Config {
         port: 50053,
-        wal_dir: wal_path.clone(),
+        wal_dir: wal_dir.clone(),
+        data_dir: data_dir.clone(),
 
         // Use File Strategy
         storage: StorageCommand::File(FileConfig {

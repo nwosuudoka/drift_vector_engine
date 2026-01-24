@@ -27,3 +27,4 @@ zerocopy = "0.8.33"
 parking_lot = "0.12"                                                        # For RwLock
 tracing = "0.1.44"
 futures = "0.3"
+atomic_float = "1.1.0"

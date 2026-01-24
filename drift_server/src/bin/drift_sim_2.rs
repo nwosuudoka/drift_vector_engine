@@ -160,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config {
         port: 50055,
         wal_dir: dir.path().join("wal"),
+        data_dir: dir.path().join("data"),
         storage: StorageCommand::File(FileConfig {
             path: dir.path().join("storage"),
         }),

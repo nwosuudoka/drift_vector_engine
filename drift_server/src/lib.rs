@@ -47,12 +47,19 @@ pub mod drift_proto {
 // V2 implementation
 pub mod drift_server;
 pub mod janitor_v2;
+pub mod manager_v2;
 pub mod persistence_v2;
 pub mod reaper;
 pub mod recovery;
+pub mod server_v2;
 
 #[cfg(test)]
 mod janitor_v2_tests;
-
+#[cfg(test)]
+mod manager_v2_tests;
+#[cfg(test)]
+mod persistence_v2_tests;
+#[cfg(test)]
+mod recovery_test;
 #[cfg(test)]
 mod server_integration_tests;
