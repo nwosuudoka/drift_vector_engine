@@ -26,6 +26,10 @@ impl LocalStagingManager {
         })
     }
 
+    pub fn get_base_path(&self) -> &Path {
+        &self.base_path
+    }
+
     /// Returns the currently active filename for this bucket.
     pub fn get_active_filename(&self, bucket_id: u32) -> String {
         self.active_files
@@ -201,5 +205,27 @@ impl LocalStagingManager {
         let root = self.base_path.to_str().unwrap();
         let builder = services::Fs::default().root(root);
         Ok(Operator::new(builder)?.finish())
+    }
+
+    /// NEW: Writes a fresh file for a bucket (CoW support).
+    /// Used during Scatter-Merge to rewrite a neighbor bucket with new data.
+    pub async fn write_new_file(&self, filename: &str, group: &PartitionGroup) -> io::Result<u64> {
+        let path = self.base_path.join(filename);
+        let dim = group.flat_vectors.len() / group.ids.len();
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .context("Failed to create new staging file")?;
+
+        let q = Quantizer::train(&group.flat_vectors, dim);
+        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim)?;
+
+        writer.write_batch(&group.ids, &group.flat_vectors)?;
+        let (_, total_count) = writer.finalize()?;
+
+        Ok(total_count)
     }
 }

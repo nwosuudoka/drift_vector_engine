@@ -2,6 +2,7 @@ use crate::local_staging::LocalStagingManager;
 use crate::manifest::ServerManifestManager;
 use crate::persistence_v2::PersistenceManager;
 use crate::reaper::Reaper;
+use drift_core::partitioner::PartitionGroup;
 use drift_core::{index_v2::VectorIndex, lock_manager::BucketCoordinator};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
 use drift_traits::StorageEngine;
@@ -12,18 +13,38 @@ use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{error, info};
 
+pub struct JanitorVars {
+    pub promotion_threshold_bytes: u64,
+    pub max_bucket_capacity: usize,
+    pub drift_threshold: f32,         // Default 0.15
+    pub split_threshold: f32,         // Default 0.8
+    pub temperature_cool_factor: f32, // default to 0.98
+    pub check_interval: Duration,
+    pub urgency_threshold: f32, // default to 1.5
+}
+
+impl Default for JanitorVars {
+    fn default() -> Self {
+        Self {
+            promotion_threshold_bytes: 1024,
+            max_bucket_capacity: 2000,
+            drift_threshold: 0.15,
+            split_threshold: 0.8,
+            temperature_cool_factor: 0.98,
+            check_interval: Duration::from_millis(100),
+            urgency_threshold: 1.5,
+        }
+    }
+}
+
 pub struct JanitorConfig {
     pub index: Arc<VectorIndex>,
     pub manifest: Arc<ServerManifestManager>,
     pub staging: Arc<LocalStagingManager>,
     pub persistence: Arc<PersistenceManager>,
     pub bucket_manager: Arc<BucketManager>,
-    pub check_interval: Duration,
-    pub promotion_threshold_bytes: u64,
     pub coordinator: Arc<BucketCoordinator>,
-    pub max_bucket_capacity: usize,
-    pub drift_threshold: f32, // Default 0.15
-    pub split_threshold: f32, // Default 0.8
+    pub vars: JanitorVars,
 }
 
 pub struct Janitor {
@@ -32,13 +53,9 @@ pub struct Janitor {
     staging: Arc<LocalStagingManager>,
     persistence: Arc<PersistenceManager>,
     bucket_manager: Arc<BucketManager>,
-    check_interval: Duration,
-    promotion_threshold_bytes: u64,
     reaper: Mutex<Reaper>,
     coordinator: Arc<BucketCoordinator>,
-    max_bucket_capacity: usize,
-    drift_threshold: f32,
-    split_threshold: f32,
+    vars: JanitorVars,
 }
 
 impl Janitor {
@@ -53,18 +70,14 @@ impl Janitor {
             staging: config.staging,
             persistence: config.persistence,
             bucket_manager: config.bucket_manager,
-            check_interval: config.check_interval,
-            promotion_threshold_bytes: config.promotion_threshold_bytes,
             reaper,
             coordinator: config.coordinator,
-            max_bucket_capacity: config.max_bucket_capacity,
-            drift_threshold: config.drift_threshold,
-            split_threshold: config.split_threshold,
+            vars: config.vars,
         }
     }
 
     pub async fn run(&self) {
-        let mut interval = time::interval(self.check_interval);
+        let mut interval = time::interval(self.vars.check_interval);
         info!("Janitor: Started.");
 
         loop {
@@ -86,75 +99,6 @@ impl Janitor {
             // 4. Check for Promotions (Local -> S3)
             if let Err(e) = self.promote_segments().await {
                 error!("Janitor: Promotion failed: {}", e);
-            }
-        }
-    }
-
-    pub(crate) async fn check_maintainance(&self) {
-        // Simple heuristic: Scan one bucket per tick to find candidates
-        // In prod, use a PriorityQueue or "Dirty Set"
-
-        // This relies on BucketManager implementing get_all_bucket_ids or similar
-        // Or we iterate Manifest state.
-        let buckets = self.manifest.get_state().get_buckets().clone();
-        let max_cap = self.max_bucket_capacity as f32;
-
-        let (router_centroids, router_ids) = self.index.get_router().read().get_snapshot();
-
-        // Map BucketID -> Centroid
-        let centroid_map: HashMap<u32, Vec<f32>> = router_ids
-            .iter()
-            .zip(router_centroids.chunks(self.index.get_dim()))
-            .map(|(id, vec)| (*id, vec.to_vec()))
-            .collect();
-
-        for b in buckets {
-            // 1. Get Live Stats from BucketManager
-            let (current_sum, current_count) =
-                match self.bucket_manager.get_bucket_drift_stats(b.id) {
-                    Some(s) => s,
-                    None => continue, // Bucket might be deleted
-                };
-
-            // 2. Get Target Centroid
-            let target_centroid = match centroid_map.get(&b.id) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            // 3. Calculate Drift
-            // Drift = Dist(Mean, Centroid)
-            let drift_score = if current_count > 0 && !current_sum.is_empty() {
-                let dim = current_sum.len();
-                let n = current_count as f32;
-                let mut dist_sq = 0.0;
-
-                for i in 0..dim {
-                    let mean = current_sum[i] / n;
-                    let diff = mean - target_centroid[i];
-                    dist_sq += diff * diff;
-                }
-                dist_sq.sqrt()
-            } else {
-                0.0
-            };
-
-            let cap_ratio = current_count as f32 / max_cap;
-
-            // 4. Decision: Split if Full OR (Mostly Full AND Drifted)
-            // 0.15 is the Drift Threshold from the paper.
-            if cap_ratio > 1.0
-                || (cap_ratio > self.split_threshold && drift_score > self.drift_threshold)
-            {
-                info!(
-                    "Janitor: Triggering Split for Bucket {} (Cap: {:.2}, Drift: {:.4})",
-                    b.id, cap_ratio, drift_score
-                );
-
-                if let Err(e) = self.perform_split(b.id).await {
-                    error!("Janitor: Split failed for {}: {}", b.id, e);
-                }
-                break; // Throttle
             }
         }
     }
@@ -271,7 +215,7 @@ impl Janitor {
     }
 
     async fn promote_segments(&self) -> io::Result<()> {
-        let threshold = self.promotion_threshold_bytes;
+        let threshold = self.vars.promotion_threshold_bytes;
         let candidates = self.staging.list_large_buckets(threshold)?;
 
         if candidates.is_empty() {
@@ -466,5 +410,268 @@ impl Janitor {
             bucket_id, id_left, id_right
         );
         Ok(())
+    }
+
+    async fn perform_merge(&self, zombie_id: u32) -> io::Result<()> {
+        info!("Janitor: 🚑 Merging Zombie Bucket {}", zombie_id);
+
+        let proposal = match self.index.calculate_merge(zombie_id).await? {
+            Ok(p) => p,
+            Err(status) => {
+                info!("Janitor: Merge aborted: {}", status.to_str());
+                return Ok(());
+            }
+        };
+
+        // Handle Empty/No-Neighbor case (Delete Logic)
+        if proposal.moves.is_empty() {
+            info!(
+                "Janitor: Zombie Bucket {} is empty or isolated. Deleting.",
+                zombie_id
+            );
+
+            // 1. Remove from Metadata
+            self.manifest.apply_atomic(|m| m.remove_bucket(zombie_id))?;
+            self.index.apply_merge_update(zombie_id, &[]).await;
+
+            // 2. ⚡ NEW: Delete Physical File
+            let zombie_file = self.staging.get_active_filename(zombie_id);
+            if let Err(e) = self.staging.delete_file(&zombie_file).await {
+                error!(
+                    "Janitor: Failed to delete zombie file {}: {}",
+                    zombie_file, e
+                );
+            }
+
+            return Ok(());
+        }
+
+        if proposal.moves.is_empty() {
+            self.manifest.apply_atomic(|m| m.remove_bucket(zombie_id))?;
+            self.index.apply_merge_update(zombie_id, &[]).await;
+            return Ok(());
+        }
+
+        let mut manifest_updates = Vec::new();
+        let mut files_to_delete = Vec::new();
+
+        for (target_id, group) in &proposal.moves {
+            // A. New File Name
+            let new_filename = format!("bucket_{}_{}.drift", target_id, uuid::Uuid::new_v4());
+
+            // B. Read Old Data (to merge)
+            let (mut ids, mut vecs) = self.staging.read_full_bucket(*target_id).await?;
+            let old_filename = self.staging.get_active_filename(*target_id);
+
+            // C. Merge Vectors
+            ids.extend(&group.ids);
+            let dim = self.index.get_dim();
+            for chunk in group.flat_vectors.chunks_exact(dim) {
+                vecs.push(chunk.to_vec());
+            }
+
+            // D. Recalculate Stats (Sum & Centroid)
+            let count = ids.len();
+            let mut new_sum = vec![0.0; dim];
+
+            // Flatten for writing & summing
+            let mut flat_vecs = Vec::with_capacity(count * dim);
+            for v in &vecs {
+                flat_vecs.extend_from_slice(v);
+                for i in 0..dim {
+                    new_sum[i] += v[i];
+                }
+            }
+
+            // ⚡ NEW: Calculate Centroid
+            let mut new_centroid = vec![0.0; dim];
+            if count > 0 {
+                for i in 0..dim {
+                    new_centroid[i] = new_sum[i] / count as f32;
+                }
+            }
+
+            // E. Write File
+            let mut merged_group = PartitionGroup::new(dim, None);
+            merged_group.ids = ids;
+            merged_group.flat_vectors = flat_vecs;
+            merged_group.count = count;
+
+            self.staging
+                .write_new_file(&new_filename, &merged_group)
+                .await?;
+
+            // Track update: (ID, Count, Sum, Centroid, Filename)
+            manifest_updates.push((
+                *target_id,
+                count as u64,
+                new_sum,
+                new_centroid,
+                new_filename,
+            ));
+            files_to_delete.push(old_filename);
+        }
+
+        // 3. Atomic Commit (Manifest)
+        self.manifest.apply_atomic(|m| {
+            m.remove_bucket(zombie_id);
+            for (id, count, _, centroid, _) in &manifest_updates {
+                // Use add_bucket to update Centroid + Count in Manifest
+                // add_bucket handles upsert correctly
+                m.add_bucket(*id, String::new(), Some(centroid.clone()));
+                m.update_bucket_stats(*id, *count, 0);
+            }
+        })?;
+
+        // 4. Update Runtime (Router)
+        // Convert to format required by apply_merge_update: (id, count, sum, centroid)
+        let router_updates: Vec<_> = manifest_updates
+            .iter()
+            .map(|(id, c, s, cent, _)| (*id, *c, s.clone(), cent.clone()))
+            .collect();
+
+        self.index
+            .apply_merge_update(zombie_id, &router_updates)
+            .await;
+
+        // 5. Update Storage (BucketManager)
+        for (id, count, sum, _, filename) in &manifest_updates {
+            // Register overwrites the entry in BucketManager with a fresh state (empty sum)
+            self.bucket_manager
+                .register_bucket(*id, filename.clone(), StorageClass::Local);
+            self.staging.set_active_filename(*id, filename.clone());
+
+            // Re-inject the correct sum so Drift Calculation works immediately
+            self.bucket_manager
+                .update_bucket_drift(*id, sum, *count as u32)?;
+        }
+
+        // 6. Cleanup
+        let zombie_file = self.staging.get_active_filename(zombie_id);
+        let _ = self.staging.delete_file(&zombie_file).await;
+
+        for f in files_to_delete {
+            if !manifest_updates.iter().any(|(_, _, _, _, new)| *new == f) {
+                let _ = self.staging.delete_file(&f).await;
+            }
+        }
+
+        info!("Janitor: Merge Complete. {} scattered.", zombie_id);
+        Ok(())
+    }
+
+    pub(crate) async fn check_maintainance(&self) {
+        // 1. Global Cooling (Decay temperature for all buckets)
+        // V2 API: We tell the storage engine to decay all active temperatures.
+        // const TEMPERATURE_COOL_FACTOR: f32 = 0.98;
+        self.bucket_manager
+            .tick_cooling(self.vars.temperature_cool_factor);
+
+        // 2. Snapshot State
+        let buckets = self.manifest.get_state().get_buckets().clone();
+        let max_cap = self.vars.max_bucket_capacity as f32;
+
+        // Snapshot Router for Centroids (needed for Drift calc)
+        let (router_centroids, router_ids) = self.index.get_router().read().get_snapshot();
+        let dim = self.index.get_dim();
+
+        // Helper to find centroid for a bucket ID
+        let centroid_map: HashMap<u32, Vec<f32>> = router_ids
+            .iter()
+            .zip(router_centroids.chunks(dim))
+            .map(|(id, vec)| (*id, vec.to_vec()))
+            .collect();
+
+        for b in buckets {
+            // 3. Fetch Live Stats from BucketManager (V2 API)
+            // returns BucketStats { tombstone_count, total_count, temperature, ... }
+            let stats = match self.bucket_manager.get_bucket_stats(b.id) {
+                Some(s) => s,
+                None => continue, // Bucket might be deleted or not yet registered
+            };
+
+            // Fetch Vector Sum for Drift (V2 API)
+            let (current_sum, _drift_count) = self
+                .bucket_manager
+                .get_bucket_drift_stats(b.id)
+                .unwrap_or((vec![], 0));
+
+            let current_count = stats.total_count;
+
+            // 4. Calculate Metrics (Manually, since V1 BucketHeader logic is gone)
+
+            // --- A. Calculate Urgency ---
+            // Formula: (Emptiness / (Temp + epsilon)) + (Beta * ZombieRatio)
+            let total = current_count as f32;
+            let dead = stats.tombstone_count as f32;
+            let temp = stats.temperature; // Already decayed by tick_cooling above
+
+            let live = (total - dead).max(0.0);
+
+            let emptiness = if live < max_cap {
+                (max_cap - live) / max_cap
+            } else {
+                0.0
+            };
+
+            let zombie_ratio = if total > 0.0 { dead / total } else { 0.0 };
+
+            const EPSILON: f32 = 0.001;
+            const BETA: f32 = 3.0;
+
+            let urgency = (emptiness / (temp + EPSILON)) + (BETA * zombie_ratio);
+
+            // --- B. Calculate Drift ---
+            // Formula: Distance(Mean, Centroid)
+            let drift_score = if current_count > 0 && !current_sum.is_empty() {
+                if let Some(target_centroid) = centroid_map.get(&b.id) {
+                    let n = current_count as f32;
+                    let mut dist_sq = 0.0;
+                    for i in 0..dim {
+                        let mean = current_sum[i] / n;
+                        let diff = mean - target_centroid[i];
+                        dist_sq += diff * diff;
+                    }
+                    dist_sq.sqrt()
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            let cap_ratio = current_count as f32 / max_cap;
+
+            // 5. Decision Matrix
+
+            // A. SPLIT: Too Full OR High Drift
+            if cap_ratio > 1.0
+                || (cap_ratio > self.vars.split_threshold
+                    && drift_score > self.vars.drift_threshold)
+            {
+                info!(
+                    "Janitor: ✂️ Triggering Split for Bucket {} (Cap: {:.2}, Drift: {:.4})",
+                    b.id, cap_ratio, drift_score
+                );
+
+                if let Err(e) = self.perform_split(b.id).await {
+                    error!("Janitor: Split failed for {}: {}", b.id, e);
+                }
+                break; // One op per tick
+            }
+            // B. MERGE: High Urgency
+            // Using the urgency score we calculated manually above
+            else if urgency > self.vars.urgency_threshold {
+                info!(
+                    "Janitor: 🚑 Triggering Merge for Zombie Bucket {} (Urgency: {:.2}, Count: {})",
+                    b.id, urgency, current_count
+                );
+
+                if let Err(e) = self.perform_merge(b.id).await {
+                    error!("Janitor: Merge failed for {}: {}", b.id, e);
+                }
+                break; // One op per tick
+            }
+        }
     }
 }

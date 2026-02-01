@@ -238,6 +238,29 @@ impl Router {
     pub fn get_all_centroids_flat(&self) -> Vec<f32> {
         self.flat_centroids.clone()
     }
+
+    // /// ⚡ NEW: Updates the vector count for a specific bucket.
+    // /// Critical for maintaining the Reliability score R(b) after a merge.
+    // pub fn update_bucket_count(&mut self, bucket_id: u32, count: u32) {
+    //     if let Some(idx) = self.bucket_ids.iter().position(|&id| id == bucket_id) {
+    //         self.bucket_counts[idx] = count;
+    //     }
+    // }
+
+    /// NEW: Updates a bucket's centroid and count after a merge/split.
+    pub fn update_bucket(&mut self, bucket_id: u32, count: u32, new_centroid: Vec<f32>) {
+        if let Some(idx) = self.bucket_ids.iter().position(|&id| id == bucket_id) {
+            // Update Count
+            self.bucket_counts[idx] = count;
+
+            // Update Centroid (Flat buffer manipulation)
+            let start = idx * self.dim;
+            let end = start + self.dim;
+            if new_centroid.len() == self.dim {
+                self.flat_centroids[start..end].copy_from_slice(&new_centroid);
+            }
+        }
+    }
 }
 
 // --- Inline Math Helpers (Candidates for SIMD Optimization later) ---

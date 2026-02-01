@@ -375,12 +375,12 @@ impl StorageEngine for BucketManager {
             }
         }
 
-        if merged_ids.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Bucket data empty or inaccessible",
-            ));
-        }
+        //    if merged_ids.is_empty() {
+        //         return Err(io::Error::new(
+        //             io::ErrorKind::NotFound,
+        //             "Bucket data empty or inaccessible",
+        //         ));
+        //     }
 
         Ok((merged_ids, merged_vecs_flat))
     }

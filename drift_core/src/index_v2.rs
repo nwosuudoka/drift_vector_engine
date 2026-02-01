@@ -7,7 +7,7 @@ use drift_kv::bitstore::BitStore;
 use drift_traits::{StorageEngine, TombstoneView};
 use parking_lot::{Mutex, RwLock};
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
@@ -62,6 +62,11 @@ impl TombstoneView for L0TombstoneView {
     fn len(&self) -> usize {
         self.inner.len()
     }
+}
+
+pub struct MergeProposal {
+    pub zombie_id: u32,
+    pub moves: HashMap<u32, PartitionGroup>,
 }
 
 pub struct VectorIndex {
@@ -542,5 +547,125 @@ impl VectorIndex {
     // For testing purposes
     pub fn get_router(&self) -> &Arc<RwLock<Router>> {
         &self.router
+    }
+
+    /// This is Read-Only. It does not modify disk or memory.
+    pub async fn calculate_merge(
+        &self,
+        zombie_id: u32,
+    ) -> io::Result<Result<MergeProposal, MaintenanceStatus>> {
+        // 1. Fetch Data
+        // This pulls High-Fidelity data (merging L1 tiers if needed)
+        let fetch_res = self.storage.fetch_bucket(zombie_id).await;
+
+        let (ids, flat_vecs) = match fetch_res {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    "calculate_merge: Failed to fetch bucket {}: {}",
+                    zombie_id,
+                    e
+                );
+                println!("skip locked here {}", e);
+                // If the file is gone, it's already locked or deleted. Skip.
+                return Ok(Err(MaintenanceStatus::SkippedLocked));
+            }
+        };
+
+        // 2. Budget / Sanity Checks
+        // If it's empty, we just return an empty proposal (signal to delete).
+        if ids.is_empty() {
+            return Ok(Ok(MergeProposal {
+                zombie_id,
+                moves: HashMap::new(),
+            }));
+        }
+
+        // If it grew significantly since the check (e.g. unexpected ingest), abort.
+        // We don't want to scatter a huge healthy bucket.
+        if ids.len() > 100 {
+            return Ok(Err(MaintenanceStatus::SkippedTooSmall)); // Actually too big
+        }
+
+        // 3. Snapshot Router (Global Context)
+        // We need this to find neighbors.
+        let (centroids, bucket_ids) = self.router.read().get_snapshot();
+        let dim = self.dim;
+
+        // 4. Offload Calculation (CPU Heavy)
+        let proposal_result = task::spawn_blocking(move || {
+            let mut moves: HashMap<u32, PartitionGroup> = HashMap::new();
+
+            for (i, &id) in ids.iter().enumerate() {
+                let start = i * dim;
+                let end = start + dim;
+                let vec = &flat_vecs[start..end];
+
+                // Find Nearest Neighbor that is NOT the zombie
+                let mut best_dist = f32::MAX;
+                let mut best_id = None;
+                let mut best_centroid = None;
+
+                // Iterate all global centroids
+                for (c_idx, &c_id) in bucket_ids.iter().enumerate() {
+                    if c_id == zombie_id {
+                        continue;
+                    }
+
+                    let c_start = c_idx * dim;
+                    let centroid = &centroids[c_start..c_start + dim];
+
+                    // Optimization: Use L2 Squared (no sqrt needed for comparison)
+                    let dist = crate::math::l2_sq(vec, centroid);
+
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_id = Some(c_id);
+                        best_centroid = Some(centroid.to_vec());
+                    }
+                }
+
+                if let Some(target) = best_id {
+                    let group = moves.entry(target).or_insert_with(|| {
+                        // We pass the Target's centroid so PartitionGroup is valid
+                        PartitionGroup::new(dim, best_centroid)
+                    });
+
+                    group.ids.push(id);
+                    group.flat_vectors.extend_from_slice(vec);
+                    group.count += 1;
+                } else {
+                    // No neighbors found?
+                    // This happens if:
+                    // 1. There is only 1 bucket in the system.
+                    // 2. All other buckets are empty/inactive (unlikely).
+                    // We abort the merge.
+                    return Err(MaintenanceStatus::SkippedTooSmall);
+                }
+            }
+
+            Ok(MergeProposal { zombie_id, moves })
+        })
+        .await
+        .map_err(io::Error::other)?;
+
+        Ok(proposal_result)
+    }
+
+    /// Now accepts `new_centroid` to keep drift calculations valid.
+    pub async fn apply_merge_update(
+        &self,
+        zombie_id: u32,
+        updates: &[(u32, u64, Vec<f32>, Vec<f32>)], // (TargetID, Count, Sum, Centroid)
+    ) {
+        let mut r = self.router.write();
+
+        // 1. Kill Zombie
+        r.remove_bucket(zombie_id);
+
+        // 2. Update Neighbors (Count + Centroid)
+        for (target_id, new_count, _, new_centroid) in updates {
+            r.update_bucket(*target_id, *new_count as u32, new_centroid.clone());
+        }
     }
 }

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::janitor_v2::{Janitor, JanitorConfig};
+use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
 use crate::local_staging::LocalStagingManager;
 use crate::manifest::ServerManifestManager;
 use crate::persistence_v2::PersistenceManager;
@@ -185,12 +185,16 @@ impl CollectionManager {
             staging,
             persistence,
             bucket_manager: bucket_manager.clone(),
-            check_interval: Duration::from_millis(100),
-            promotion_threshold_bytes: 16 * 1024 * 1024,
             coordinator,
-            max_bucket_capacity,
-            split_threshold: 0.8,
-            drift_threshold: 0.15,
+            vars: JanitorVars {
+                promotion_threshold_bytes: 16 * 1024 * 1024,
+                check_interval: Duration::from_millis(100),
+                max_bucket_capacity,
+                split_threshold: 0.8,
+                drift_threshold: 0.15,
+                temperature_cool_factor: 0.98,
+                urgency_threshold: 1.5,
+            },
         };
 
         let janitor = Janitor::new(janitor_config);

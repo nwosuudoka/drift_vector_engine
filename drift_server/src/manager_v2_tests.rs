@@ -350,8 +350,9 @@ mod bucket_fetch_test {
     }
 
     // --- TEST 3: Missing Component Failure ---
+    // --- TEST 3: Missing Component Failure ---
     #[tokio::test]
-    async fn test_fetch_bucket_fails_gracefully_on_missing_files() {
+    async fn test_fetch_bucket_returns_empty_on_missing_files() {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
@@ -360,11 +361,16 @@ mod bucket_fetch_test {
         // Register bucket pointing to non-existent file
         manager.register_bucket(999, "ghost.drift".to_string(), StorageClass::Local);
 
-        // Fetch should fail
+        // Fetch should NOT fail. It should return empty data.
         let res = manager.fetch_bucket(999).await;
-        assert!(res.is_err(), "Should error on missing file");
 
-        // Error kind should be NotFound (mapped from empty merge result)
-        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            res.is_ok(),
+            "Should not error on missing file (treated as empty)"
+        );
+
+        let (ids, vecs) = res.unwrap();
+        assert!(ids.is_empty(), "IDs should be empty");
+        assert!(vecs.is_empty(), "Vectors should be empty");
     }
 }

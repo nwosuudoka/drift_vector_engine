@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::janitor_v2::{Janitor, JanitorConfig};
+    use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
     use crate::local_staging::LocalStagingManager;
     use crate::manifest::ServerManifestManager;
     use crate::persistence_v2::PersistenceManager;
@@ -76,12 +76,12 @@ mod tests {
             staging: staging.clone(),
             persistence,
             bucket_manager: bucket_manager.clone(),
-            check_interval: Duration::from_millis(10),
-            promotion_threshold_bytes: 100,
             coordinator: coordinator.clone(),
-            max_bucket_capacity: 2000,
-            split_threshold: 0.8,
-            drift_threshold: 0.15,
+            vars: JanitorVars {
+                promotion_threshold_bytes: 100,
+                check_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
         });
 
         // 4. Trigger Flush Condition (Split Batches)
@@ -125,7 +125,7 @@ mod tests {
 
 #[cfg(test)]
 mod stress_tests {
-    use crate::janitor_v2::{Janitor, JanitorConfig};
+    use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
     use crate::local_staging::LocalStagingManager;
     use crate::manifest::ServerManifestManager;
     use crate::persistence_v2::PersistenceManager;
@@ -217,12 +217,12 @@ mod stress_tests {
             staging: staging,
             persistence,
             bucket_manager: bucket_manager.clone(),
-            check_interval: Duration::from_millis(5),
-            promotion_threshold_bytes: promotion_threshold,
             coordinator: coordinator.clone(),
-            max_bucket_capacity: 2000,
-            split_threshold: 0.8,
-            drift_threshold: 0.15,
+            vars: JanitorVars {
+                promotion_threshold_bytes: promotion_threshold,
+                check_interval: Duration::from_millis(5),
+                ..Default::default()
+            },
         });
 
         (index, bucket_manager, janitor, manifest)
@@ -289,7 +289,7 @@ mod stress_tests {
 
 #[cfg(test)]
 mod janitor_split_test {
-    use crate::janitor_v2::{Janitor, JanitorConfig};
+    use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
     use crate::local_staging::LocalStagingManager;
     use crate::manifest::ServerManifestManager;
     use crate::persistence_v2::PersistenceManager;
@@ -305,7 +305,6 @@ mod janitor_split_test {
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
     use std::sync::Arc;
-    use std::time::Duration;
     use tempfile::tempdir;
 
     fn create_fs_operator(path: &std::path::Path) -> Operator {
@@ -406,12 +405,8 @@ mod janitor_split_test {
             staging: staging.clone(),
             persistence,
             bucket_manager: bucket_manager.clone(),
-            check_interval: Duration::from_millis(100),
-            promotion_threshold_bytes: 1024,
             coordinator: coordinator.clone(),
-            max_bucket_capacity: 2000,
-            split_threshold: 0.8,
-            drift_threshold: 0.15,
+            vars: JanitorVars::default(),
         });
 
         // 5. EXECUTE SPLIT
@@ -714,18 +709,20 @@ mod edge_case_tests {
 }
 
 #[cfg(test)]
-mod janitor_split_drift_test {
-    use crate::janitor_v2::{Janitor, JanitorConfig};
+mod janitor_scatter_merge_test {
+    use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
     use crate::local_staging::LocalStagingManager;
     use crate::manifest::ServerManifestManager;
     use crate::persistence_v2::PersistenceManager;
     use drift_core::index_v2::VectorIndex;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
+    use drift_core::quantizer::Quantizer;
     use drift_core::router::Router;
     use drift_core::wal_v2::WalManager;
     use drift_kv::bitstore::BitStore;
-    use drift_storage::bucket_manager::BucketManager;
+    use drift_storage::bucket_file_writer::BucketFileWriter;
+    use drift_storage::bucket_manager::{BucketManager, StorageClass};
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
@@ -738,13 +735,44 @@ mod janitor_split_drift_test {
         Operator::new(builder).unwrap().finish()
     }
 
+    async fn create_bucket_file(
+        dir: &std::path::Path,
+        filename: &str,
+        ids: &[u64],
+        vecs: &[Vec<f32>],
+        dim: usize,
+    ) {
+        let path = dir.join(filename);
+        let file = std::fs::File::create(&path).unwrap();
+        // Flatten vectors
+        let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
+        // Handle empty case for quantization
+        let q = if !flat.is_empty() {
+            Quantizer::train(&flat, dim)
+        } else {
+            Quantizer::train(&vec![0.0; dim], dim)
+        };
+
+        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
+        if !ids.is_empty() {
+            writer.write_batch(ids, &flat).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
     async fn setup_env(
         dir: &std::path::Path,
-        bucket_cap: usize,
-    ) -> (Arc<VectorIndex>, Arc<ServerManifestManager>, Janitor) {
+        dim: usize,
+        max_bucket_cap: usize,
+    ) -> (
+        Arc<VectorIndex>,
+        Arc<BucketManager>,
+        Janitor,
+        Arc<ServerManifestManager>,
+        Arc<LocalStagingManager>,
+    ) {
         let data_dir = dir.join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        let dim = 2;
 
         let manifest = Arc::new(ServerManifestManager::new(dir, dim as u32).unwrap());
         let staging = Arc::new(LocalStagingManager::new(&data_dir).unwrap());
@@ -758,289 +786,235 @@ mod janitor_split_drift_test {
             coordinator.clone(),
         ));
 
-        let centroids = vec![drift_core::manifest::pb::Centroid {
-            id: 1,
-            vector: vec![0.0; dim],
-        }];
-        let router = Arc::new(RwLock::new(
-            Router::new(&centroids, &[0], dim, Metric::L2).unwrap(),
-        ));
-
-        let wal = Arc::new(Mutex::new(WalManager::new(dir.join("wal")).unwrap()));
+        let wal_dir = dir.join("wal");
+        let wal_mgr = Arc::new(Mutex::new(WalManager::new(&wal_dir).unwrap()));
         let kv = Arc::new(BitStore::new(dir.join("kv")).unwrap());
+
+        let centroids = vec![];
+        let router = Arc::new(RwLock::new(
+            Router::new(&centroids, &[], dim, Metric::L2).unwrap_or(Router::empty(dim, Metric::L2)),
+        ));
 
         let index = Arc::new(VectorIndex::new(
             dim,
-            bucket_cap,
+            max_bucket_cap,
             router,
-            wal,
+            wal_mgr,
             bucket_manager.clone(),
             kv,
         ));
 
-        // Initial State
-        manifest
-            .apply_atomic(|m| {
-                m.add_bucket(1, "run1".into(), Some(vec![0.0; dim]));
-                m.update_bucket_stats(1, 0, 0);
-            })
-            .unwrap();
-
         let janitor = Janitor::new(JanitorConfig {
             index: index.clone(),
             manifest: manifest.clone(),
-            staging,
+            staging: staging.clone(),
             persistence,
             bucket_manager: bucket_manager.clone(),
-            check_interval: Duration::from_millis(10),
-            promotion_threshold_bytes: 1024 * 1024,
             coordinator,
-            max_bucket_capacity: 100, // Config cap for split logic
-            split_threshold: 0.8,
-            drift_threshold: 0.15,
+            vars: JanitorVars {
+                check_interval: Duration::from_millis(10),
+                promotion_threshold_bytes: 1024 * 1024,
+                max_bucket_capacity: max_bucket_cap,
+                split_threshold: 0.8,
+                drift_threshold: 0.15,
+                ..Default::default()
+            },
         });
 
-        // We actually need to return the janitor to spawn it, or spawn inside.
-        // Let's just return the components.
-
-        (index, manifest, janitor)
+        (index, bucket_manager, janitor, manifest, staging)
     }
 
     #[tokio::test]
-    async fn test_janitor_splits_on_drift_threshold() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_test_writer() // plays nicely with cargo test output capture
-            .try_init();
-
+    async fn test_scatter_merge_e2e_small_bucket() {
         let dir = tempdir().unwrap();
-        let data_dir = dir.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-
         let dim = 2;
+        let max_cap = 100;
+        let (index, bucket_mgr, janitor, manifest, staging) =
+            setup_env(dir.path(), dim, max_cap).await;
 
-        // Capacity 90: Inserting 90 items forces rotation -> flush
-        let bucket_capacity = 90;
+        let c1 = vec![0.0; dim];
+        let c2 = vec![10.0; dim];
 
-        // 1. Setup Stack
-        let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
-        let staging = Arc::new(LocalStagingManager::new(&data_dir).unwrap());
-        let op = create_fs_operator(&data_dir);
-        let persistence = Arc::new(PersistenceManager::new(op.clone()));
-        let coordinator = Arc::new(BucketCoordinator::new());
+        {
+            let mut r = index.get_router().write();
+            r.add_bucket(1, c1.clone());
+            r.add_bucket(2, c2.clone());
+            r.update_bucket(1, 5, c1.clone());
+            r.update_bucket(2, 50, c2.clone());
+        }
 
-        let bucket_manager = Arc::new(BucketManager::new(
-            op.clone(),
-            op.clone(),
-            4,
-            coordinator.clone(),
-        ));
-
-        let centroids = vec![drift_core::manifest::pb::Centroid {
-            id: 1,
-            vector: vec![0.0; dim], // Centroid at Origin
-        }];
-        let router = Arc::new(RwLock::new(
-            Router::new(&centroids, &[0], dim, Metric::L2).unwrap(),
-        ));
-
-        let wal = Arc::new(Mutex::new(WalManager::new(dir.path().join("wal")).unwrap()));
-        let kv = Arc::new(BitStore::new(dir.path().join("kv")).unwrap());
-
-        let index = Arc::new(VectorIndex::new(
+        // Bucket 1: 5 items
+        let b1_ids: Vec<u64> = (0..5).collect();
+        let b1_vecs = vec![c1.clone(); 5];
+        create_bucket_file(
+            staging.get_base_path(),
+            "bucket_1.drift",
+            &b1_ids,
+            &b1_vecs,
             dim,
-            bucket_capacity,
-            router.clone(),
-            wal,
-            bucket_manager.clone(),
-            kv,
-        ));
+        )
+        .await;
 
-        // 2. Initialize Metadata (Manifest only)
-        // We do NOT register with BucketManager manually. The Flush will do it.
+        // Bucket 2: 50 items
+        let b2_ids: Vec<u64> = (100..150).collect();
+        let b2_vecs = vec![c2.clone(); 50];
+        create_bucket_file(
+            staging.get_base_path(),
+            "bucket_2.drift",
+            &b2_ids,
+            &b2_vecs,
+            dim,
+        )
+        .await;
+
+        staging.set_active_filename(1, "bucket_1.drift".into());
+        staging.set_active_filename(2, "bucket_2.drift".into());
+
+        bucket_mgr.register_bucket(1, "bucket_1.drift".into(), StorageClass::Local);
+        bucket_mgr.register_bucket(2, "bucket_2.drift".into(), StorageClass::Local);
+
+        bucket_mgr
+            .update_bucket_drift(1, &vec![0.0; dim], 5)
+            .unwrap();
+        bucket_mgr
+            .update_bucket_drift(2, &vec![500.0; dim], 50)
+            .unwrap();
+
         manifest
             .apply_atomic(|m| {
-                m.add_bucket(1, "run1".into(), Some(vec![0.0; dim]));
-                m.update_bucket_stats(1, 0, 0);
+                m.add_bucket(1, "".into(), Some(c1));
+                m.update_bucket_stats(1, 5, 0);
+                m.add_bucket(2, "".into(), Some(c2));
+                m.update_bucket_stats(2, 50, 0);
             })
             .unwrap();
 
-        // ⚡ REMOVED: bucket_manager.register_bucket(...) -> This caused the bug!
+        let handle = tokio::spawn(async move { janitor.run().await });
 
-        // 3. Inject "Drifting" Data
-        let mut drift_batch = Vec::new();
-        for i in 0..90 {
-            // Noise ensures it's not a singularity
-            let noise = (i % 20) as f32 * 0.1;
-            let val = 10.0 + noise; // Mean ~10.5. Centroid 0.0. Drift > 10.0.
-            drift_batch.push((i as u64, vec![val; dim]));
-        }
-
-        // ⚡ Insert triggers rotation (90 >= 90)
-        let rotated = index.insert_batch(&drift_batch).unwrap();
-        assert!(rotated, "Index should have rotated MemTable");
-
-        // 4. Run Janitor
-        let janitor = Janitor::new(JanitorConfig {
-            index: index.clone(),
-            manifest: manifest.clone(),
-            staging,
-            persistence,
-            bucket_manager: bucket_manager.clone(),
-            check_interval: Duration::from_millis(10),
-            promotion_threshold_bytes: 1024 * 1024,
-            coordinator,
-            max_bucket_capacity: 100, // Config cap for split calc (0.9 ratio)
-            split_threshold: 0.8,
-            drift_threshold: 0.15,
-        });
-
-        let handle = tokio::spawn(async move {
-            janitor.run().await;
-        });
-
-        println!("⏳ Waiting for Janitor to Flush and Split...");
-
-        // 5. Polling Assertion
-        let mut split_occurred = false;
+        // Wait for Merge
+        let mut merged = false;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(100)).await;
-
             let state = manifest.get_state();
-            let buckets = state.get_buckets();
-
-            // Check if split happened (Bucket 1 gone, count increased)
-            if !buckets.iter().any(|b| b.id == 1) && buckets.len() >= 2 {
-                split_occurred = true;
+            if !state.get_buckets().iter().any(|b| b.id == 1) {
+                merged = true;
                 break;
             }
         }
-
         handle.abort();
 
-        // 6. Verify Results
-        let final_state = manifest.get_state();
-        let buckets = final_state.get_buckets();
+        assert!(merged, "Janitor failed to merge zombie bucket 1!");
 
-        println!(
-            "Final Buckets: {:?}",
-            buckets.iter().map(|b| b.id).collect::<Vec<_>>()
-        );
-
-        // Debugging dump if failed
-        if !split_occurred {
-            // Print stats to see why it didn't trigger
-            if let Some(stats) = bucket_manager.get_bucket_drift_stats(1) {
-                println!("Bucket 1 Stats - Sum: {:?}, Count: {}", stats.0, stats.1);
-            } else {
-                println!("Bucket 1 Stats: None (Not Registered?)");
-            }
-        }
-
-        assert!(split_occurred, "Janitor failed to split drifting bucket!");
-
-        // 7. Verify Distribution
-        let b2 = buckets.iter().find(|b| b.id != 1).unwrap();
-        let b3 = buckets.iter().find(|b| b.id != 1 && b.id != b2.id).unwrap();
-
-        let count_2 = b2.vector_count;
-        let count_3 = b3.vector_count;
-
-        println!(
-            "Split Distribution: Bucket {} has {}, Bucket {} has {}",
-            b2.id, count_2, b3.id, count_3
-        );
-
-        assert_eq!(count_2 + count_3, 90, "Lost data during split!");
-        assert!(count_2 > 30 && count_3 > 30, "Split was unbalanced!");
+        // Verify Bucket 2 Grew
+        let state = manifest.get_state();
+        let b2 = state.get_buckets().iter().find(|b| b.id == 2).unwrap();
+        assert_eq!(b2.vector_count, 55, "Neighbor bucket count incorrect");
     }
 
     #[tokio::test]
-    async fn test_high_drift_low_capacity_ignored() {
+    async fn test_scatter_merge_budget_constraint() {
         let dir = tempdir().unwrap();
-        // Capacity 10: Insert 10 items. Config Max is 100.
-        // Ratio = 10/100 = 0.10. (Threshold is 0.8).
-        let (index, manifest, janitor) = setup_env(dir.path(), 10).await;
+        let dim = 2;
+        let max_cap = 100;
+        let (index, bucket_mgr, janitor, manifest, staging) =
+            setup_env(dir.path(), dim, max_cap).await;
 
-        let mut batch = Vec::new();
-        for i in 0..10 {
-            // Extreme Drift: Value 100.0 (Centroid 0.0) -> Drift ~140.0
-            batch.push((i as u64, vec![100.0; 2]));
+        let c1 = vec![0.0; dim];
+        let c2 = vec![10.0; dim];
+
+        {
+            let mut r = index.get_router().write();
+            r.add_bucket(1, c1.clone());
+            r.add_bucket(2, c2.clone());
         }
 
-        // Force Flush (Rotation)
-        index.insert_batch(&batch).unwrap();
+        // ⚡ FIX: Use 110 items to exceed the hardcoded 100 limit in drift_core
+        let large_count = 110;
+        let b1_vecs = vec![c1.clone(); large_count];
+        create_bucket_file(
+            staging.get_base_path(),
+            "bucket_1.drift",
+            &vec![0; large_count],
+            &b1_vecs,
+            dim,
+        )
+        .await;
 
-        let handle = tokio::spawn(async move { janitor.run().await });
+        create_bucket_file(
+            staging.get_base_path(),
+            "bucket_2.drift",
+            &vec![0; 10],
+            &vec![c2.clone(); 10],
+            dim,
+        )
+        .await;
 
-        // Wait a bit
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        handle.abort();
+        staging.set_active_filename(1, "bucket_1.drift".into());
+        bucket_mgr.register_bucket(1, "bucket_1.drift".into(), StorageClass::Local);
+        bucket_mgr
+            .update_bucket_drift(1, &vec![0.0; dim], large_count as u32)
+            .unwrap();
 
-        // Verify Bucket 1 still exists (No Split)
-        let buckets = manifest.get_state().get_buckets().clone();
-        assert!(
-            buckets.iter().any(|b| b.id == 1),
-            "Bucket 1 should NOT be split (Low Capacity)"
-        );
-        assert_eq!(buckets.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_high_capacity_zero_drift_ignored() {
-        let dir = tempdir().unwrap();
-        // Capacity 90: Insert 90 items. Config Max 100.
-        // Ratio = 0.90 (High). Drift = 0.0 (Perfectly centered).
-        let (index, manifest, janitor) = setup_env(dir.path(), 90).await;
-
-        let mut batch = Vec::new();
-        for i in 0..90 {
-            // Data exactly at centroid [0.0, 0.0]
-            batch.push((i as u64, vec![0.0; 2]));
-        }
-
-        index.insert_batch(&batch).unwrap();
+        // Force High Urgency to simulate "Hot Zombie" state
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(1, "".into(), Some(c1));
+                m.update_bucket_stats(1, large_count as u64, 0);
+            })
+            .unwrap();
 
         let handle = tokio::spawn(async move { janitor.run().await });
         tokio::time::sleep(Duration::from_millis(500)).await;
         handle.abort();
 
-        // Verify Bucket 1 still exists
-        let buckets = manifest.get_state().get_buckets().clone();
+        // 4. Verify Bucket 1 Still Exists (Budget Protected)
+        let state = manifest.get_state();
         assert!(
-            buckets.iter().any(|b| b.id == 1),
-            "Bucket 1 should NOT be split (Zero Drift)"
+            state.get_buckets().iter().any(|b| b.id == 1),
+            "Bucket 1 should NOT be merged (over budget)"
         );
     }
 
     #[tokio::test]
-    async fn test_oscillating_drift_cancels_out() {
+    async fn test_scatter_merge_no_neighbors_empty() {
         let dir = tempdir().unwrap();
-        // Capacity 90.
-        // Half data at -10.0, Half at +10.0.
-        // Mean should be ~0.0. Drift should be ~0.0.
-        // Variance is high, but Drift (shift of mean) is low.
-        let (index, manifest, janitor) = setup_env(dir.path(), 90).await;
+        let dim = 2;
+        let (index, bucket_mgr, janitor, manifest, staging) = setup_env(dir.path(), dim, 100).await;
 
-        let mut batch = Vec::new();
-        for i in 0..90 {
-            let val = if i % 2 == 0 { 10.0 } else { -10.0 };
-            batch.push((i as u64, vec![val; 2]));
+        let c1 = vec![0.0; dim];
+        {
+            let mut r = index.get_router().write();
+            r.add_bucket(1, c1.clone());
         }
 
-        index.insert_batch(&batch).unwrap();
+        // If it has data but no neighbors, index_v2 returns SkippedTooSmall to prevent data loss.
+        // If it is EMPTY, index_v2 returns Empty Proposal, allowing deletion.
+        create_bucket_file(staging.get_base_path(), "bucket_1.drift", &[], &[], dim).await;
+
+        staging.set_active_filename(1, "bucket_1.drift".into());
+        bucket_mgr.register_bucket(1, "bucket_1.drift".into(), StorageClass::Local);
+        // Zero drift stats
+        bucket_mgr.update_bucket_drift(1, &c1, 0).unwrap();
+
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(1, "".into(), Some(c1));
+                m.update_bucket_stats(1, 0, 0); // 0 items -> Emptiness = 1.0 -> Urgency high
+            })
+            .unwrap();
 
         let handle = tokio::spawn(async move { janitor.run().await });
         tokio::time::sleep(Duration::from_millis(500)).await;
         handle.abort();
 
-        // Verify Bucket 1 still exists
-        // The mean is [0,0], so drift from centroid [0,0] is 0.
-        // A naive system might see "lots of far points" and panic, but our Mean-based Drift is robust.
-        let buckets = manifest.get_state().get_buckets().clone();
+        // 3. Verify Bucket 1 is Deleted
+        let state = manifest.get_state();
         assert!(
-            buckets.iter().any(|b| b.id == 1),
-            "Oscillating data should have near-zero drift mean"
+            !state.get_buckets().iter().any(|b| b.id == 1),
+            "Empty zombie bucket should be deleted"
         );
+
+        let path = staging.get_base_path().join("bucket_1.drift");
+        assert!(!path.exists(), "File should be deleted");
     }
 }

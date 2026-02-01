@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::janitor_v2::{Janitor, JanitorConfig};
+    use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
     use crate::local_staging::LocalStagingManager;
     use crate::manifest::ServerManifestManager;
     use crate::persistence_v2::PersistenceManager;
@@ -89,12 +89,15 @@ mod tests {
             staging,
             persistence: persistence.clone(),
             bucket_manager: bucket_manager.clone(),
-            check_interval: Duration::from_millis(100),
-            promotion_threshold_bytes: 1024,
             coordinator,
-            max_bucket_capacity: 2000,
-            split_threshold: 0.8,
-            drift_threshold: 0.15,
+            vars: JanitorVars {
+                check_interval: Duration::from_millis(100),
+                promotion_threshold_bytes: 1024,
+                max_bucket_capacity: 2000,
+                split_threshold: 0.8,
+                drift_threshold: 0.15,
+                ..Default::default()
+            },
         });
 
         (index, bucket_manager, janitor, manifest, persistence)

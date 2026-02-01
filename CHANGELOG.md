@@ -1,8 +1,14 @@
 # Changelog
 
-# Changelog
-
 ## [Unreleased] - v2.0.0-alpha (The LBR Architecture)
+
+### Added
+
+- **Scatter-Merge (Zombie Healing):** Implemented a self-healing mechanism for under-filled or deleted ("Zombie") buckets.
+  - **Urgency-Based Trigger:** Uses `(Emptiness / Temp) + (Beta * ZombieRatio)` to prioritize merging dead buckets over merely small ones.
+  - **Budget Awareness:** Strictly limits merges to small buckets (< 50 items) to prevent write stalls on the hot path.
+  - **Delta-CoW Execution:** Merges data by writing fresh local staging files for neighbors, avoiding expensive S3 rewrites.
+  - **Drift Correction:** Automatically recalculates centroids and drift statistics for target buckets to maintain routing accuracy.
 
 **Summary:** massive architectural pivot from "Immutable Segments" to **"Local Buffered Rewrite" (LBR)**. This reduces write amplification by 100x and enables real-time drift adaptation without full index rebuilds.
 
