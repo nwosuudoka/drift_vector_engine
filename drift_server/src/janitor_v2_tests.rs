@@ -1018,3 +1018,222 @@ mod janitor_scatter_merge_test {
         assert!(!path.exists(), "File should be deleted");
     }
 }
+
+#[cfg(test)]
+mod janitor_promotion_test {
+    use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
+    use crate::local_staging::LocalStagingManager;
+    use crate::manifest::ServerManifestManager;
+    use crate::persistence_v2::PersistenceManager;
+    use drift_core::index_v2::VectorIndex;
+    use drift_core::lock_manager::BucketCoordinator;
+    use drift_core::math::Metric;
+    use drift_core::partitioner::PartitionGroup;
+    use drift_core::quantizer::Quantizer;
+    use drift_core::router::Router;
+    use drift_core::wal_v2::WalManager;
+    use drift_kv::bitstore::BitStore;
+    use drift_storage::bucket_file_writer::BucketFileWriter;
+    use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_traits::StorageEngine;
+    use opendal::{Operator, services};
+    use parking_lot::{Mutex, RwLock};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn create_fs_operator(path: &std::path::Path) -> Operator {
+        let builder = services::Fs::default().root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
+    /// Helper to write a valid .drift segment file manually (simulating an old S3 flush)
+    async fn create_s3_segment(
+        dir: &std::path::Path,
+        filename: &str,
+        ids: &[u64],
+        vecs: &[Vec<f32>],
+        dim: usize,
+    ) {
+        let path = dir.join(filename);
+        let file = std::fs::File::create(&path).unwrap();
+
+        let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
+        let q = Quantizer::train(&flat, dim);
+
+        // We use new_streaming to create a proper segment with header/footer
+        let mut writer = BucketFileWriter::new_streaming(file, [1u8; 16], q, dim).unwrap();
+        writer.write_batch(ids, &flat).unwrap();
+        writer.finalize().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_janitor_promotion_merges_tiers_and_purges_deletes() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let dim = 2;
+        let bucket_id = 1;
+
+        // --- SETUP COMPONENTS ---
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
+        let staging = Arc::new(LocalStagingManager::new(&data_dir).unwrap());
+        let op = create_fs_operator(&data_dir); // Shared Operator for S3 simulation
+        let persistence = Arc::new(PersistenceManager::new(op.clone()));
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let bucket_manager = Arc::new(BucketManager::new(
+            op.clone(), // Remote
+            op.clone(), // Local (reused for test simplicity, usually staging)
+            4,
+            coordinator.clone(),
+        ));
+
+        let wal = Arc::new(Mutex::new(WalManager::new(dir.path().join("wal")).unwrap()));
+        let kv = Arc::new(BitStore::new(dir.path().join("kv")).unwrap());
+        let router = Arc::new(RwLock::new(Router::empty(dim, Metric::L2)));
+        let index = Arc::new(VectorIndex::new(
+            dim,
+            100,
+            router,
+            wal,
+            bucket_manager.clone(),
+            kv,
+        ));
+
+        // --- PREPARE DATA ---
+
+        // 1. Remote Base (Old S3 Segment) - IDs 0..10
+        // We simulate a previous run "run_OLD"
+        let remote_ids: Vec<u64> = (0..10).collect();
+        let remote_vecs = vec![vec![1.0, 1.0]; 10];
+        create_s3_segment(
+            &data_dir,
+            "bucket_1_run_OLD.drift",
+            &remote_ids,
+            &remote_vecs,
+            dim,
+        )
+        .await;
+
+        // 2. Local Staging (New Delta) - IDs 10..20
+        let local_ids: Vec<u64> = (10..20).collect();
+        let mut group = PartitionGroup::new(dim, None);
+        group.ids = local_ids.clone();
+        for _ in 0..10 {
+            group.flat_vectors.extend_from_slice(&[2.0, 2.0]);
+        }
+        group.count = 10;
+
+        // Write to staging and register as Active
+        staging.append_batch(bucket_id, &group).await.unwrap();
+
+        // Register the Tiered State (simulating startup or previous operations)
+        // Note: Janitor expects a file in staging to exist for promotion logic
+        let staging_file = staging.get_active_filename(bucket_id);
+
+        bucket_manager.register_bucket(
+            bucket_id,
+            "bucket_1_run_OLD.drift".to_string(), // Currently pointing to remote
+            StorageClass::Tiered {
+                remote_path: "bucket_1_run_OLD.drift".to_string(),
+                local_path: staging_file.clone(), // But also has local data
+            },
+        );
+
+        // [FIX START]: Register the bucket in the manifest so the Janitor knows to check it
+        manifest
+            .apply_atomic(|m| {
+                // 1. Create the bucket entry
+                m.add_bucket(
+                    bucket_id,
+                    "run_OLD".to_string(),
+                    Some(vec![0.0; dim]), // Dummy centroid
+                );
+                // 2. Update its statistics
+                m.update_bucket_stats(bucket_id, 10, 0); // Initial count before merge
+            })
+            .unwrap();
+        // [FIX END]
+
+        // 3. Mark Deletes (One from Remote, One from Local)
+        // ID 5 (Remote) and ID 15 (Local)
+        bucket_manager.mark_delete(bucket_id, 5).unwrap();
+        bucket_manager.mark_delete(bucket_id, 15).unwrap();
+
+        assert_eq!(
+            bucket_manager.get_tombstones(bucket_id).len(),
+            2,
+            "Tombstones should be registered"
+        );
+
+        // --- EXECUTE PROMOTION ---
+
+        let janitor = Janitor::new(JanitorConfig {
+            index: index.clone(),
+            manifest: manifest.clone(),
+            staging: staging.clone(),
+            persistence: persistence.clone(),
+            bucket_manager: bucket_manager.clone(),
+            coordinator: coordinator.clone(),
+            vars: JanitorVars {
+                promotion_threshold_bytes: 1, // Force promotion (file > 1 byte)
+                check_interval: Duration::from_millis(100),
+                ..Default::default()
+            },
+        });
+
+        // Trigger explicitly
+        janitor.promote_segments().await.expect("Promotion failed");
+
+        // --- VERIFY RESULTS ---
+
+        // 1. Check Manifest
+        let state = manifest.get_state();
+        let b1 = state
+            .get_buckets()
+            .iter()
+            .find(|b| b.id == bucket_id)
+            .unwrap(); // This should now succeed
+
+        // Count should be 18 (20 total - 2 deleted)
+        assert_eq!(
+            b1.vector_count, 18,
+            "Manifest count should match merged & purged data"
+        );
+        assert_ne!(b1.run_id, "run_OLD", "Run ID should update");
+
+        // 2. Check S3 File Content
+        let new_key = format!("bucket_1_{}.drift", b1.run_id);
+        assert!(
+            op.exists(&new_key).await.unwrap(),
+            "New S3 segment should exist"
+        );
+
+        let (stored_ids, _) = persistence
+            .read_remote_bucket(bucket_id, &b1.run_id)
+            .await
+            .unwrap();
+        assert_eq!(stored_ids.len(), 18);
+        assert!(!stored_ids.contains(&5), "ID 5 should be purged");
+        assert!(!stored_ids.contains(&15), "ID 15 should be purged");
+        assert!(stored_ids.contains(&0), "ID 0 should remain");
+        assert!(stored_ids.contains(&19), "ID 19 should remain");
+
+        // 3. Check Memory Reconcile (Pruning)
+        // The bucket's specific tombstones should now be empty (since we flushed them)
+        let remaining_tombstones = bucket_manager.get_tombstones(bucket_id);
+        assert!(
+            remaining_tombstones.is_empty(),
+            "Memory tombstones should be pruned after flush"
+        );
+
+        // 4. Check Cleanup
+        // Staging file should be gone
+        let staging_path = staging.get_base_path().join(staging_file);
+        assert!(!staging_path.exists(), "Staging file should be deleted");
+
+        // Old S3 file should be gone
+        let old_path = data_dir.join("bucket_1_run_OLD.drift");
+        assert!(!old_path.exists(), "Old S3 segment should be deleted");
+    }
+}

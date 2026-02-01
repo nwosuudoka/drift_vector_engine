@@ -62,10 +62,14 @@ mod tests {
             })
             .unwrap();
 
-        // B. Promote to S3
+        // B. Promote to S3 (Simulating Janitor Logic)
+        // 1. Read Local
         let (local_ids, local_vecs) = staging.read_full_bucket(bucket_id).await.unwrap();
+
+        // 2. Read Remote (None here)
+        // 3. Write New S3 Segment using the new primitive
         let (new_run_id, _) = persistence
-            .promote_to_s3(bucket_id, &local_ids, &local_vecs, None, dim)
+            .write_remote_bucket(bucket_id, &local_ids, &local_vecs, dim)
             .await
             .unwrap();
 
@@ -80,7 +84,6 @@ mod tests {
 
         // C. Recover
         let bucket_manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator.clone());
-        // Fix: Pass data_dir so it looks in data_dir/staging
         let recovery = RecoveryManager::new(&data_dir, manifest.clone());
 
         let (router_lock, _replay) = recovery
@@ -154,7 +157,6 @@ mod tests {
 
         // 4. Recover
         let coordinator = Arc::new(BucketCoordinator::new());
-        // ⚡ Pass local_op (staging rooted)
         let bucket_manager = BucketManager::new(local_op, remote_op, 1, coordinator.clone());
 
         let recovery = RecoveryManager::new(&data_dir, manifest.clone());
@@ -167,8 +169,6 @@ mod tests {
         // 5. Verify Priority
         let (path, class) = bucket_manager.get_location(bucket_id).unwrap();
 
-        // RecoveryManager registers "bucket_1.drift".
-        // Since bucket_manager.local_op is rooted at staging/, this resolves correctly.
         assert!(
             path.contains("bucket_1.drift"),
             "Recovery failed to prefer Local Staging. Got: {}",
@@ -191,7 +191,6 @@ mod tests {
         let wal_dir = dir.path().join("wal").join("test_col");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Recovery expects .log extensions for WAL segments
         let wal_path = wal_dir.join("wal_1.log");
 
         let dim = 8;
@@ -209,10 +208,8 @@ mod tests {
         }
 
         // 2. Recover
-        // We use dir.path() here because we aren't testing staging resolution
         let recovery = RecoveryManager::new(dir.path(), manifest.clone());
 
-        // Pass the directory containing the WAL file
         let (router, replay_data) = recovery
             .recover(&bucket_manager, dim, &wal_dir)
             .await

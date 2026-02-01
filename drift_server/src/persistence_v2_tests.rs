@@ -169,3 +169,113 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod persistence_integration_tests {
+    use crate::persistence_v2::PersistenceManager;
+    use drift_storage::bucket_file_reader::BucketFileReader;
+    use opendal::{Operator, services};
+    use tempfile::tempdir;
+
+    // --- Helpers ---
+
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let builder = services::Fs::default().root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
+    fn mock_data(start_id: u64, count: usize, dim: usize, val: f32) -> (Vec<u64>, Vec<Vec<f32>>) {
+        let ids: Vec<u64> = (0..count as u64).map(|i| start_id + i).collect();
+        let vecs: Vec<Vec<f32>> = (0..count).map(|_| vec![val; dim]).collect();
+        (ids, vecs)
+    }
+
+    #[tokio::test]
+    async fn test_persistence_promotion_and_merge_flow() {
+        // Setup
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op.clone());
+        let bucket_id = 1;
+        let dim = 4;
+
+        // ==========================================================
+        // PHASE 1: Initial Promotion (Local Staging -> S3)
+        // ==========================================================
+        println!("Phase 1: Initial Promotion...");
+        let (ids_1, vecs_1) = mock_data(0, 10, dim, 1.0); // IDs 0-9, Value 1.0
+
+        // ⚡ CHANGE: Use atomic write_remote_bucket
+        let (run_id_1, count_1) = persistence
+            .write_remote_bucket(bucket_id, &ids_1, &vecs_1, dim)
+            .await
+            .expect("Initial promotion failed");
+
+        assert_eq!(count_1, 10);
+        let key_1 = format!("bucket_{}_{}.drift", bucket_id, run_id_1);
+
+        // Verify file exists
+        assert!(op.exists(&key_1).await.unwrap());
+
+        // ==========================================================
+        // PHASE 2: Merge Promotion (New Local + Old S3 -> New S3)
+        // ==========================================================
+        println!("Phase 2: Merge Promotion...");
+        let (ids_2, vecs_2) = mock_data(10, 10, dim, 2.0); // IDs 10-19, Value 2.0
+
+        // ⚡ CHANGE: Explicitly Fetch + Merge + Write
+
+        // A. Read Remote (Base)
+        let (remote_ids, remote_vecs) = persistence
+            .read_remote_bucket(bucket_id, &run_id_1)
+            .await
+            .expect("Failed to read remote bucket");
+
+        // B. Merge in Memory (Local Delta + Remote Base)
+        // Note: We simulate the Janitor's append logic (Local first, then Remote)
+        let mut merged_ids = ids_2.clone();
+        let mut merged_vecs = vecs_2.clone();
+        merged_ids.extend(remote_ids);
+        merged_vecs.extend(remote_vecs);
+
+        // C. Write New Segment
+        let (run_id_2, count_2) = persistence
+            .write_remote_bucket(bucket_id, &merged_ids, &merged_vecs, dim)
+            .await
+            .expect("Merge promotion failed");
+
+        assert_eq!(count_2, 20, "Should contain 10 old + 10 new items");
+        let key_2 = format!("bucket_{}_{}.drift", bucket_id, run_id_2);
+
+        // ==========================================================
+        // PHASE 3: Verification (Read Back)
+        // ==========================================================
+        println!("Phase 3: Verify Merged Data...");
+
+        let mut reader = BucketFileReader::open(op.clone(), &key_2)
+            .await
+            .expect("Failed to open merged file");
+
+        let (read_ids, read_vecs) = reader
+            .read_all_vectors()
+            .await
+            .expect("Failed to read vectors");
+
+        // Check Counts
+        assert_eq!(read_ids.len(), 20);
+        assert_eq!(read_vecs.len(), 20);
+
+        // Check Content
+        // We merged [10..19] (Local) then [0..9] (Remote).
+
+        // Verify ID 10 (Local) is present and has value 2.0
+        let idx_10 = read_ids.iter().position(|&x| x == 10).unwrap();
+        assert_eq!(read_vecs[idx_10][0], 2.0);
+
+        // Verify ID 0 (Remote) is present and has value 1.0
+        let idx_0 = read_ids.iter().position(|&x| x == 0).unwrap();
+        assert_eq!(read_vecs[idx_0][0], 1.0);
+
+        println!("✅ Persistence Integration Test Passed!");
+    }
+}

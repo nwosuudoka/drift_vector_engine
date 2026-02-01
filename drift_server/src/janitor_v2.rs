@@ -214,7 +214,7 @@ impl Janitor {
         Ok(())
     }
 
-    async fn promote_segments(&self) -> io::Result<()> {
+    pub(crate) async fn promote_segments(&self) -> io::Result<()> {
         let threshold = self.vars.promotion_threshold_bytes;
         let candidates = self.staging.list_large_buckets(threshold)?;
 
@@ -225,12 +225,12 @@ impl Janitor {
         info!("JanitorV2: Promoting {} buckets to S3...", candidates.len());
 
         for bucket_id in candidates {
-            // 🔒 ACQUIRE HEAVY WRITE LOCK
-            // No searchers can read this bucket while we hold this.
-            // This guarantees safety without complex Reaper logic.
+            // 🔒 Lock Bucket (Prevents split/merge/compact during promotion)
             let _lock_guard = self.coordinator.write(bucket_id).await;
 
-            // 1. GENERATE UNIQUE FILENAMES
+            let tombstone_snapshot = self.bucket_manager.get_tombstones(bucket_id);
+
+            // 1. Rotate Local File
             let staging_filename = format!(
                 "bucket_{}_staging_{}.drift",
                 bucket_id,
@@ -238,18 +238,15 @@ impl Janitor {
             );
             let new_filename = format!("bucket_{}_{}.drift", bucket_id, uuid::Uuid::new_v4());
 
-            // 2. ROTATE (Active -> Staging)
             let rotated = self
                 .staging
                 .rotate_bucket_for_promotion(bucket_id, &staging_filename, &new_filename)
                 .await?;
-
             if !rotated {
                 continue;
             }
 
-            // 3. CHECK STATE & UPDATE REGISTRY (Atomic Swap to Promoting)
-            // Even though we have a lock, we update registry so that IF we crash or unlock, state is valid.
+            // 2. Update Registry to "Promoting" state
             let remote_path_opt = if let Some(ver) = self.bucket_manager.get_version(bucket_id) {
                 match &ver.class {
                     StorageClass::Tiered { remote_path, .. } => Some(remote_path.clone()),
@@ -265,67 +262,87 @@ impl Janitor {
                 local_frozen: staging_filename.clone(),
                 remote_path: remote_path_opt.clone(),
             };
-
-            // We do NOT need to send the old version to Reaper here because we hold the lock!
-            // No one else can be reading the old version.
             self.bucket_manager
                 .register_bucket(bucket_id, new_filename.clone(), promoting_class);
 
-            // 4. UPLOAD (Slow IO - blocking search on this bucket)
-            let (ids, vecs) = self.staging.read_file_content(&staging_filename).await?;
-            if ids.is_empty() {
+            // --- ⚡ EXPLICIT MERGE & FILTER LOGIC ---
+
+            // A. Read Local Staging
+            let (mut merged_ids, mut merged_vecs) =
+                self.staging.read_file_content(&staging_filename).await?;
+            if merged_ids.is_empty() {
                 let _ = self.staging.delete_file(&staging_filename).await;
                 continue;
             }
 
-            let old_run_id = {
-                let m = self.manifest.get_state();
-                m.get_buckets()
-                    .iter()
-                    .find(|b| b.id == bucket_id)
-                    .map(|b| b.run_id.clone())
-                    .filter(|s| !s.is_empty())
-            };
+            // B. Read Remote (if exists)
+            if let Some(path) = &remote_path_opt {
+                // Extract RunID from path "bucket_{id}_{uuid}.drift"
+                if let Some(run_id) = path
+                    .strip_prefix(&format!("bucket_{}_", bucket_id))
+                    .and_then(|s| s.strip_suffix(".drift"))
+                {
+                    let (r_ids, r_vecs) = self
+                        .persistence
+                        .read_remote_bucket(bucket_id, run_id)
+                        .await?;
+                    merged_ids.extend(r_ids);
+                    merged_vecs.extend(r_vecs);
+                }
+            }
 
+            // C. Snapshot Tombstones (Atomic Arc clone)
+
+            // D. Filter (Purge)
+            let mut final_ids = Vec::with_capacity(merged_ids.len());
+            let mut final_vecs = Vec::with_capacity(merged_vecs.len());
+
+            for (id, vec) in merged_ids.into_iter().zip(merged_vecs.into_iter()) {
+                if !tombstone_snapshot.contains(&id) {
+                    final_ids.push(id);
+                    final_vecs.push(vec);
+                }
+            }
+
+            let final_count = final_ids.len() as u32;
+
+            // E. Write to S3
             let dim = self.index.get_dim();
-            let (new_run_id, final_count) = self
+            let (new_run_id, _) = self
                 .persistence
-                .promote_to_s3(bucket_id, &ids, &vecs, old_run_id, dim)
+                .write_remote_bucket(bucket_id, &final_ids, &final_vecs, dim)
                 .await?;
 
-            // 5. FINALIZE (Promoting -> Tiered)
+            // --- END EXPLICIT LOGIC ---
+
+            // 3. Finalize Registry (Tiered)
             let new_remote_path = format!("bucket_{}_{}.drift", bucket_id, new_run_id);
             let tiered_class = StorageClass::Tiered {
                 remote_path: new_remote_path.clone(),
                 local_path: new_filename.clone(),
             };
-
             self.bucket_manager
                 .register_bucket(bucket_id, new_remote_path, tiered_class);
 
-            // 6. UPDATE MANIFEST
-            self.manifest.apply_atomic(|m| {
-                m.update_bucket_run_id(bucket_id, new_run_id.clone());
-                m.update_bucket_stats(bucket_id, final_count, 0);
-            })?;
+            // 4. ⚡ RECONCILE: Prune the specific deletions we just handled
+            self.bucket_manager
+                .prune_tombstones(bucket_id, &tombstone_snapshot);
 
-            // 7. CLEANUP (Immediate & Safe)
-            // Because we hold the Write Lock, no Searcher is accessing `staging_filename` or `old_remote_path`.
-            // We can delete them immediately.
-
-            // Delete Local Staging
-            info!("JanitorV2: Cleaning up staging {}", staging_filename);
-            let _ = self.staging.delete_file(&staging_filename).await;
-
-            // Delete Old S3 File
-            if let Some(old_path) = remote_path_opt {
-                info!("JanitorV2: Cleaning up old S3 segment {}", old_path);
-                let _ = self.persistence.delete_file(&old_path).await;
+            // 5. Update Manifest
+            // Get fresh stats for atomic update (retains any NEW tombstones that arrived during upload)
+            if let Some(stats) = self.bucket_manager.get_bucket_stats(bucket_id) {
+                self.manifest.apply_atomic(|m| {
+                    m.update_bucket_run_id(bucket_id, new_run_id.clone());
+                    m.update_bucket_stats(bucket_id, final_count as u64, stats.tombstone_count);
+                })?;
             }
 
-            info!("JanitorV2: Promoted Bucket {} -> {}", bucket_id, new_run_id);
-        } // 🔓 LOCK RELEASED HERE
-
+            // 6. Cleanup
+            let _ = self.staging.delete_file(&staging_filename).await;
+            if let Some(old_path) = remote_path_opt {
+                let _ = self.persistence.delete_file(&old_path).await;
+            }
+        }
         Ok(())
     }
 

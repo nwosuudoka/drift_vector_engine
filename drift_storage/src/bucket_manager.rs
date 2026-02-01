@@ -147,6 +147,39 @@ impl BucketManager {
         self.get_version(bucket_id)
             .map(|v| (v.path.clone(), v.class.clone()))
     }
+
+    pub fn get_tombstones(&self, bucket_id: u32) -> Arc<HashSet<u64>> {
+        let reg = self.registry.read();
+        if let Some(state) = reg.get(&bucket_id) {
+            return state.tombstones.read().clone();
+        }
+        Arc::new(HashSet::new())
+    }
+
+    /// This handles the race condition where new deletes arrive during promotion.
+    pub fn prune_tombstones(&self, bucket_id: u32, processed_ids: &HashSet<u64>) {
+        let reg = self.registry.read();
+        if let Some(state) = reg.get(&bucket_id) {
+            let mut guard = state.tombstones.write();
+
+            // COW: Clone the current set (which might contain NEW deletes)
+            let mut new_set = (**guard).clone();
+
+            // Remove ONLY the ones we successfully persisted/purged
+            // This leaves any "new" deletes untouched.
+            let len_before = new_set.len();
+            new_set.retain(|id| !processed_ids.contains(id));
+            let len_after = new_set.len();
+
+            *guard = Arc::new(new_set);
+
+            // Update the atomic counter
+            let removed_count = (len_before - len_after) as u32;
+            state
+                .tombstone_count
+                .fetch_sub(removed_count, Ordering::Relaxed);
+        }
+    }
 }
 
 #[async_trait::async_trait]
