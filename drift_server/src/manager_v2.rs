@@ -189,6 +189,8 @@ impl CollectionManager {
             promotion_threshold_bytes: 16 * 1024 * 1024,
             coordinator,
             max_bucket_capacity,
+            split_threshold: 0.8,
+            drift_threshold: 0.15,
         };
 
         let janitor = Janitor::new(janitor_config);

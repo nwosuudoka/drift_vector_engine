@@ -124,6 +124,16 @@ pub trait StorageEngine: Send + Sync {
     fn mark_delete(&self, bucket_id: u32, vector_id: u64) -> Result<()>;
     fn get_bucket_stats(&self, bucket_id: u32) -> Option<BucketStats>;
 
+    /// Called by Janitor after flushing new vectors to disk.
+    fn update_bucket_drift(
+        &self,
+        bucket_id: u32,
+        delta_sum: &[f32],
+        delta_count: u32,
+    ) -> Result<()>;
+    /// Returns None if bucket not found.
+    fn get_bucket_drift_stats(&self, bucket_id: u32) -> Option<(Vec<f32>, u32)>;
+
     // Called by Janitor to simulate cooling over time
     fn tick_cooling(&self, decay_rate: f32);
 

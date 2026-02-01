@@ -4,9 +4,10 @@ use crate::persistence_v2::PersistenceManager;
 use crate::reaper::Reaper;
 use drift_core::{index_v2::VectorIndex, lock_manager::BucketCoordinator};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
-use std::io;
+use drift_traits::StorageEngine;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{collections::HashMap, io};
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{error, info};
@@ -21,6 +22,8 @@ pub struct JanitorConfig {
     pub promotion_threshold_bytes: u64,
     pub coordinator: Arc<BucketCoordinator>,
     pub max_bucket_capacity: usize,
+    pub drift_threshold: f32, // Default 0.15
+    pub split_threshold: f32, // Default 0.8
 }
 
 pub struct Janitor {
@@ -34,6 +37,8 @@ pub struct Janitor {
     reaper: Mutex<Reaper>,
     coordinator: Arc<BucketCoordinator>,
     max_bucket_capacity: usize,
+    drift_threshold: f32,
+    split_threshold: f32,
 }
 
 impl Janitor {
@@ -53,6 +58,8 @@ impl Janitor {
             reaper,
             coordinator: config.coordinator,
             max_bucket_capacity: config.max_bucket_capacity,
+            drift_threshold: config.drift_threshold,
+            split_threshold: config.split_threshold,
         }
     }
 
@@ -83,7 +90,7 @@ impl Janitor {
         }
     }
 
-    async fn check_maintainance(&self) {
+    pub(crate) async fn check_maintainance(&self) {
         // Simple heuristic: Scan one bucket per tick to find candidates
         // In prod, use a PriorityQueue or "Dirty Set"
 
@@ -92,16 +99,62 @@ impl Janitor {
         let buckets = self.manifest.get_state().get_buckets().clone();
         let max_cap = self.max_bucket_capacity as f32;
 
+        let (router_centroids, router_ids) = self.index.get_router().read().get_snapshot();
+
+        // Map BucketID -> Centroid
+        let centroid_map: HashMap<u32, Vec<f32>> = router_ids
+            .iter()
+            .zip(router_centroids.chunks(self.index.get_dim()))
+            .map(|(id, vec)| (*id, vec.to_vec()))
+            .collect();
+
         for b in buckets {
-            let cap_ratio = b.vector_count as f32 / max_cap;
+            // 1. Get Live Stats from BucketManager
+            let (current_sum, current_count) =
+                match self.bucket_manager.get_bucket_drift_stats(b.id) {
+                    Some(s) => s,
+                    None => continue, // Bucket might be deleted
+                };
 
-            // TODO: Use actual Drift metric (requires calculating mean vs centroid)
+            // 2. Get Target Centroid
+            let target_centroid = match centroid_map.get(&b.id) {
+                Some(c) => c,
+                None => continue,
+            };
 
-            if cap_ratio > 0.8 {
+            // 3. Calculate Drift
+            // Drift = Dist(Mean, Centroid)
+            let drift_score = if current_count > 0 && !current_sum.is_empty() {
+                let dim = current_sum.len();
+                let n = current_count as f32;
+                let mut dist_sq = 0.0;
+
+                for i in 0..dim {
+                    let mean = current_sum[i] / n;
+                    let diff = mean - target_centroid[i];
+                    dist_sq += diff * diff;
+                }
+                dist_sq.sqrt()
+            } else {
+                0.0
+            };
+
+            let cap_ratio = current_count as f32 / max_cap;
+
+            // 4. Decision: Split if Full OR (Mostly Full AND Drifted)
+            // 0.15 is the Drift Threshold from the paper.
+            if cap_ratio > 1.0
+                || (cap_ratio > self.split_threshold && drift_score > self.drift_threshold)
+            {
+                info!(
+                    "Janitor: Triggering Split for Bucket {} (Cap: {:.2}, Drift: {:.4})",
+                    b.id, cap_ratio, drift_score
+                );
+
                 if let Err(e) = self.perform_split(b.id).await {
                     error!("Janitor: Split failed for {}: {}", b.id, e);
                 }
-                break; // One op per tick
+                break; // Throttle
             }
         }
     }
@@ -119,6 +172,37 @@ impl Janitor {
         for (bucket_id, group) in &partitions {
             let new_count = self.staging.append_batch(*bucket_id, group).await?;
             updates.push((*bucket_id, new_count, group.centroid.clone()));
+
+            // If we update stats for a non-existent bucket, BucketManager ignores it.
+            if self.bucket_manager.get_version(*bucket_id).is_none() {
+                let filename = self.staging.get_active_filename(*bucket_id);
+                self.bucket_manager.register_bucket(
+                    *bucket_id,
+                    filename,
+                    drift_storage::bucket_manager::StorageClass::Local,
+                );
+            }
+
+            // Calculate Delta Sum for Drift Tracking
+            // We iterate the flat vector buffer
+            if group.count > 0 {
+                let dim = group.flat_vectors.len() / group.count;
+                let mut delta_sum = vec![0.0; dim];
+
+                for chunk in group.flat_vectors.chunks_exact(dim) {
+                    for (i, val) in chunk.iter().enumerate() {
+                        delta_sum[i] += val;
+                    }
+                }
+
+                // Push update to BucketManager
+                self.bucket_manager.update_bucket_drift(
+                    *bucket_id,
+                    &delta_sum,
+                    group.count as u32,
+                )?;
+            }
+
             if self.bucket_manager.get_version(*bucket_id).is_none() {
                 let filename = self.staging.get_active_filename(*bucket_id);
                 self.bucket_manager.register_bucket(

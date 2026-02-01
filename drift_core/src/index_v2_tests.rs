@@ -139,6 +139,20 @@ mod tests {
                 Ok((vec![], vec![]))
             }
         }
+
+        fn update_bucket_drift(
+            &self,
+            _bucket_id: u32,
+            _delta_sum: &[f32],
+            _delta_count: u32,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn get_bucket_drift_stats(&self, _bucket_id: u32) -> Option<(Vec<f32>, u32)> {
+            // Return dummy stats for testing
+            Some((vec![], 0))
+        }
     }
 
     // --- SETUP HELPER ---
@@ -585,6 +599,20 @@ mod tests {
 
         async fn fetch_bucket(&self, _bucket_id: u32) -> std::io::Result<(Vec<u64>, Vec<f32>)> {
             Ok((vec![], vec![]))
+        }
+
+        fn update_bucket_drift(
+            &self,
+            _bucket_id: u32,
+            _delta_sum: &[f32],
+            _delta_count: u32,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn get_bucket_drift_stats(&self, _bucket_id: u32) -> Option<(Vec<f32>, u32)> {
+            // Return dummy stats for testing
+            Some((vec![], 0))
         }
     }
 

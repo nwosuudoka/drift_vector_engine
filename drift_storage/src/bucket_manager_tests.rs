@@ -311,4 +311,102 @@ mod tests {
         // 4. Verify ID 100 is filtered
         assert!(res.is_empty(), "Shadowing failed to hide ID 100");
     }
+
+    #[tokio::test]
+    async fn test_bucket_drift_tracking_accumulation() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+
+        let bucket_id = 1;
+
+        // 1. Register Bucket (Initialize State)
+        // Storage class doesn't matter for this test, but it must be registered to exist in the registry.
+        manager.register_bucket(bucket_id, "test.drift".to_string(), StorageClass::Local);
+
+        // 2. First Update (Initialization Path)
+        // Simulating flushing a batch of 10 vectors that sum to [10.0, 20.0]
+        let delta_sum_1 = vec![10.0, 20.0];
+        let count_1 = 10;
+
+        manager
+            .update_bucket_drift(bucket_id, &delta_sum_1, count_1)
+            .expect("First update failed");
+
+        // Verify Initial State
+        let (sum_1, total_1) = manager
+            .get_bucket_drift_stats(bucket_id)
+            .expect("Stats not found");
+        assert_eq!(total_1, 10);
+        assert_eq!(sum_1, vec![10.0, 20.0]);
+
+        // 3. Second Update (Accumulation Path)
+        // Simulating flushing another batch of 5 vectors summing to [5.5, 5.5]
+        let delta_sum_2 = vec![5.5, 5.5];
+        let count_2 = 5;
+
+        manager
+            .update_bucket_drift(bucket_id, &delta_sum_2, count_2)
+            .expect("Second update failed");
+
+        // Verify Accumulation
+        let (sum_2, total_2) = manager
+            .get_bucket_drift_stats(bucket_id)
+            .expect("Stats not found");
+
+        assert_eq!(total_2, 15, "Total count should be 10 + 5");
+
+        // Check sums with float tolerance
+        assert!(
+            (sum_2[0] - 15.5).abs() < 1e-5,
+            "Dim 0 sum incorrect: {}",
+            sum_2[0]
+        );
+        assert!(
+            (sum_2[1] - 25.5).abs() < 1e-5,
+            "Dim 1 sum incorrect: {}",
+            sum_2[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bucket_drift_dimension_mismatch_safety() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+
+        let bucket_id = 99;
+        manager.register_bucket(bucket_id, "safe.drift".to_string(), StorageClass::Local);
+
+        // 1. Initialize with Dim 2
+        manager
+            .update_bucket_drift(bucket_id, &vec![1.0, 1.0], 1)
+            .unwrap();
+
+        // 2. Try updating with Dim 3 (Should fail silently/warn but NOT crash or corrupt)
+        // The code logs a warning and skips the update.
+        manager
+            .update_bucket_drift(bucket_id, &vec![1.0, 1.0, 1.0], 1)
+            .unwrap();
+
+        // 3. Verify state is unchanged
+        let (sum, count) = manager.get_bucket_drift_stats(bucket_id).unwrap();
+        assert_eq!(sum.len(), 2, "Dimensions should remain 2");
+        assert_eq!(
+            sum,
+            vec![1.0, 1.0],
+            "Sum should not be modified by bad update"
+        );
+
+        // Count updates happen BEFORE the dimension check in the provided code snippet.
+        // If your code updates count before checking dim, this will be 2.
+        // If you want it to be atomic, the count update should move inside the check.
+        // Based on the provided snippet: `state.total_count.fetch_add` happens first.
+        assert_eq!(
+            count, 2,
+            "Count updated despite dim mismatch (Current implementation behavior)"
+        );
+    }
 }

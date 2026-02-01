@@ -41,6 +41,7 @@ struct LiveBucketState {
     tombstone_count: AtomicU32,
     temperature: AtomicF32,
     tombstones: RwLock<Arc<HashSet<u64>>>,
+    vector_sum: RwLock<Vec<f32>>,
 }
 
 impl LiveBucketState {
@@ -51,6 +52,7 @@ impl LiveBucketState {
             tombstone_count: AtomicU32::new(0),
             temperature: AtomicF32::new(0.5),
             tombstones: RwLock::new(Arc::new(HashSet::new())),
+            vector_sum: RwLock::new(Vec::new()),
         }
     }
 
@@ -381,5 +383,45 @@ impl StorageEngine for BucketManager {
         }
 
         Ok((merged_ids, merged_vecs_flat))
+    }
+
+    fn update_bucket_drift(
+        &self,
+        bucket_id: u32,
+        delta_sum: &[f32],
+        delta_count: u32,
+    ) -> io::Result<()> {
+        let reg = self.registry.read();
+        if let Some(state) = reg.get(&bucket_id) {
+            // 1. Update Count
+            state.total_count.fetch_add(delta_count, Ordering::Relaxed);
+
+            // 2. Update Sum
+            let mut sum_guard = state.vector_sum.write();
+            if sum_guard.is_empty() {
+                // First update or recovery
+                *sum_guard = delta_sum.to_vec();
+            } else if sum_guard.len() == delta_sum.len() {
+                for (i, val) in sum_guard.iter_mut().enumerate() {
+                    *val += delta_sum[i];
+                }
+            } else {
+                tracing::warn!(
+                    "Dimension mismatch in drift update for bucket {}",
+                    bucket_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn get_bucket_drift_stats(&self, bucket_id: u32) -> Option<(Vec<f32>, u32)> {
+        let reg = self.registry.read();
+        let state = reg.get(&bucket_id)?;
+
+        let sum = state.vector_sum.read().clone();
+        let count = state.total_count.load(Ordering::Relaxed);
+
+        Some((sum, count))
     }
 }

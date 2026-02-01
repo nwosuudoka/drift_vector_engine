@@ -93,6 +93,8 @@ mod tests {
             promotion_threshold_bytes: 1024,
             coordinator,
             max_bucket_capacity: 2000,
+            split_threshold: 0.8,
+            drift_threshold: 0.15,
         });
 
         (index, bucket_manager, janitor, manifest, persistence)
