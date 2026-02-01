@@ -77,7 +77,7 @@ impl Router {
         Some(self.flat_centroids[start..end].to_vec())
     }
 
-    /// ⚡ THE ALGORITHM: Drift-Aware Bucket Selection
+    /// THE ALGORITHM: Drift-Aware Bucket Selection
     /// Returns a list of BucketIDs to scan.
     pub fn select_buckets(
         &self,
@@ -201,6 +201,42 @@ impl Router {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// Returns a lightweight snapshot of the global geometry.
+    /// Used for background maintenance tasks to find "Global Neighbors".
+    pub fn get_snapshot(&self) -> (Vec<f32>, Vec<u32>) {
+        (self.flat_centroids.clone(), self.bucket_ids.clone())
+    }
+
+    pub fn remove_bucket(&mut self, bucket_id: u32) {
+        if let Some(idx) = self.bucket_ids.iter().position(|&id| id == bucket_id) {
+            // Remove ID
+            self.bucket_ids.remove(idx);
+            self.bucket_counts.remove(idx);
+
+            // Remove Vector data (Chunk removal)
+            let start = idx * self.dim;
+            let end = start + self.dim;
+
+            self.flat_centroids.drain(start..end);
+        }
+    }
+
+    pub fn add_bucket(&mut self, bucket_id: u32, centroid: Vec<f32>) {
+        assert_eq!(centroid.len(), self.dim, "Centroid dim mismatch");
+        self.bucket_ids.push(bucket_id);
+        self.bucket_counts.push(0); // Count starts at 0 (updated later via manifest reload or direct set)
+        self.flat_centroids.extend(centroid);
+    }
+
+    pub fn max_bucket_id(&self) -> u32 {
+        self.bucket_ids.iter().copied().max().unwrap_or(0)
+    }
+
+    // Helper used by calculate_split
+    pub fn get_all_centroids_flat(&self) -> Vec<f32> {
+        self.flat_centroids.clone()
     }
 }
 

@@ -20,6 +20,7 @@ pub struct JanitorConfig {
     pub check_interval: Duration,
     pub promotion_threshold_bytes: u64,
     pub coordinator: Arc<BucketCoordinator>,
+    pub max_bucket_capacity: usize,
 }
 
 pub struct Janitor {
@@ -32,6 +33,7 @@ pub struct Janitor {
     promotion_threshold_bytes: u64,
     reaper: Mutex<Reaper>,
     coordinator: Arc<BucketCoordinator>,
+    max_bucket_capacity: usize,
 }
 
 impl Janitor {
@@ -50,6 +52,7 @@ impl Janitor {
             promotion_threshold_bytes: config.promotion_threshold_bytes,
             reaper,
             coordinator: config.coordinator,
+            max_bucket_capacity: config.max_bucket_capacity,
         }
     }
 
@@ -65,14 +68,40 @@ impl Janitor {
                 error!("Janitor: Flush failed: {}", e);
             }
 
-            // 2. Run Reaper (Garbage Collection)
+            // 2. Maintenance (Splits)
+            self.check_maintainance().await;
+
+            // 3. Run Reaper (Garbage Collection)
             let mut reaper = self.reaper.lock().await;
             reaper.run_cycle().await;
             drop(reaper); // Release lock before long operations
 
-            // 3. Check for Promotions (Local -> S3)
+            // 4. Check for Promotions (Local -> S3)
             if let Err(e) = self.promote_segments().await {
                 error!("Janitor: Promotion failed: {}", e);
+            }
+        }
+    }
+
+    async fn check_maintainance(&self) {
+        // Simple heuristic: Scan one bucket per tick to find candidates
+        // In prod, use a PriorityQueue or "Dirty Set"
+
+        // This relies on BucketManager implementing get_all_bucket_ids or similar
+        // Or we iterate Manifest state.
+        let buckets = self.manifest.get_state().get_buckets().clone();
+        let max_cap = self.max_bucket_capacity as f32;
+
+        for b in buckets {
+            let cap_ratio = b.vector_count as f32 / max_cap;
+
+            // TODO: Use actual Drift metric (requires calculating mean vs centroid)
+
+            if cap_ratio > 0.8 {
+                if let Err(e) = self.perform_split(b.id).await {
+                    error!("Janitor: Split failed for {}: {}", b.id, e);
+                }
+                break; // One op per tick
             }
         }
     }
@@ -269,6 +298,89 @@ impl Janitor {
             info!("JanitorV2: Promoted Bucket {} -> {}", bucket_id, new_run_id);
         } // 🔓 LOCK RELEASED HERE
 
+        Ok(())
+    }
+
+    /// Executes the physical split operation.
+    pub(crate) async fn perform_split(&self, bucket_id: u32) -> io::Result<()> {
+        info!("Janitor: ✂️ Calculating split for Bucket {}", bucket_id);
+
+        // 1. Calculate (The Brain)
+        // This is read-only and safe.
+        let proposal = match self.index.calculate_split(bucket_id).await? {
+            Ok(p) => p,
+            Err(status) => {
+                info!("Janitor: Split aborted: {}", status.to_str());
+                // TODO: Update Ignore Map here to prevent retry loops
+                return Ok(());
+            }
+        };
+
+        // 2. Write New Buckets (Staging)
+        // We allocate new IDs for the children
+        // Note: allocate_next_bucket_id is atomic on Index
+        let id_left = self.index.allocate_next_bucket_id();
+        let id_right = self.index.allocate_next_bucket_id();
+
+        // Write Left
+        let count_l = self.staging.append_batch(id_left, &proposal.left).await?;
+        let file_l = self.staging.get_active_filename(id_left);
+
+        // Write Right
+        let count_r = self.staging.append_batch(id_right, &proposal.right).await?;
+        let file_r = self.staging.get_active_filename(id_right);
+
+        // 3. Register New Files (Local)
+        self.bucket_manager
+            .register_bucket(id_left, file_l, StorageClass::Local);
+        self.bucket_manager
+            .register_bucket(id_right, file_r, StorageClass::Local);
+
+        // 4. Atomic Commit (Manifest + Router)
+        // We perform all metadata updates in one go.
+        self.manifest.apply_atomic(|m| {
+            // Remove Old
+            m.remove_bucket(bucket_id);
+
+            // Add New
+            m.add_bucket(id_left, String::new(), proposal.left.centroid.clone());
+            m.update_bucket_stats(id_left, count_l, 0);
+
+            m.add_bucket(id_right, String::new(), proposal.right.centroid.clone());
+            m.update_bucket_stats(id_right, count_r, 0);
+        })?;
+
+        // 5. Update In-Memory Router (Critical for Search)
+        // We need to expose a method on Index to update router, or do it here if we have access.
+        // Ideally, Index listens to Manifest updates or we call a method.
+        // For V2 MVP, we can call a helper on Index.
+        self.index
+            .apply_split_update(
+                bucket_id,
+                (id_left, proposal.left.centroid.unwrap()),
+                (id_right, proposal.right.centroid.unwrap()),
+            )
+            .await;
+
+        // 6. Handle Defectors (Loopback)
+        if !proposal.loopback.is_empty() {
+            info!(
+                "Janitor: ↩️ Looping back {} defectors",
+                proposal.loopback.len()
+            );
+            self.index.insert_batch(&proposal.loopback)?;
+        }
+
+        // 7. Cleanup Old
+        // We delete the STAGING file for the old bucket immediately if it exists.
+        // Remote files are handled by Reaper later.
+        let old_staging = self.staging.get_active_filename(bucket_id);
+        let _ = self.staging.delete_file(&old_staging).await;
+
+        info!(
+            "Janitor: Split Complete. {} -> {}, {}",
+            bucket_id, id_left, id_right
+        );
         Ok(())
     }
 }

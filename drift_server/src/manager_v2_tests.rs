@@ -33,7 +33,7 @@ mod tests {
 
         // 1. Initialize Collection
         let collection = manager
-            .get_or_create(collection_name, None)
+            .get_or_create(collection_name, None, None)
             .await
             .expect("Failed to create collection");
 
@@ -74,14 +74,14 @@ mod tests {
 
         // 1. Create and Modify
         {
-            let coll = manager.get_or_create(name, None).await.unwrap();
+            let coll = manager.get_or_create(name, None, None).await.unwrap();
             // Insert something to trigger WAL/KV creation
             coll.index.insert(1, &[0.0; DIM]).unwrap();
         } // Drop collection ref
 
         // 2. Re-Initialize (Simulate Restart)
         let manager2 = Arc::new(CollectionManager::new(config));
-        let _coll2 = manager2.get_or_create(name, None).await.unwrap();
+        let _coll2 = manager2.get_or_create(name, None, None).await.unwrap();
 
         // 3. Verify Persistence
         // The KV/WAL should still exist on disk.
@@ -99,10 +99,15 @@ mod tests {
         let manager = Arc::new(CollectionManager::new(config));
 
         // 1. Create with Dim 128
-        let _ = manager.get_or_create("dim_test", Some(128)).await.unwrap();
+        let _ = manager
+            .get_or_create("dim_test", Some(128), Some(2000))
+            .await
+            .unwrap();
 
         // 2. Try to get with Dim 64 -> Should Fail
-        let result = manager.get_or_create("dim_test", Some(64)).await;
+        let result = manager
+            .get_or_create("dim_test", Some(64), Some(2000))
+            .await;
 
         assert!(result.is_err());
 
@@ -114,7 +119,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod more_tests {
+mod load_and_unload_collection_test {
     use crate::config::{Config, FileConfig, StorageCommand};
     use crate::manager_v2::CollectionManager;
     use std::sync::Arc;
@@ -142,7 +147,7 @@ mod more_tests {
         let manager = Arc::new(CollectionManager::new(config));
 
         let name = "test_struct";
-        manager.get_or_create(name, None).await.unwrap();
+        manager.get_or_create(name, None, None).await.unwrap();
 
         // Verify Structure:
         // root/data/test_struct/
@@ -172,7 +177,7 @@ mod more_tests {
         // 1. Initial Run
         {
             let manager = Arc::new(CollectionManager::new(config.clone()));
-            let coll = manager.get_or_create(name, None).await.unwrap();
+            let coll = manager.get_or_create(name, None, None).await.unwrap();
 
             // Insert Data (Writes to WAL)
             coll.index.insert(1, &[0.0; 128]).unwrap();
@@ -187,7 +192,7 @@ mod more_tests {
 
         // 2. Re-open (Simulate Restart)
         let manager2 = Arc::new(CollectionManager::new(config));
-        let coll2 = manager2.get_or_create(name, None).await.unwrap();
+        let coll2 = manager2.get_or_create(name, None, None).await.unwrap();
 
         // 3. Verify data via search (WAL replay should have restored ID 1)
         let res = coll2
@@ -198,5 +203,168 @@ mod more_tests {
 
         assert_eq!(res.len(), 1, "WAL Replay failed: Index is empty");
         assert_eq!(res[0].0, 1, "WAL Replay failed: ID mismatch");
+    }
+}
+
+#[cfg(test)]
+mod bucket_fetch_test {
+    // use crate::bucket_file_writer::BucketFileWriter;
+    // use crate::bucket_manager::{BucketManager, StorageClass};
+    use drift_core::lock_manager::BucketCoordinator;
+    use drift_core::quantizer::Quantizer;
+    use drift_storage::{
+        bucket_file_writer::BucketFileWriter,
+        bucket_manager::{BucketManager, StorageClass},
+    };
+    use drift_traits::StorageEngine;
+    use opendal::{Operator, services};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    // --- Helpers ---
+
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let builder = services::Fs::default().root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
+    /// Creates a valid .drift file with specific data
+    async fn create_bucket_file(
+        dir: &std::path::Path,
+        filename: &str,
+        ids: &[u64],
+        vecs: &[Vec<f32>],
+        dim: usize,
+    ) {
+        let path = dir.join(filename);
+        let file = std::fs::File::create(&path).unwrap();
+
+        let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
+        let q = Quantizer::train(&flat, dim);
+        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
+        writer.write_batch(ids, &flat).unwrap();
+        writer.finalize().unwrap();
+    }
+
+    // --- TEST 1: Tiered Fetch (Base + Delta) ---
+    #[tokio::test]
+    async fn test_fetch_bucket_merges_tiered_storage() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+
+        let dim = 2;
+        let bucket_id = 100;
+
+        // 1. Create Remote Base (IDs 0-9)
+        let base_ids: Vec<u64> = (0..10).collect();
+        let base_vecs = vec![vec![1.0, 1.0]; 10];
+        create_bucket_file(dir.path(), "base.drift", &base_ids, &base_vecs, dim).await;
+
+        // 2. Create Local Delta (IDs 10-14)
+        let delta_ids: Vec<u64> = (10..15).collect();
+        let delta_vecs = vec![vec![2.0, 2.0]; 5];
+        create_bucket_file(dir.path(), "delta.drift", &delta_ids, &delta_vecs, dim).await;
+
+        // 3. Register Tiered
+        manager.register_bucket_with_count(
+            bucket_id,
+            "ignored.drift".to_string(),
+            StorageClass::Tiered {
+                remote_path: "base.drift".to_string(),
+                local_path: "delta.drift".to_string(),
+            },
+            15,
+        );
+
+        // 4. Fetch
+        let (ids, flat_vecs) = manager.fetch_bucket(bucket_id).await.expect("Fetch failed");
+
+        // 5. Verify Merge
+        assert_eq!(ids.len(), 15, "Should have 15 total items");
+        assert_eq!(flat_vecs.len(), 30, "Should have 30 floats (15 * 2)");
+
+        // Check content
+        // Base items
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&9));
+        // Delta items
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&14));
+
+        // Verify values (approx check due to quantization)
+        // Find index of ID 0
+        let idx_0 = ids.iter().position(|&x| x == 0).unwrap();
+        assert!(
+            (flat_vecs[idx_0 * 2] - 1.0).abs() < 0.05,
+            "Base value mismatch"
+        );
+
+        // Find index of ID 10
+        let idx_10 = ids.iter().position(|&x| x == 10).unwrap();
+        assert!(
+            (flat_vecs[idx_10 * 2] - 2.0).abs() < 0.05,
+            "Delta value mismatch"
+        );
+    }
+
+    // --- TEST 2: Promoting Fetch (Active + Frozen + Remote) ---
+    #[tokio::test]
+    async fn test_fetch_bucket_merges_promoting_storage() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let dim = 2;
+        let bucket_id = 200;
+
+        // 1. Remote Base (ID 1)
+        create_bucket_file(dir.path(), "remote.drift", &[1], &[vec![1.0; dim]], dim).await;
+
+        // 2. Local Frozen (ID 2)
+        create_bucket_file(dir.path(), "frozen.drift", &[2], &[vec![2.0; dim]], dim).await;
+
+        // 3. Local Active (ID 3)
+        create_bucket_file(dir.path(), "active.drift", &[3], &[vec![3.0; dim]], dim).await;
+
+        // 4. Register Promoting
+        manager.register_bucket(
+            bucket_id,
+            "active.drift".to_string(),
+            StorageClass::Promoting {
+                local_active: "active.drift".to_string(),
+                local_frozen: "frozen.drift".to_string(),
+                remote_path: Some("remote.drift".to_string()),
+            },
+        );
+
+        // 5. Fetch
+        let (ids, _) = manager.fetch_bucket(bucket_id).await.expect("Fetch failed");
+
+        // 6. Verify Full Merge
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&1), "Missing Remote");
+        assert!(ids.contains(&2), "Missing Frozen");
+        assert!(ids.contains(&3), "Missing Active");
+    }
+
+    // --- TEST 3: Missing Component Failure ---
+    #[tokio::test]
+    async fn test_fetch_bucket_fails_gracefully_on_missing_files() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+
+        // Register bucket pointing to non-existent file
+        manager.register_bucket(999, "ghost.drift".to_string(), StorageClass::Local);
+
+        // Fetch should fail
+        let res = manager.fetch_bucket(999).await;
+        assert!(res.is_err(), "Should error on missing file");
+
+        // Error kind should be NotFound (mapped from empty merge result)
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
 }

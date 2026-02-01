@@ -129,14 +129,7 @@ pub trait StorageEngine: Send + Sync {
 
     // Registers a new bucket (e.g. from Split/Flush)
     fn register_bucket(&self, bucket_id: u32, path: String, count: u32);
-}
 
-/// Represents a component capable of retrieving full bucket data.
-/// Used by maintenance tasks (Split/Merge) to load data for re-clustering.
-#[async_trait]
-pub trait DataProvider: Send + Sync {
-    /// Fetches all high-fidelity vectors for a specific bucket.
-    /// Returns (IDs, Vectors).
     async fn fetch_bucket(&self, bucket_id: u32) -> Result<(Vec<u64>, Vec<f32>)>;
 }
 

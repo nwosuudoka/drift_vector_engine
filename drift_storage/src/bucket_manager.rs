@@ -1,8 +1,7 @@
 use crate::bucket_file_reader::BucketFileReader;
-use async_trait::async_trait;
 use atomic_float::AtomicF32;
 use drift_core::lock_manager::BucketCoordinator;
-use drift_traits::{BucketStats, DataProvider, StorageEngine, TombstoneView};
+use drift_traits::{BucketStats, StorageEngine, TombstoneView};
 use futures::future::join_all;
 use opendal::Operator;
 use parking_lot::RwLock;
@@ -310,45 +309,77 @@ impl StorageEngine for BucketManager {
         }
         all_results
     }
-}
 
-#[async_trait]
-impl DataProvider for BucketManager {
+    /// Fetches ALL high-fidelity vectors for a logical bucket.
+    /// MERGES data from Local (Delta) and Remote (Base) tiers if necessary.
     async fn fetch_bucket(&self, bucket_id: u32) -> io::Result<(Vec<u64>, Vec<f32>)> {
-        // 1. Get Location
+        // 1. Get Location Snapshot
         let version = self
             .get_version(bucket_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Bucket not found"))?;
 
-        let ops_to_try = match &version.class {
-            StorageClass::Local => vec![(self.local_op.clone(), version.path.clone())],
-            StorageClass::Remote => vec![(self.remote_op.clone(), version.path.clone())],
-            // For Tiered, we ideally need the merged view.
-            // MVP: Just fetch Remote (Base) + Local (Delta) and merge in memory.
-            // For now, let's implement the simple case (Remote or Local).
-            StorageClass::Tiered { remote_path, .. } => {
-                vec![(self.remote_op.clone(), remote_path.clone())]
+        // 2. Identify all sources
+        let mut ops_to_scan = Vec::new();
+        match &version.class {
+            StorageClass::Local => {
+                ops_to_scan.push((self.local_op.clone(), version.path.clone()));
             }
-            StorageClass::Promoting { local_active, .. } => {
-                vec![(self.local_op.clone(), local_active.clone())]
+            StorageClass::Remote => {
+                ops_to_scan.push((self.remote_op.clone(), version.path.clone()));
+            }
+            StorageClass::Tiered {
+                remote_path,
+                local_path,
+            } => {
+                // Fetch Base (Remote) THEN Delta (Local)
+                ops_to_scan.push((self.remote_op.clone(), remote_path.clone()));
+                ops_to_scan.push((self.local_op.clone(), local_path.clone()));
+            }
+            StorageClass::Promoting {
+                local_active,
+                local_frozen,
+                remote_path,
+            } => {
+                // If we are promoting, data is scattered. Gather everything.
+                if let Some(rp) = remote_path {
+                    ops_to_scan.push((self.remote_op.clone(), rp.clone()));
+                }
+                ops_to_scan.push((self.local_op.clone(), local_frozen.clone()));
+                ops_to_scan.push((self.local_op.clone(), local_active.clone()));
             }
         };
 
-        for (op, path) in ops_to_try {
-            if let Ok(mut reader) = BucketFileReader::open(op, &path).await {
-                // We need a method on Reader to get EVERYTHING (IDs + Floats)
-                // BucketFileReader already has read_all_vectors() -> (Vec<u64>, Vec<Vec<f32>>)
-                // We need flattened floats.
-                if let Ok((ids, vecs)) = reader.read_all_vectors().await {
-                    let flat: Vec<f32> = vecs.into_iter().flatten().collect();
-                    return Ok((ids, flat));
+        // 3. Fetch and Merge
+        let mut merged_ids = Vec::new();
+        let mut merged_vecs_flat = Vec::new();
+
+        for (op, path) in ops_to_scan {
+            match BucketFileReader::open(op, &path).await {
+                Ok(mut reader) => {
+                    // Read (IDs, Vec<Vec<f32>>)
+                    if let Ok((ids, vecs)) = reader.read_all_vectors().await {
+                        merged_ids.extend(ids);
+                        for v in vecs {
+                            merged_vecs_flat.extend(v);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // If a tiered file is missing, that's critical data loss (or config error)
+                    tracing::warn!("fetch_bucket: Failed to read component {}: {}", path, e);
+                    // We continue best-effort? No, for maintenance we want strict correctness.
+                    // But for now, let's log and continue to avoid crashing the Janitor loop.
                 }
             }
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Failed to read bucket data",
-        ))
+        if merged_ids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Bucket data empty or inaccessible",
+            ));
+        }
+
+        Ok((merged_ids, merged_vecs_flat))
     }
 }

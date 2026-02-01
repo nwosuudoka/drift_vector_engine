@@ -1,3 +1,4 @@
+use crate::kmeans::KMeansTrainer;
 use crate::memtable_v2::{MemTableOptions, MemTableV2};
 use crate::partitioner::{IncrementalPartitioner, PartitionGroup, PartitionResult};
 use crate::router::Router;
@@ -9,7 +10,11 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use tokio::task;
+
+const SPLIT_THRESHOLD: usize = 50;
+const SINGULARITY_THRESHOLD: f32 = 0.01;
 
 #[derive(Clone)]
 pub struct FrozenTable {
@@ -67,6 +72,9 @@ pub struct VectorIndex {
     kv: Arc<BitStore>,
     router: Arc<RwLock<Router>>,
     deleted_ids: RwLock<Arc<HashSet<u64>>>,
+
+    next_bucket_id: AtomicU32,
+
     dim: usize,
     capacity: usize,
 }
@@ -80,6 +88,8 @@ impl VectorIndex {
         storage: Arc<dyn StorageEngine>,
         kv: Arc<BitStore>,
     ) -> Self {
+        let max_id = router.read().max_bucket_id();
+
         Self {
             active: RwLock::new(Arc::new(MemTableV2::new(MemTableOptions { capacity, dim }))),
             frozen: RwLock::new(Vec::new()),
@@ -90,7 +100,12 @@ impl VectorIndex {
             router,
             dim,
             capacity,
+            next_bucket_id: AtomicU32::new(max_id + 1),
         }
+    }
+
+    pub fn allocate_next_bucket_id(&self) -> u32 {
+        self.next_bucket_id.fetch_add(1, AtomicOrdering::Relaxed)
     }
 
     pub fn insert(&self, id: u64, vector: &[f32]) -> io::Result<bool> {
@@ -392,5 +407,140 @@ impl VectorIndex {
 
     pub fn get_wal(&self) -> Arc<Mutex<WalManager>> {
         self.wal_manager.clone()
+    }
+
+    pub async fn calculate_split(
+        &self,
+        bucket_id: u32,
+    ) -> io::Result<Result<SplitProposal, MaintenanceStatus>> {
+        // 1. Fetch High-Fidelity Data (Async I/O)
+        let fetch_res = self.storage.fetch_bucket(bucket_id).await;
+
+        let (ids, flat_vecs) = match fetch_res {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    "calculate_split: Failed to fetch bucket {}: {}",
+                    bucket_id,
+                    e
+                );
+                return Ok(Err(MaintenanceStatus::SkippedLocked));
+            }
+        };
+
+        if ids.len() < SPLIT_THRESHOLD {
+            return Ok(Err(MaintenanceStatus::SkippedTooSmall));
+        }
+
+        // 2. Snapshot Global Context (for Defector Check)
+        // We capture the state of the world NOW.
+        let (global_centroids, global_ids) = self.router.read().get_snapshot();
+        let dim = self.dim;
+
+        // 3. Offload Compute to Blocking Thread
+        let proposal_result = task::spawn_blocking(move || {
+            // A. Train K-Means (K=2)
+            let trainer = KMeansTrainer::new(2, dim, 15);
+            let result = trainer.train(&flat_vecs);
+
+            // B. Singularity Check (Variance)
+            let dist_sq = crate::math::l2_sq(&result.centroids[0], &result.centroids[1]);
+            if dist_sq < SINGULARITY_THRESHOLD {
+                return Err(MaintenanceStatus::SkippedSingularity { variance: dist_sq });
+            }
+
+            // C. Partition & Defector Logic
+            let mut left = PartitionGroup::new(dim, Some(result.centroids[0].clone()));
+            let mut right = PartitionGroup::new(dim, Some(result.centroids[1].clone()));
+            let mut loopback = Vec::new();
+
+            let c0 = &result.centroids[0];
+            let c1 = &result.centroids[1];
+
+            // Pre-calculate defector threshold (Hysteresis)
+            // A neighbor must be at least 10% closer to be worth moving.
+            const HYSTERESIS: f32 = 0.90;
+
+            for (i, &assignment) in result.assignments.iter().enumerate() {
+                let start = i * dim;
+                let end = start + dim;
+                let vec = &flat_vecs[start..end];
+                let id = ids[i];
+
+                // 1. Distance to assigned Local Child
+                let dist_local = if assignment == 0 {
+                    crate::math::l2_sq(vec, c0)
+                } else {
+                    crate::math::l2_sq(vec, c1)
+                };
+
+                // 2. Global Defector Check
+                // Find distance to the NEAREST global neighbor (excluding the current bucket).
+                // Optimization: We scan the flat buffer directly.
+                let mut best_global_dist = f32::MAX;
+
+                // We iterate chunks of 'dim' in global_centroids
+                for (g_idx, g_id) in global_ids.iter().enumerate() {
+                    if *g_id == bucket_id {
+                        continue;
+                    } // Skip self
+
+                    let g_start = g_idx * dim;
+                    let g_vec = &global_centroids[g_start..g_start + dim];
+
+                    let d = crate::math::l2_sq(vec, g_vec);
+                    if d < best_global_dist {
+                        best_global_dist = d;
+                    }
+                }
+
+                // 3. Decision
+                if best_global_dist < (dist_local * HYSTERESIS) {
+                    // DEFECTOR FOUND: Sending back to MemTable
+                    loopback.push((id, vec.to_vec()));
+                } else {
+                    // Stay Local
+                    if assignment == 0 {
+                        left.ids.push(id);
+                        left.flat_vectors.extend_from_slice(vec);
+                        left.count += 1;
+                    } else {
+                        right.ids.push(id);
+                        right.flat_vectors.extend_from_slice(vec);
+                        right.count += 1;
+                    }
+                }
+            }
+
+            Ok(SplitProposal {
+                target_bucket: bucket_id,
+                left,
+                right,
+                loopback,
+            })
+        })
+        .await
+        .map_err(io::Error::other)?;
+
+        Ok(proposal_result)
+    }
+
+    pub async fn apply_split_update(
+        &self,
+        old_id: u32,
+        left: (u32, Vec<f32>),
+        right: (u32, Vec<f32>),
+    ) {
+        let mut guard = self.router.write();
+        // Remove old
+        guard.remove_bucket(old_id);
+        // Add new
+        guard.add_bucket(left.0, left.1);
+        guard.add_bucket(right.0, right.1);
+    }
+
+    // For testing purposes
+    pub fn get_router(&self) -> &Arc<RwLock<Router>> {
+        &self.router
     }
 }

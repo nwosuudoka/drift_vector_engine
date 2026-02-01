@@ -92,6 +92,7 @@ mod tests {
             check_interval: Duration::from_millis(100),
             promotion_threshold_bytes: 1024,
             coordinator,
+            max_bucket_capacity: 2000,
         });
 
         (index, bucket_manager, janitor, manifest, persistence)

@@ -53,6 +53,7 @@ impl CollectionManager {
         &self,
         name: &str,
         dim_hint: Option<usize>,
+        max_bucket_capacity: Option<usize>,
     ) -> std::io::Result<Arc<Collection>> {
         // 1. Fast Path
         {
@@ -175,6 +176,8 @@ impl CollectionManager {
             }
         }
 
+        let max_bucket_capacity = max_bucket_capacity.unwrap_or(self.config.max_bucket_capacity);
+
         // --- JANITOR ---
         let janitor_config = JanitorConfig {
             index: index.clone(),
@@ -185,6 +188,7 @@ impl CollectionManager {
             check_interval: Duration::from_millis(100),
             promotion_threshold_bytes: 16 * 1024 * 1024,
             coordinator,
+            max_bucket_capacity,
         };
 
         let janitor = Janitor::new(janitor_config);

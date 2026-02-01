@@ -29,7 +29,7 @@ impl Drift for DriftService {
 
         let collection = self
             .manager
-            .get_or_create(&collection_name, None) // Add dim hint support in proto if needed
+            .get_or_create(&collection_name, None, None) // Add dim hint support in proto if needed
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -50,7 +50,7 @@ impl Drift for DriftService {
         let req = request.into_inner();
         let collection = self
             .manager
-            .get_or_create(&req.collection_name, None)
+            .get_or_create(&req.collection_name, None, None)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -72,7 +72,7 @@ impl Drift for DriftService {
         let req = request.into_inner();
         let collection = self
             .manager
-            .get_or_create(&req.collection_name, None)
+            .get_or_create(&req.collection_name, None, None)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

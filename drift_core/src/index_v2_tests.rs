@@ -122,6 +122,23 @@ mod tests {
 
         fn register_bucket(&self, _bucket_id: u32, _path: String, _count: u32) {}
         fn tick_cooling(&self, _decay_rate: f32) {}
+
+        async fn fetch_bucket(&self, bucket_id: u32) -> std::io::Result<(Vec<u64>, Vec<f32>)> {
+            let data = self.data.read();
+            if let Some(items) = data.get(&bucket_id) {
+                let mut ids = Vec::new();
+                let mut vecs = Vec::new();
+                for (id, val) in items {
+                    ids.push(*id);
+                    // Mock engine stores (id, dist), not vectors.
+                    // We return dummy vectors for testing flow.
+                    vecs.extend(vec![*val; 2]); // Assuming dim=2
+                }
+                Ok((ids, vecs))
+            } else {
+                Ok((vec![], vec![]))
+            }
+        }
     }
 
     // --- SETUP HELPER ---
@@ -565,6 +582,10 @@ mod tests {
         }
         fn register_bucket(&self, _b: u32, _p: String, _c: u32) {}
         fn tick_cooling(&self, _d: f32) {}
+
+        async fn fetch_bucket(&self, _bucket_id: u32) -> std::io::Result<(Vec<u64>, Vec<f32>)> {
+            Ok((vec![], vec![]))
+        }
     }
 
     fn create_index_with_components(
