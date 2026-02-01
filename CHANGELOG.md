@@ -1,6 +1,38 @@
 # Changelog
 
-## [Unreleased] - v2.0.0 Migration
+# Changelog
+
+## [Unreleased] - v2.0.0-alpha (The LBR Architecture)
+
+**Summary:** massive architectural pivot from "Immutable Segments" to **"Local Buffered Rewrite" (LBR)**. This reduces write amplification by 100x and enables real-time drift adaptation without full index rebuilds.
+
+### Added
+
+- **Storage Engine V2 (`drift_storage`):**
+  - **Append-Only Files:** Local `.drift` files now support atomic RowGroup appends (Read Footer -> Write Data -> New Footer).
+  - **BucketManager:** Centralized coordinator that abstracts over Local (NVMe), Remote (S3), and Tiered (Cache) storage.
+  - **Tiered Fetch:** Transparently merges Local Delta + Remote Base files for unified reads.
+
+- **Maintenance Logic:**
+  - **Drift Tracking:** Real-time tracking of `vector_sum` and `count` per bucket to detect distribution shifts ($Drift > 0.15$).
+  - **Smart Split:** New split logic that identifies "Defectors" (vectors closer to neighbors) and loops them back to the MemTable instead of forcing them into suboptimal child buckets.
+  - **Singularity Detection:** Prevents splitting dense clusters (Variance < 0.01) to avoid infinite maintenance loops.
+
+- **Safety & Recovery:**
+  - **WAL V2:** Transactional Write-Ahead Log with `Begin`/`Commit` markers.
+  - **RecoveryManager:** Rebuilds the Routing Table and replays WALs upon startup.
+  - **Atomic Promotion:** `PersistenceManager` now merges Local Staging + S3 Base into a new optimized S3 segment safely.
+
+### Changed
+
+- **Flush Architecture:**
+  - _Old:_ Flush -> Run K-Means -> Create New Buckets -> Write S3.
+  - _New:_ Flush -> Route to Existing Buckets -> Append to Local Disk -> Update Stats.
+- **Janitor V2:** Now acts as an autonomous state machine managing Flush, Split, and Promotion lifecycles concurrently.
+
+### Removed
+
+- **Segment-Based Indexing:** The concept of "Segments" containing multiple buckets is replaced by "One File Per Bucket" (physically) for simpler compaction.
 
 ### Added
 

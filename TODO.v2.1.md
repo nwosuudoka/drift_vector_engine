@@ -34,7 +34,7 @@ _Goal: Create a single file format (`.drift`) that works for both efficient loca
 - [ ] Implement **Early Abort**: If Bloom Filter (in Footer/Header) fails, drop the reader immediately.
 
 - **1.5. Verification**
-- [ ] Test: Append 10 small RGs to a local file. Read it back as one stream. Verify data integrity.
+- [x] Test: Append 10 small RGs to a local file. Read it back as one stream. Verify data integrity.
 
 ---
 
@@ -43,7 +43,7 @@ _Goal: Create a single file format (`.drift`) that works for both efficient loca
 _Goal: Ensure no data loss on crash and prevent "Split Brain" during splits._
 
 - **2.1. The Manifest (`drift_core/src/manifest.rs`)**
-- [ ] Define `manifest.proto` (Protobuf):
+- [x] Define `manifest.proto` (Protobuf):
 - `version`: monotonic u64.
 - `centroids`: List of `[id, vector]`.
 - `buckets`: Map `id -> { run_id, vector_count, tombstone_count }`.
@@ -53,8 +53,8 @@ _Goal: Ensure no data loss on crash and prevent "Split Brain" during splits._
 - `cas_update(old_v, new_manifest)`: Optimistic locking write (e.g., `If-None-Match` or DynamoDB lock).
 
 - **2.2. The Write-Ahead Log (`drift_core/src/wal.rs`)**
-- [ ] _Audit existing WAL:_ Ensure strictly append-only and `fsync` on every batch.
-- [ ] Implement `WalReplayer`:
+- [x] _Audit existing WAL:_ Ensure strictly append-only and `fsync` on every batch.
+- [x] Implement `WalReplayer`:
 - Read log from byte 0.
 - Filter entries that are already in the Manifest (using Log Sequence Numbers or IDs).
 - Return list of "Lost Vectors" to be re-inserted.
@@ -106,15 +106,15 @@ _Goal: Stop "Centroid Proliferation". Assign vectors to fixed buckets._
 _Goal: Buffer writes locally. Write to S3 only when data is "big enough"._
 
 - **4.1. Local Staging Manager**
-- [ ] Manage `data/buckets/bucket_{id}.drift` files.
-- [ ] Implement `append_batch(bucket_id, vectors)`:
+- [x] Manage `data/buckets/bucket_{id}.drift` files.
+- [x] Implement `append_batch(bucket_id, vectors)`:
 - Uses `BucketFileWriter` (Append Mode).
 - Updates in-memory "Dirty Set" (track which buckets were modified).
 
 - **4.2. Update `Janitor` Flush Loop**
-- [ ] **Old:** `MemTable -> S3`.
-- [ ] **New:** `MemTable -> Partition -> Local Staging`.
-- [ ] **Constraint:** Flush MUST verify local file sync before truncating WAL.
+- [x] **Old:** `MemTable -> S3`.
+- [x] **New:** `MemTable -> Partition -> Local Staging`.
+- [x] **Constraint:** Flush MUST verify local file sync before truncating WAL.
 
 ---
 
