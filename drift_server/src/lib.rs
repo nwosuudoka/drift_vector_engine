@@ -63,3 +63,9 @@ mod persistence_v2_tests;
 mod recovery_test;
 #[cfg(test)]
 mod server_integration_tests;
+
+#[cfg(test)]
+mod reaper_test;
+
+#[cfg(test)]
+mod chaos_test;

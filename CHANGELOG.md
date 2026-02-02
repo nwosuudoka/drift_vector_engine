@@ -2,6 +2,16 @@
 
 ## [Unreleased] - v2.0.0-alpha (The LBR Architecture)
 
+### Verified
+
+- **Garbage Collection:** Implemented and verified the `Reaper` integration. Proved that promoted local files and obsolete S3 segments are physically deleted after the Janitor cycle.
+- **Tiering Handover:** Hardened `Janitor` promotion logic to prevent race conditions where valid data was mistaken for "Zombie" buckets during the upload window.
+
+### Fixed
+
+- **Janitor Resurrection Bug:** Fixed a critical race condition in `promote_segments` where updating the registry to `Promoting` state wiped in-memory tombstones before they could be applied to the new S3 segment. Added logic to snapshot tombstones before registry updates.
+- **Atomic Manifest Updates:** Hardened `janitor_v2` to ensure bucket additions and stat updates happen in a single atomic manifest transaction.
+
 ### Added
 
 - **Scatter-Merge (Zombie Healing):** Implemented a self-healing mechanism for under-filled or deleted ("Zombie") buckets.

@@ -15,9 +15,30 @@ pub struct DriftService {
 impl Drift for DriftService {
     async fn train(
         &self,
-        _request: Request<TrainRequest>,
+        request: Request<TrainRequest>,
     ) -> Result<Response<TrainResponse>, Status> {
-        todo!()
+        let req = request.into_inner();
+
+        // Extract dimension from training data
+        let dim_hint = req.vectors.first().map(|v| v.values.len());
+
+        let collection = self
+            .manager
+            .get_or_create(&req.collection_name, dim_hint, None)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let batch: Vec<(u64, Vec<f32>)> =
+            req.vectors.into_iter().map(|v| (v.id, v.values)).collect();
+
+        // Treat training data as just another batch of inserts.
+        // The Janitor will see the volume and trigger training automatically.
+        collection
+            .index
+            .insert_batch(&batch)
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(TrainResponse { success: true }))
     }
 
     async fn insert(
@@ -27,9 +48,11 @@ impl Drift for DriftService {
         let req = request.into_inner();
         let collection_name = req.collection_name;
 
+        let dim_hint = req.vector.as_ref().map(|v| v.values.len());
+
         let collection = self
             .manager
-            .get_or_create(&collection_name, None, None) // Add dim hint support in proto if needed
+            .get_or_create(&collection_name, dim_hint, None) // Add dim hint support in proto if needed
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -48,9 +71,12 @@ impl Drift for DriftService {
         request: Request<InsertBatchRequest>,
     ) -> Result<Response<InsertResponse>, Status> {
         let req = request.into_inner();
+
+        let dim_hint = req.vectors.first().map(|v| v.values.len());
+
         let collection = self
             .manager
-            .get_or_create(&req.collection_name, None, None)
+            .get_or_create(&req.collection_name, dim_hint, None)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -70,9 +96,10 @@ impl Drift for DriftService {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
+        let dim_hint = Some(req.vector.len());
         let collection = self
             .manager
-            .get_or_create(&req.collection_name, None, None)
+            .get_or_create(&req.collection_name, dim_hint, None)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

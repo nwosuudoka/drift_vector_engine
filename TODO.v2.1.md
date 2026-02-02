@@ -61,22 +61,23 @@
   - [x] **Execution:** Delta-CoW to Neighbor Staging Files.
   - [x] **Cleanup:** Atomic Manifest Update + Physical Deletion.
 
-#### **Phase 6: Unified Search & Operations**
+#### Phase 6: Unified Search & Operations
 
-**Status:** 🚧 **In Progress**
+**Status:** ✅ **Complete**
 
 - [x] **Unified Searcher:**
   - [x] `search_async` scans MemTable (L0).
   - [x] `BucketManager` scans Local + Remote files (L1).
   - [x] `Refine`: Loads High-Fidelity data (ALP) for top candidates.
-- [ ] **Tombstone Handling V2 (Hardening):**
+- [x] **Tombstone Handling V2 (Hardening):**
   - [x] `mark_delete` updates in-memory bitsets.
-  - [ ] **Persistent Deletes:** Ensure deletes are propagated correctly during Promotion/Compaction (currently we might be losing some delete signals if a crash happens between marking and flushing).
-  - [ ] **Global Filter:** Optimize global tombstone filter for large-scale deletes.
+  - [x] **Persistent Deletes:** Verified tombstone propagation during Promotion/Compaction cycles.
+  - [x] **Global Filter:** Optimize global tombstone filter for large-scale deletes.
 
-#### **Phase 7: Cleanup & Hardening**
+#### Phase 7: Cleanup & Hardening
 
-**Status:** 📝 **Next Steps**
+**Status:** 🚧 **In Progress**
 
+- [x] **Reaper Verification:** Integration test to ensure physical file deletion (Local + S3) after compaction/promotion.
+- [ ] **Chaos Testing:** Random kill -9 loop while running heavy ingest.
 - [ ] **Distributed Consensus:** Prepare for stateless workers.
-- [ ] **Final Chaos Test:** Random kill -9 loop while running heavy ingest.

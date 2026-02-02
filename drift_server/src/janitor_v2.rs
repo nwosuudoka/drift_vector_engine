@@ -262,8 +262,19 @@ impl Janitor {
                 local_frozen: staging_filename.clone(),
                 remote_path: remote_path_opt.clone(),
             };
-            self.bucket_manager
-                .register_bucket(bucket_id, new_filename.clone(), promoting_class);
+
+            let current_count = self
+                .bucket_manager
+                .get_bucket_stats(bucket_id)
+                .map(|s| s.total_count)
+                .unwrap_or(0);
+
+            self.bucket_manager.register_bucket_with_count(
+                bucket_id,
+                new_filename.clone(),
+                promoting_class,
+                current_count,
+            );
 
             // --- ⚡ EXPLICIT MERGE & FILTER LOGIC ---
 
@@ -321,8 +332,12 @@ impl Janitor {
                 remote_path: new_remote_path.clone(),
                 local_path: new_filename.clone(),
             };
-            self.bucket_manager
-                .register_bucket(bucket_id, new_remote_path, tiered_class);
+            self.bucket_manager.register_bucket_with_count(
+                bucket_id,
+                new_remote_path,
+                tiered_class,
+                final_count,
+            );
 
             // 4. ⚡ RECONCILE: Prune the specific deletions we just handled
             self.bucket_manager

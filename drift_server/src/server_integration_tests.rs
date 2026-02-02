@@ -225,3 +225,161 @@ mod tests {
         assert_eq!(replay_data.inserts[1].0, 888);
     }
 }
+
+#[cfg(test)]
+mod janitor_reaper_integration_tests {
+    use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
+    use crate::local_staging::LocalStagingManager;
+    use crate::manifest::ServerManifestManager;
+    use crate::persistence_v2::PersistenceManager;
+    use drift_core::index_v2::VectorIndex;
+    use drift_core::lock_manager::BucketCoordinator;
+    use drift_core::math::Metric;
+    use drift_core::quantizer::Quantizer;
+    use drift_core::router::Router;
+    use drift_core::wal_v2::WalManager;
+    use drift_kv::bitstore::BitStore;
+    use drift_storage::bucket_file_writer::BucketFileWriter;
+    use drift_storage::bucket_manager::BucketManager;
+    use opendal::{Operator, services};
+    use parking_lot::Mutex;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use tokio::time::sleep;
+
+    fn create_fs_operator(path: &std::path::Path) -> Operator {
+        let mut builder = services::Fs::default();
+        builder = builder.root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
+
+    async fn create_bucket_file(dir: &std::path::Path, filename: &str, count: usize, dim: usize) {
+        let path = dir.join(filename);
+        let file = std::fs::File::create(&path).unwrap();
+
+        let ids: Vec<u64> = (0..count as u64).collect();
+        let vecs: Vec<f32> = (0..count * dim).map(|i| i as f32).collect();
+
+        let q = Quantizer::train(&vecs, dim);
+        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
+        writer.write_batch(&ids, &vecs).unwrap();
+        writer.finalize().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_janitor_automatically_reaps_promoted_files() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("drift_server=info,drift_storage=info")
+            .with_test_writer()
+            .try_init();
+
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let staging_dir = data_dir.join("staging");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        let dim = 2;
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
+        let staging = Arc::new(LocalStagingManager::new(&staging_dir).unwrap());
+        let op = create_fs_operator(&data_dir);
+        let persistence = Arc::new(PersistenceManager::new(op.clone()));
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let bucket_manager = Arc::new(BucketManager::new(
+            op.clone(),
+            op.clone(),
+            4,
+            coordinator.clone(),
+        ));
+
+        let wal_mgr = Arc::new(Mutex::new(WalManager::new(dir.path().join("wal")).unwrap()));
+        let kv = Arc::new(BitStore::new(dir.path().join("kv")).unwrap());
+        let router = Arc::new(RwLock::new(Router::empty(dim, Metric::L2)));
+        let index = Arc::new(VectorIndex::new(
+            dim,
+            100,
+            router,
+            wal_mgr,
+            bucket_manager.clone(),
+            kv,
+        ));
+
+        // 3. Create Local File
+        let bucket_id = 1;
+        let filename = format!("bucket_{}.drift", bucket_id);
+        let item_count = 50;
+
+        create_bucket_file(&staging_dir, &filename, item_count, dim).await;
+
+        staging.set_active_filename(bucket_id, filename.clone());
+
+        // ⚡ FIX 1: Register with COUNT so Janitor knows it's not empty
+        bucket_manager.register_bucket_with_count(
+            bucket_id,
+            filename.clone(),
+            drift_storage::bucket_manager::StorageClass::Local,
+            item_count as u32,
+        );
+
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(bucket_id, "run1".into(), Some(vec![0.0; dim]));
+                m.update_bucket_stats(bucket_id, item_count as u64, 0);
+            })
+            .unwrap();
+
+        let janitor = Janitor::new(JanitorConfig {
+            index: index.clone(),
+            manifest: manifest.clone(),
+            staging: staging.clone(),
+            persistence: persistence.clone(),
+            bucket_manager: bucket_manager.clone(),
+            coordinator: coordinator.clone(),
+            vars: JanitorVars {
+                promotion_threshold_bytes: 100,
+                check_interval: Duration::from_millis(10),
+                // ⚡ FIX 2: Set capacity to match data size.
+                // 50 items / 50 capacity = 100% full. Urgency = 0.
+                // This prevents the "Zombie Merge" logic from deleting it.
+                max_bucket_capacity: item_count,
+                ..Default::default()
+            },
+        });
+
+        let handle = tokio::spawn(async move { janitor.run().await });
+
+        sleep(Duration::from_millis(1000)).await;
+        handle.abort();
+
+        // 5. VERIFY
+        let local_path = staging_dir.join(&filename);
+        assert!(
+            !local_path.exists(),
+            "Reaper failed! Local file {:?} still exists.",
+            local_path
+        );
+
+        let mut found_remote = false;
+        let mut remote_files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&data_dir) {
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    remote_files.push(name.to_string());
+                    if name.starts_with("bucket_1_") && name.ends_with(".drift") {
+                        found_remote = true;
+                    }
+                }
+            }
+        }
+
+        if !found_remote {
+            panic!(
+                "Promotion failed! No remote file found in {:?}.\nFound files: {:?}",
+                data_dir, remote_files
+            );
+        }
+    }
+}
