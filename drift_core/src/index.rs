@@ -73,12 +73,12 @@ impl PartialEq for SearchResult {
 impl Eq for SearchResult {}
 impl PartialOrd for SearchResult {
     fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        self.distance.partial_cmp(&other.distance)
+        Some(self.cmp(other))
     }
 }
 impl Ord for SearchResult {
     fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.partial_cmp(other).unwrap_or(CmpOrdering::Equal)
+        self.distance.total_cmp(&other.distance)
     }
 }
 
@@ -245,7 +245,7 @@ impl VectorIndex {
     pub async fn train_from_memtable(&self, memtable: &MemTable) -> io::Result<()> {
         info!("Janitor: Training Quantizer from MemTable (Zero-Copy)...");
 
-        if memtable.len() == 0 {
+        if memtable.is_empty() {
             return Ok(());
         }
 
@@ -426,10 +426,9 @@ impl VectorIndex {
 
             if let (Ok(bucket_vecs), Ok(hot_data)) = (bucket_vecs_res, hot_data_res) {
                 let safe_limit = bucket_vecs.len().min(hot_data.vids.len());
-                for i in 0..safe_limit {
+                for (i, vec) in bucket_vecs.iter().take(safe_limit).enumerate() {
                     let id = hot_data.vids[i];
                     if target_ids.contains(&id) {
-                        let vec = &bucket_vecs[i];
                         let true_dist = crate::math::l2_sq(query, vec);
                         Self::push_to_heap(
                             &mut final_heap,

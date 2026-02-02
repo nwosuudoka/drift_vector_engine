@@ -147,7 +147,7 @@ pub fn transpose_from_columns(columns: &[Vec<f32>], count: usize) -> Vec<Vec<f32
 /// * `indices` - List of row indices to extract and transpose.
 /// * `dim` - Vector dimension.
 pub fn transpose_subset(source: &[f32], indices: &[usize], dim: usize) -> Vec<Vec<f32>> {
-    assert!(source.len() % dim == 0, "Invalid source length");
+    assert!(source.len().is_multiple_of(dim), "Invalid source length");
 
     let n = indices.len();
     if n == 0 {

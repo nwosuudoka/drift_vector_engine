@@ -116,14 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let mut batch_proto = Vec::with_capacity(BATCH_SIZE);
-        for i in 0..BATCH_SIZE {
-            for d in 0..DIM {
+        for vec in batch_vecs.iter_mut().take(BATCH_SIZE) {
+            for val in vec.iter_mut().take(DIM) {
                 // Same geometric range [0, 100]
-                batch_vecs[i][d] = rng.random::<f32>() * 100.0;
+                *val = rng.random::<f32>() * 100.0;
             }
             batch_proto.push(Vector {
                 id: next_id,
-                values: batch_vecs[i].clone(),
+                values: vec.clone(),
             });
             next_id += 1;
         }

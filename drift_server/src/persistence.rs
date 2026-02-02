@@ -321,6 +321,7 @@ impl PersistenceManager {
         partitions: &[PartitionResult],
         index: &VectorIndex,
     ) -> std::io::Result<(String, HashMap<u32, BucketLocation>)> {
+        type PreparedBucket = (u32, Vec<u8>, Vec<u8>, Vec<u64>);
         let run_id = uuid::Uuid::new_v4().to_string();
         let file_name = format!("segment_{}.drift", run_id);
 
@@ -331,7 +332,7 @@ impl PersistenceManager {
 
         //  We introduce this block to restrict the lifetime of the locks.
         // The locks (frozen_guard, data_guard) will be dropped at the closing brace '};'
-        let prepared_buckets: Vec<(u32, Vec<u8>, Vec<u8>, Vec<u64>)> = {
+        let prepared_buckets: Vec<PreparedBucket> = {
             // 1. Acquire Locks
             let frozen_guard = index.frozen_memtable.read();
             let memtable = frozen_guard

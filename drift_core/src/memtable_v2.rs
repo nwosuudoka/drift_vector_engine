@@ -181,12 +181,12 @@ struct OrderedFloat(f32);
 impl Eq for OrderedFloat {}
 impl PartialOrd for OrderedFloat {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 impl Ord for OrderedFloat {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Less)
+        self.0.total_cmp(&other.0)
     }
 }
 struct HeapItem {
@@ -201,7 +201,7 @@ impl PartialEq for HeapItem {
 impl Eq for HeapItem {}
 impl PartialOrd for HeapItem {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.distance.partial_cmp(&other.distance)
+        Some(self.cmp(other))
     }
 }
 impl Ord for HeapItem {

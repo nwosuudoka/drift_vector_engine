@@ -443,7 +443,7 @@ impl BitStore {
         let pages_needed = if total_slots == 0 {
             1
         } else {
-            (total_slots + SLOTS_PER_PAGE - 1) / SLOTS_PER_PAGE
+            total_slots.div_ceil(SLOTS_PER_PAGE)
         };
 
         // 1. Allocate offsets for all pages

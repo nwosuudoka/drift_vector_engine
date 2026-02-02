@@ -25,7 +25,6 @@ impl WalWriter {
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
             // .truncate(false)
             .append(true)
             .open(path)?;

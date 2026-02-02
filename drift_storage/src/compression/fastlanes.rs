@@ -275,7 +275,7 @@ where
         vec![0u32; BLOCK_SIZE]
     } else {
         let total_bits = BLOCK_SIZE * (bit_width as usize);
-        let total_bytes = (total_bits + 7) / 8;
+        let total_bytes = total_bits.div_ceil(8);
         let mut packed_buf = vec![0u8; total_bytes];
         reader.read_exact(&mut packed_buf)?;
 

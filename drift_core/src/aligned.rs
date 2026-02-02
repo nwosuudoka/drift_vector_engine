@@ -110,8 +110,9 @@ impl AlignedBytes {
         }
     }
 
-    /// SAFETY: Caller must ensure `new_len <= self.capacity` and that
-    /// the memory up to `new_len` is initialized (or will be immediately).
+    /// # Safety
+    /// Caller must ensure `new_len <= self.capacity` and that the memory up to
+    /// `new_len` is initialized (or will be immediately).
     pub unsafe fn set_len(&mut self, new_len: usize) {
         assert!(new_len <= self.capacity);
         self.len = new_len;

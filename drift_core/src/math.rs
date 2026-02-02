@@ -7,7 +7,7 @@ pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
 
 pub fn mean_columns(data: &[f32], dim: usize) -> Vec<f32> {
     debug_assert!(dim > 0);
-    debug_assert!(data.len() % dim == 0);
+    debug_assert!(data.len().is_multiple_of(dim));
 
     let rows = data.len() / dim;
     let mut mean = vec![0.0f32; dim];

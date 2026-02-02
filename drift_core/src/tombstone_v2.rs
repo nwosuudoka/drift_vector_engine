@@ -65,6 +65,12 @@ impl InMemoryTombstoneTracker {
     }
 }
 
+impl Default for InMemoryTombstoneTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait::async_trait]
 impl TombstoneTracker for InMemoryTombstoneTracker {
     fn mark_delete(&self, id: u64) {

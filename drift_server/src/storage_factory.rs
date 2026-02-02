@@ -49,7 +49,7 @@ impl StorageFactory {
         }
 
         let op = Operator::new(builder)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .finish();
         Ok(op)
     }

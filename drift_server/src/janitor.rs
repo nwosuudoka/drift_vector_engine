@@ -127,12 +127,10 @@ impl Janitor {
             self.perform_maintenance().await;
 
             // 4. Garbage Collection
-            if cycle > 0 && cycle % 100 == 0 {
-                if let Some(c) = &self.compactor {
-                    info!("Janitor: Running Compaction Cycle #{}", cycle);
-                    if let Err(e) = c.run_cycle().await {
-                        error!("Janitor: Compaction cycle failed: {}", e);
-                    }
+            if cycle > 0 && cycle.is_multiple_of(100) && let Some(c) = &self.compactor {
+                info!("Janitor: Running Compaction Cycle #{}", cycle);
+                if let Err(e) = c.run_cycle().await {
+                    error!("Janitor: Compaction cycle failed: {}", e);
                 }
             }
         }
@@ -234,7 +232,7 @@ impl Janitor {
             }
         };
 
-        if memtable_arc.len() == 0 {
+        if memtable_arc.is_empty() {
             info!("Janitor: Flush Empty - Clearing Frozen");
             self.index.confirm_flush()?;
             return Ok(None);

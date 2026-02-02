@@ -175,26 +175,27 @@ impl LocalStagingManager {
             for entry in fs::read_dir(&self.base_path)? {
                 let entry = entry?;
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if name.starts_with("bucket_") && name.ends_with(".drift") {
-                        let id_part = name
-                            .trim_start_matches("bucket_")
-                            .trim_end_matches(".drift");
-                        if let Ok(id) = id_part.parse::<u32>() {
-                            if entry.metadata()?.len() >= threshold {
-                                res.push(id);
-                            }
-                        }
+                if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                    && name.starts_with("bucket_")
+                    && name.ends_with(".drift")
+                {
+                    let id_part = name
+                        .trim_start_matches("bucket_")
+                        .trim_end_matches(".drift");
+                    if let Ok(id) = id_part.parse::<u32>()
+                        && entry.metadata()?.len() >= threshold
+                    {
+                        res.push(id);
                     }
                 }
             }
         } else {
             for (&id, filename) in map.iter() {
                 let path = self.base_path.join(filename);
-                if let Ok(meta) = fs::metadata(path) {
-                    if meta.len() >= threshold {
-                        res.push(id);
-                    }
+                if let Ok(meta) = fs::metadata(path)
+                    && meta.len() >= threshold
+                {
+                    res.push(id);
                 }
             }
         }

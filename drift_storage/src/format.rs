@@ -10,7 +10,7 @@ pub const ROW_GROUP_HEADER_SIZE: usize = 64;
 pub const FOOTER_SIZE: usize = 128;
 
 /// 1. File Header (Fixed 128 Bytes)
-/// Zero-Copy compatible. Layout matches C-struct.
+///    Zero-Copy compatible. Layout matches C-struct.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable, KnownLayout)]
 pub struct DriftHeader {
@@ -71,7 +71,7 @@ impl DriftHeader {
 }
 
 /// 2. Row Group Header (Fixed 64 Bytes)
-/// Note: This struct was already naturally aligned, so no changes needed.
+///    Note: This struct was already naturally aligned, so no changes needed.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable, KnownLayout)]
 pub struct RowGroupHeader {

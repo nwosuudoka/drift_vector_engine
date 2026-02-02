@@ -336,20 +336,18 @@ where
         }
 
         let max_allowed_slots = self.capacity * 2;
-        if self.entries.len() >= max_allowed_slots {
-            if self.g_len > 0 {
-                let victim = self.g_head;
-                self.detach(victim);
-                self.index_map.remove(&self.entries[victim as usize].key);
-                let e = &mut self.entries[victim as usize];
-                e.key = key;
-                e.value = value;
-                e.freq = 0;
-                e.queue = QueueType::None;
-                e.next = NULL;
-                e.prev = NULL;
-                return victim;
-            }
+        if self.entries.len() >= max_allowed_slots && self.g_len > 0 {
+            let victim = self.g_head;
+            self.detach(victim);
+            self.index_map.remove(&self.entries[victim as usize].key);
+            let e = &mut self.entries[victim as usize];
+            e.key = key;
+            e.value = value;
+            e.freq = 0;
+            e.queue = QueueType::None;
+            e.next = NULL;
+            e.prev = NULL;
+            return victim;
         }
 
         let idx = self.entries.len() as Index;
@@ -374,6 +372,10 @@ where
 
     pub fn len(&self) -> usize {
         self.s_len + self.m_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     #[cfg(test)]

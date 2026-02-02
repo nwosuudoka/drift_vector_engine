@@ -334,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             print!(".");
         }
     }
-    println!("");
+    println!();
 
     force_flush_and_wait(&service, collection).await;
 
