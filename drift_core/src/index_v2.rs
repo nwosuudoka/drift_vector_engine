@@ -553,11 +553,11 @@ impl VectorIndex {
 
     pub fn update_router_count(&self, bucket_id: u32, count: u32, centroid: Option<Vec<f32>>) {
         let mut r = self.router.write();
-        if !r.update_bucket_count(bucket_id, count) {
-            if let Some(c) = centroid {
-                r.add_bucket(bucket_id, c);
-                let _ = r.update_bucket_count(bucket_id, count);
-            }
+        if !r.update_bucket_count(bucket_id, count)
+            && let Some(c) = centroid
+        {
+            r.add_bucket(bucket_id, c);
+            let _ = r.update_bucket_count(bucket_id, count);
         }
     }
 

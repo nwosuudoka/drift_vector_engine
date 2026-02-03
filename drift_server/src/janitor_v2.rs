@@ -104,6 +104,125 @@ impl Janitor {
     }
 
     async fn perform_flush(&self) -> io::Result<()> {
+        // 1. Data Flush Logic
+        let (partitions, wal_ids) = match self.index.flush_frozen() {
+            Some((p, w)) => (p, w),
+            None => return Ok(()),
+        };
+
+        let mut manifest_updates = Vec::new();
+        // ⚡ CHANGE: Store updates for the Router (ID, Count, Centroid)
+        let mut router_updates = Vec::new();
+
+        for (bucket_id, group) in &partitions {
+            // A. Append to Local Staging
+            let new_count = self.staging.append_batch(*bucket_id, group).await?;
+
+            // B. Ensure Registered
+            if self.bucket_manager.get_version(*bucket_id).is_none() {
+                let filename = self.staging.get_active_filename(*bucket_id);
+                self.bucket_manager.register_bucket(
+                    *bucket_id,
+                    filename,
+                    drift_storage::bucket_manager::StorageClass::Local,
+                );
+            }
+
+            // C. Calculate Delta Sum (for Drift Tracking)
+            let dim = self.index.get_dim();
+            let mut delta_sum = vec![0.0; dim];
+            if group.count > 0 {
+                // Sum the new vectors
+                for chunk in group.flat_vectors.chunks_exact(dim) {
+                    for (i, val) in chunk.iter().enumerate() {
+                        delta_sum[i] += val;
+                    }
+                }
+            }
+
+            // D. Update Persistent Stats
+            self.bucket_manager
+                .update_bucket_drift(*bucket_id, &delta_sum, group.count as u32)?;
+
+            // E. ⚡ FETCH GLOBAL TRUTH
+            // We get the TOTAL sum and TOTAL count from the manager
+            let (total_sum, total_count) =
+                self.bucket_manager
+                    .get_bucket_drift_stats(*bucket_id)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to read stats"))?;
+
+            // F. ⚡ RECALCULATE CENTROID
+            let global_centroid: Vec<f32> = if total_count > 0 {
+                total_sum.iter().map(|s| s / total_count as f32).collect()
+            } else {
+                vec![0.0; dim]
+            };
+
+            manifest_updates.push((*bucket_id, new_count, Some(global_centroid.clone())));
+            router_updates.push((*bucket_id, total_count, global_centroid));
+        }
+
+        // 2. Tombstone Persistence
+        let mut all_tombstones = Vec::new();
+        {
+            let l0_arc = self.index.get_tombstones();
+            all_tombstones.extend(l0_arc.iter());
+        }
+        let l1_deletes = self.bucket_manager.collect_all_tombstones();
+        all_tombstones.extend(l1_deletes);
+
+        let mut tombstone_file_opt = None;
+        if !all_tombstones.is_empty() {
+            all_tombstones.sort_unstable();
+            all_tombstones.dedup();
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let ts_file = self
+                .persistence
+                .flush_tombstones(&all_tombstones, &run_id)
+                .await?;
+            tombstone_file_opt = Some(ts_file);
+        }
+
+        // 3. Update Manifest
+        self.manifest.apply_atomic(|m| {
+            for (id, count, centroid_opt) in manifest_updates {
+                let exists = m.get_buckets().iter().any(|b| b.id == id);
+                if !exists {
+                    m.add_bucket(id, String::new(), centroid_opt);
+                }
+                m.update_bucket_stats(id, count, 0);
+            }
+            if let Some(tf) = tombstone_file_opt {
+                m.inner.tombstone_files = vec![tf];
+            }
+        })?;
+
+        // 4. ⚡ UPDATE ROUTER
+        // We need a helper on Index to access the Router's `update_bucket` (not update_bucket_count)
+        // If it doesn't exist, we'll need to add `index.update_router_bucket(...)`
+        // Assuming we can access the router lock via the index:
+        {
+            let mut r = self.index.get_router().write();
+            for (id, count, vec) in router_updates {
+                // If bucket exists, update count AND centroid.
+                // If it doesn't exist, add it.
+                if r.get_centroid(id).is_some() {
+                    r.update_bucket(id, count, vec);
+                } else {
+                    r.add_bucket(id, vec);
+                    // Ensure count is set correctly after add (add_bucket sets count to 0)
+                    r.update_bucket_count(id, count);
+                }
+            }
+        }
+
+        // 5. Acknowledge
+        self.index.acknowledge_flush(&wal_ids)?;
+
+        Ok(())
+    }
+
+    async fn _perform_flush(&self) -> io::Result<()> {
         // 1. Data Flush Logic (Unchanged from previous plan)
         let (partitions, wal_ids) = match self.index.flush_frozen() {
             Some((p, w)) => (p, w),
@@ -344,8 +463,7 @@ impl Janitor {
             );
 
             // Keep router counts in sync after promotion.
-            self.index
-                .update_router_count(bucket_id, final_count, None);
+            self.index.update_router_count(bucket_id, final_count, None);
 
             // 4. ⚡ RECONCILE: Prune the specific deletions we just handled
             self.bucket_manager
