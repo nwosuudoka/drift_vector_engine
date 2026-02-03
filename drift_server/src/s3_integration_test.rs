@@ -11,6 +11,7 @@ mod s3_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use aws_config::BehaviorVersion;
     use tempfile::tempdir;
     use tonic::Request;
 
@@ -56,7 +57,7 @@ mod s3_tests {
         println!("🚀 MinIO started at {endpoint}");
 
         // 2) Setup AWS SDK to create the bucket
-        let aws_config = aws_config::from_env()
+        let aws_config = aws_config::defaults(BehaviorVersion::latest())
             .endpoint_url(&endpoint)
             .region(aws_config::Region::new("us-east-1"))
             .credentials_provider(aws_credential_types::Credentials::new(
@@ -90,6 +91,7 @@ mod s3_tests {
         let drift_config = Config {
             port: 50099,
             wal_dir: dir.path().join("wal"),
+            data_dir: dir.path().join("data"),
             storage: StorageCommand::S3(S3Config {
                 bucket: "drift-test".to_string(),
                 region: "us-east-1".to_string(),

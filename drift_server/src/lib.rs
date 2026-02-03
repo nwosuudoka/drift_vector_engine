@@ -16,30 +16,56 @@ mod janitor_tests;
 #[cfg(test)]
 mod manager_tests; // Add this line
 #[cfg(test)]
-mod server_tests;
-// #[cfg(test)]
-// pub mod wal_integration_test;
-
-#[cfg(test)]
 mod persistence_tests;
-
-#[cfg(test)]
-mod tombstone_test;
-
-#[cfg(test)]
-mod scatter_budget_test;
-
 #[cfg(test)]
 mod s3_integration_test;
-
+#[cfg(test)]
+mod scatter_budget_test;
 #[cfg(test)]
 mod scavenger_test;
-
 #[cfg(test)]
 #[cfg(feature = "stress-test")]
 mod server_heavy_load_test;
+#[cfg(test)]
+mod server_tests;
+#[cfg(test)]
+mod tombstone_test;
+// v2.0
+pub mod local_staging;
+pub mod manifest;
+
+#[cfg(test)]
+mod local_staging_test;
+#[cfg(test)]
+mod manifest_tests;
 
 // Export the generated protobuf code so binaries (client) can use it
 pub mod drift_proto {
     tonic::include_proto!("drift");
 }
+
+// V2 implementation
+pub mod drift_server;
+pub mod janitor_v2;
+pub mod manager_v2;
+pub mod persistence_v2;
+pub mod reaper;
+pub mod recovery;
+pub mod server_v2;
+
+#[cfg(test)]
+mod janitor_v2_tests;
+#[cfg(test)]
+mod manager_v2_tests;
+#[cfg(test)]
+mod persistence_v2_tests;
+#[cfg(test)]
+mod recovery_test;
+#[cfg(test)]
+mod server_integration_tests;
+
+#[cfg(test)]
+mod reaper_test;
+
+#[cfg(test)]
+mod chaos_test;

@@ -1,5 +1,112 @@
 # Changelog
 
+## [v2.0.0-beta] - The LBR Architecture Complete
+
+### Hardening & Safety
+
+- **Split Consistency Guard:** Added `SAFETY CHECK` in `perform_split` to abort operations if the sum of child vectors is less than the parent, preventing data loss during race conditions.
+- **Router Truth:** Fixed `perform_flush` to fetch global centroid statistics from `BucketManager` before updating the Router, ensuring 100% recall even after small batch updates.
+- **Atomic Promotion:** Hardened `promote_segments` to atomically merge Local Staging + Remote Base into a new S3 segment, preventing read-glitches during tiering transitions.
+
+### Simulation & Verification
+
+- **Scale Harness:** Updated `billion_scale.rs` to run against the V2 architecture with real-time recall tracking.
+- **Churn Simulation:** Enhanced `churn_sim.rs` to validate "Hot Zombie" purging and memory reclamation under heavy delete load.
+- **Drift Simulation:** `drift_sim.rs` now verifies that the "Saturating Density" router correctly adapts to moving centroids over time.
+
+### Core Architecture (L
+
+## [Unreleased] - v2.0.0-alpha (The LBR Architecture)
+
+### Verified
+
+- **Garbage Collection:** Implemented and verified the `Reaper` integration. Proved that promoted local files and obsolete S3 segments are physically deleted after the Janitor cycle.
+- **Tiering Handover:** Hardened `Janitor` promotion logic to prevent race conditions where valid data was mistaken for "Zombie" buckets during the upload window.
+
+### Fixed
+
+- **Janitor Resurrection Bug:** Fixed a critical race condition in `promote_segments` where updating the registry to `Promoting` state wiped in-memory tombstones before they could be applied to the new S3 segment. Added logic to snapshot tombstones before registry updates.
+- **Atomic Manifest Updates:** Hardened `janitor_v2` to ensure bucket additions and stat updates happen in a single atomic manifest transaction.
+
+### Added
+
+- **Scatter-Merge (Zombie Healing):** Implemented a self-healing mechanism for under-filled or deleted ("Zombie") buckets.
+  - **Urgency-Based Trigger:** Uses `(Emptiness / Temp) + (Beta * ZombieRatio)` to prioritize merging dead buckets over merely small ones.
+  - **Budget Awareness:** Strictly limits merges to small buckets (< 50 items) to prevent write stalls on the hot path.
+  - **Delta-CoW Execution:** Merges data by writing fresh local staging files for neighbors, avoiding expensive S3 rewrites.
+  - **Drift Correction:** Automatically recalculates centroids and drift statistics for target buckets to maintain routing accuracy.
+
+**Summary:** massive architectural pivot from "Immutable Segments" to **"Local Buffered Rewrite" (LBR)**. This reduces write amplification by 100x and enables real-time drift adaptation without full index rebuilds.
+
+### Added
+
+- **Storage Engine V2 (`drift_storage`):**
+  - **Append-Only Files:** Local `.drift` files now support atomic RowGroup appends (Read Footer -> Write Data -> New Footer).
+  - **BucketManager:** Centralized coordinator that abstracts over Local (NVMe), Remote (S3), and Tiered (Cache) storage.
+  - **Tiered Fetch:** Transparently merges Local Delta + Remote Base files for unified reads.
+
+- **Maintenance Logic:**
+  - **Drift Tracking:** Real-time tracking of `vector_sum` and `count` per bucket to detect distribution shifts ($Drift > 0.15$).
+  - **Smart Split:** New split logic that identifies "Defectors" (vectors closer to neighbors) and loops them back to the MemTable instead of forcing them into suboptimal child buckets.
+  - **Singularity Detection:** Prevents splitting dense clusters (Variance < 0.01) to avoid infinite maintenance loops.
+
+- **Safety & Recovery:**
+  - **WAL V2:** Transactional Write-Ahead Log with `Begin`/`Commit` markers.
+  - **RecoveryManager:** Rebuilds the Routing Table and replays WALs upon startup.
+  - **Atomic Promotion:** `PersistenceManager` now merges Local Staging + S3 Base into a new optimized S3 segment safely.
+
+### Changed
+
+- **Flush Architecture:**
+  - _Old:_ Flush -> Run K-Means -> Create New Buckets -> Write S3.
+  - _New:_ Flush -> Route to Existing Buckets -> Append to Local Disk -> Update Stats.
+- **Janitor V2:** Now acts as an autonomous state machine managing Flush, Split, and Promotion lifecycles concurrently.
+
+### Removed
+
+- **Segment-Based Indexing:** The concept of "Segments" containing multiple buckets is replaced by "One File Per Bucket" (physically) for simpler compaction.
+
+### Added
+
+- **Storage:** Implemented `BucketFileWriter` with `Head-Of-Line` architecture (Quantizer in Header).
+- **Storage:** Added `Truncatable` trait to support safe file truncation on local disk while allowing streaming on S3.
+- **Storage:** Implemented `append_mode` logic: recovers Index/Bloom from old footer before overwriting.
+
+### Added
+
+- **Two-Stage Search:** Implemented `Scatter-Gather` (Hot Scan) + `Refine` (Cold Fetch) architecture.
+- **Tombstone Resurrection:** Added `unmark_delete` to `TombstoneTracker` to fix "Zombie" insert bugs.
+- **Parallel Scanning:** Updated `DiskSearcher` to use `Arc<dyn TombstoneView>`, enabling `tokio::spawn` for parallel bucket scans.
+- **VectorIndex Integration:** `VectorIndex::search` now orchestrates the full RAM -> Disk (Approx) -> Disk (Exact) pipeline.
+
+### Changed
+
+- **Architecture:** `VectorIndex` now relies on `dyn DiskSearcher` trait for disk access, enabling dependency injection of the Storage Layer.
+- **Search:** Implemented Scatter-Gather search (MemTable + Disk) in `VectorIndex`.
+
+### Added
+
+- **Traits:** Added `DiskSearcher` trait to `drift_core` to decouple storage from logic.
+- **BucketManager:** Started implementation of the disk-tier manager.
+
+## [Unreleased] - v2.0.0 Migration
+
+### Added
+
+- Implemented Router with flat-memory layout for cache-optimized routing."
+
+### Added
+
+- "Implemented BucketFileReader with robust skip logic."
+
+### Added
+
+- "Implemented Zero-Copy RowGroupWriter with SIMD alignment enforcement."
+
+### Added
+
+- **Migration Plan:** Established 7-phase roadmap for "Unified Row-Group + LBR" architecture.
+
 ## [0.6.5] - Physical Garbage Collection
 
 **Work in Progress**

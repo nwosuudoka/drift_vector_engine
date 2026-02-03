@@ -28,7 +28,7 @@ impl PageBlock {
     /// Allocate a custom-sized block (must be multiple of 4KB).
     pub fn with_size(size: usize) -> Self {
         assert!(
-            size > 0 && size % Self::ALIGNMENT == 0,
+            size > 0 && size.is_multiple_of(Self::ALIGNMENT),
             "Block size must be multiple of 4KB"
         );
 
@@ -62,6 +62,12 @@ impl PageBlock {
         if src.len() < self.size {
             self.as_mut_slice()[src.len()..].fill(0);
         }
+    }
+}
+
+impl Default for PageBlock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

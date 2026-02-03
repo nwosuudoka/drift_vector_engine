@@ -14,11 +14,12 @@ mod tests {
     fn default_test_config(path: &std::path::Path) -> Config {
         Config {
             port: 50051,
-            // ⚡ CHANGE: Use StorageCommand::File
+            // CHANGE: Use StorageCommand::File
             storage: StorageCommand::File(FileConfig {
                 path: path.join("storage"),
             }),
             wal_dir: path.join("wal"),
+            data_dir: path.join("data"),
             default_dim: 128,
             max_bucket_capacity: 1000,
             ef_construction: 50,

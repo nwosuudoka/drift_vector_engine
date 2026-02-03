@@ -1,54 +1,181 @@
-# Drift Vector Engine
+# Drift Vector Engine (v2)
 
-Rust workspace implementing the ideas sketched in `PAPER.pdf`: a drift-aware vector index with fast in-memory writes, SIMD-accelerated approximate search, and columnar on-disk persistence.
+Rust workspace implementing a drift-aware vector index with WAL-backed ingestion, unified
+on-disk row-group storage, and background maintenance for evolving data distributions.
+This README describes the **current v2 system** as implemented in this repository.
 
-## Implemented features
+## Overview
 
-- Hybrid two-level index: L0 `MemTable` (HNSW over raw f32 vectors) plus L1 product-quantized buckets with centroid routing and soft deletes.
-- Lazy ingestion + durability: O(1) memtable writes, async indexing on flush, WAL replay, and atomic rotation that truncates the WAL after flush.
-- Async search & training: `search_async` and async K-Means training with RAM-first search, phase separation (async IO vs sync CPU), and a recall guardrail.
-- Drift-aware retrieval: merges L0 HNSW results with L1 ADC scans using bucket temperature/density scoring (lambda/tau) and configurable `ef_search`.
-- Adaptive maintenance: bucket splitting with local k-means, scatter-merge healing, neighbor stealing, rebalancing, and Scavenger compaction to purge tombstones.
-- Quantization & training: percentile-clipped SQ8 quantizer, LUT-based ADC, and k-means++ training helpers with empty-cluster rescue.
-- SIMD hot paths: 64-byte aligned buffers, AVX2 ADC kernels (with scalar/NEON fallback), and cache-aware heap selection for top-k.
-- Storage format: columnar `.drift` segments with hot SQ8 blobs + cold ALP/ALP_RD blobs, checksummed blobs, Bloom filters, embedded quantizer metadata, and a 64-byte footer (`MAGIC_BYTES`).
-- Cloud-native IO + cache: opendal-backed storage URIs (local/S3) with a tiered page cache (local + remote, read-ahead) and a persistent `BitStore` for O(1) `VectorID -> BucketID` lookups.
-- Server API + tools: gRPC `Train`, `Insert`, and `Search`, multi-tenant collections, a `drift` CLI client, and `drift_sim` drift harness.
-- Background persistence: Janitor monitors L0 size, flushes to new segments via `PersistenceManager`, and persists tombstones for crash-safe deletes.
-- Tests: unit and integration coverage for k-means, quantizer, WAL, bucket logic, compression, segment IO, persistence, and janitor/WAL end-to-end flow.
+v2 is organized around **Logical Buckets** that can live in multiple physical locations:
+
+- **Local staging**: mutable `.drift` files under `data/<collection>/staging/`.
+- **Remote base**: immutable `.drift` files in the configured storage root (local or S3).
+- **Tiered**: a remote base plus a local delta.
+
+Search and maintenance operate on this logical view, while the Janitor keeps metadata
+and files consistent.
+
+## Architecture (v2)
+
+### Core components
+
+- **L0 MemTable (v2)**: append-only in-memory buffer with parallel scan search.
+- **WAL**: per-collection WAL for durable inserts/deletes, replayed on recovery.
+- **L1 Bucket Files**: columnar `.drift` files with hot SQ8 + cold ALP data, multiple
+  row groups for local staging, and a single run id for remote base files.
+- **Router**: centroid routing table that selects buckets using target_confidence, lambda,
+  tau, plus a distance guardrail.
+- **BucketManager**: tracks bucket state (Local/Remote/Tiered/Promoting), tombstones,
+  and provides unified search across local/remote tiers.
+- **BitStore (KV)**: persistent `VectorID -> BucketID` mapping used for L1 tombstones.
+- **Janitor v2**: background loop for flush, promotion, split, scatter merge, tombstone
+  persistence, and reaper cleanup.
+
+### Data layout (on disk)
+
+For a collection named `my_collection`:
+
+- WAL: `WAL_DIR/my_collection/`
+- Local staging: `DATA_DIR/my_collection/staging/`
+- KV store: `DATA_DIR/my_collection/kv/`
+- Remote storage root (local or S3): `STORAGE_ROOT/my_collection/`
+
+## Write path (v2)
+
+1. **Insert/Train** writes to WAL first.
+2. **MemTable** receives the vector (L0 visibility).
+3. When L0 reaches capacity it is rotated to a frozen table.
+4. **Janitor flush** partitions frozen vectors using the Router and appends row groups
+   to local staging files.
+5. **Router and KV** are updated: centroids/counts are recalculated and KV mappings
+   are written for each flushed ID.
+
+## Read path (v2)
+
+1. **Snapshot** L0 tombstones and active/frozen tables.
+2. **L0 scan**: parallel scan of memtables, filtered by L0 tombstones.
+3. **Bucket selection**: Router chooses buckets using target_confidence/lambda/tau plus
+   a distance guardrail.
+4. **L1 scan**: BucketManager scans local/remote/tiered files, applying per-bucket
+   tombstones and refining candidates.
+5. **Merge** L0 and L1 results, re-check L0 tombstones, return top-K.
+
+## Promotion (Local -> Remote)
+
+When a local staging file exceeds a threshold, the Janitor promotes it:
+
+1. **Lock** the bucket with the BucketCoordinator.
+2. **Rotate** the local file (active -> frozen) and create a new empty local file.
+3. **Merge** frozen local data with the remote base (if any), apply tombstones, and
+   write a new remote file.
+4. **Finalize**: bucket becomes Tiered, manifest run id is updated, tombstones are
+   pruned, and old files are scheduled for cleanup.
+
+Result: remote is compacted, local continues as a delta, and search reads both.
+
+## Split and Defector Loopback (Split/Steal update)
+
+When a bucket is too large or drifted:
+
+1. **Fetch** the bucket (merging tiers if needed).
+2. **K-Means (K=2)** produces two child centroids.
+3. **Partition** vectors into left/right children.
+4. **Defector check**: vectors that are much closer to a different global centroid are
+   looped back to L0 instead of being written to children.
+5. **Write** new local files for children, update manifest/router, delete old staging file.
+
+This replaces the older explicit neighbor stealing with a safer defector loopback guard.
+
+## Scatter Merge (Zombie healing)
+
+When a bucket becomes a zombie (low count / high urgency):
+
+1. **Fetch** the bucket data.
+2. **Scatter** each vector to the nearest neighbor centroid.
+3. **Rewrite neighbors** by writing new local files (copy-on-write).
+4. **Update** manifest/router/bucket manager and delete the zombie file.
+
+## Tombstones and deletes
+
+- **L0 tombstones** are maintained in-memory for fast filtering.
+- **L1 tombstones** are tracked per bucket; KV mapping provides `VectorID -> BucketID`.
+- **Persistence**: Janitor periodically persists a cumulative tombstone file and updates
+  the manifest pointer.
+
+## Recovery
+
+On startup, RecoveryManager:
+
+1. Loads the manifest and rebuilds the Router.
+2. Registers buckets in BucketManager (local or remote).
+3. Replays WAL inserts/deletes.
+4. Hydrates persisted tombstones.
+
+## Configuration
+
+CLI flags (also available via environment variables):
+
+- `DRIFT_PORT` (default 50051)
+- `DRIFT_WAL_DIR` (default ./data/wal)
+- `DRIFT_DATA` (default ./data/drift)
+- `DRIFT_DEFAULT_DIM` (default 128)
+- `DRIFT_MAX_BUCKET_CAPACITY` (default 1000)
+- `DRIFT_EF_CONSTRUCTION` (default 128)
+- `DRIFT_EF_SEARCH` (default 50)
+
+Storage:
+
+- File backend: `DRIFT_DATA_DIR` (root directory for remote storage)
+- S3 backend: `DRIFT_S3_BUCKET`, `DRIFT_S3_REGION`, `DRIFT_S3_ENDPOINT`,
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+
+## How to use (v2)
+
+### Run the server
+
+```
+cargo run -p drift_server
+```
+
+### Client / CLI
+
+```
+cargo run -p drift_server --bin client
+cargo run -p drift_server --bin drift -- --help
+```
+
+### Simulations
+
+```
+# v2 drift simulation
+cargo run -p drift_server --bin drift_sim --release
+
+# v2 churn/tombstone simulation
+cargo run -p drift_server --bin churn_sim --release
+```
+
+### Benchmarking (v2)
+
+```
+# Read/write benchmark (in-process)
+scripts/bench_rw.sh
+
+# Custom parameters
+scripts/bench_rw.sh -- --total-vectors 50000 --query-count 500
+```
 
 ## Workspace layout
 
-- `drift_core`: core vector index (L0+L1), WAL, quantizer, bucket maintenance, k-means, SIMD scanning, and async search/training.
-- `drift_storage`: on-disk segment format, compression pipelines, Bloom filter/index footer, and async disk manager.
-- `drift_cache`: block cache (S3-FIFO) and page manager implementations for disk-native buckets.
-- `drift_kv`: persistent `BitStore` used for `VectorID -> BucketID` mappings.
-- `drift_server`: gRPC server, multi-tenant collection manager, janitor, persistence wiring, and CLI/simulation binaries.
-- Supporting docs: `PAPER.pdf` (design target), `TODO.md`.
+- `drift_core`: v2 index, router, memtable, WAL, maintenance algorithms.
+- `drift_storage`: `.drift` file format, row groups, quantization, compression.
+- `drift_kv`: BitStore mapping for `VectorID -> BucketID`.
+- `drift_server`: gRPC server, v2 manager, janitor, persistence, and sims.
 
-## How to use
+## Current status (v2)
 
-- Build/tests: `cargo test` (or `cargo test -p drift_core`, `-p drift_storage`, `-p drift_server`).
-- Run the gRPC server: `cargo run -p drift_server` (listens on `127.0.0.1:50051`).
-- Sample client: `cargo run -p drift_server --bin client` (multi-collection insert/search demo).
-- CLI client: `cargo run -p drift_server --bin drift -- --help`.
-- Drift harness: `cargo run -p drift_server --bin drift_sim`.
-- API definitions: `drift_server/proto/drift.proto` defines `Train`, `Insert`, and `Search` requests.
-- Persistence: see `drift_server/src/persistence.rs` for flushing/loading patterns and `drift_server/src/janitor.rs` for the background loop.
-- Paper alignment: Each crate README notes which portions of `PAPER.pdf` are implemented today.
+- v2 server/manager/janitor are active and used by default (`drift_server` binary).
+- L0 uses a parallel scan MemTable; HNSW-based L0 is legacy v1.
+- v2 maintenance includes split with defector loopback and scatter merge.
+- Promotion supports Local/Remote/Tiered/Promoting states.
 
-## Status
-
-This codebase implements the core mechanics from `PAPER.pdf`—a drift-aware ANN with WAL-backed memtables, PQ buckets, compressed disk segments, and a gRPC service layer for training and search. Distributed consensus for stateless workers is the next major milestone (see `TODO.md`).
-
-## Next Steps
-
-| Feature            | Current State (v0.6.5)                                                                                | Target State (v2.0 LBR)                                                                     |
-| ------------------ | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| Data Layout        | Segment-Based: 1 File (.drift) contains N Buckets.                                                    | Bucket-Based: 1 Logical Bucket = 1 Physical File (S3) + 1 Local Log (NVMe).                 |
-| Ingestion (Flush)  | "Centroid Proliferation: Every flush runs K-Means, creates new Bucket IDs, and writes a new Segment." | Incremental: Flush assigns vectors to existing Centroids and appends to Local Staging.      |
-| Write Path         | MemTable → Partition → New Segment File.                                                              | MemTable → Assign → Local Staging File (.bin).                                              |
-| Persistence        | Immutable Segments: New segments created constantly.                                                  | Mutable-ish: Local files append. S3 files are rewritten only when large enough (Promotion). |
-| File Format        | Interleaved: Hot/Cold blobs stored per bucket inside a segment.                                       | Sectioned: Header → Hot Region (All SQ8) → Cold Region (All ALP/Meta) → Footer.             |
-| Read Path          | Scatter-Gather: Search scans multiple segments for the same region.                                   | Unified: Search scans S3 File + Local Log for specific Bucket ID.                           |
-| Garbage Collection | Vacuum: Deletes old segments not referenced by index.                                                 | Compaction: Merges S3 File + Local Log → New S3 File.                                       |
+If you want to map features to v1/v2 explicitly, see `SYSTEM_VIEW.md` and `TODO.v2.2.md`.

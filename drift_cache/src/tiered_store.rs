@@ -74,4 +74,8 @@ impl PageManager for TieredPageManager {
     async fn read_high_fidelity(&self, file_id: u32) -> Result<Vec<Vec<f32>>> {
         self.remote.read_high_fidelity(file_id).await
     }
+
+    async fn len(&self, file_id: u32) -> Result<u64> {
+        self.remote.len(file_id).await
+    }
 }

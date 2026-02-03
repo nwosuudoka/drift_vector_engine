@@ -23,63 +23,6 @@ impl SegmentCompactor {
         Ok(())
     }
 
-    // /// 🧹 PHASE 1: VACUUM SEGMENTS
-    // /// Deletes "segment_*.drift" files that are no longer referenced by any live bucket.
-    // #[instrument(skip(self), level = "info")]
-    // pub async fn vacuum_segments(&self) -> std::io::Result<()> {
-    //     // 1. Identify Live Files (Mark)
-    //     let mut live_files = HashSet::new();
-
-    //     // Get all headers from the index
-    //     let headers = self.index.get_all_bucket_headers();
-    //     let storage = self.index.cache.storage();
-
-    //     for header in headers {
-    //         let file_id = header.page_id.file_id;
-    //         // Ask storage layer which file this ID maps to
-    //         if let Some(path) = storage.get_physical_path(file_id) {
-    //             live_files.insert(path);
-    //         }
-    //     }
-
-    //     // 2. List All Files (Sweep)
-    //     let entries = self.op.list("").await.map_err(std::io::Error::other)?;
-    //     let mut deleted_count = 0;
-    //     let mut reclaimed_bytes = 0;
-
-    //     for entry in entries {
-    //         let path = entry.path();
-
-    //         // Only touch segment files
-    //         if !path.starts_with("segment_") || !path.ends_with(".drift") {
-    //             continue;
-    //         }
-
-    //         // If it's NOT in our live set, kill it.
-    //         if !live_files.contains(path) {
-    //             // Safety check: Don't delete brand new files created during a race?
-    //             // The Janitor registers files BEFORE they are visible, so live_files
-    //             // should capture them. But we can check mod time if we want to be paranoid.
-
-    //             let meta = self.op.stat(path).await.map_err(std::io::Error::other)?;
-    //             reclaimed_bytes += meta.content_length();
-
-    //             info!("Compactor: 🗑️ Deleting orphan segment: {}", path);
-    //             self.op.delete(path).await.map_err(std::io::Error::other)?;
-    //             deleted_count += 1;
-    //         }
-    //     }
-
-    //     if deleted_count > 0 {
-    //         info!(
-    //             "Compactor: Vacuum complete. Deleted {} segments, freed {} bytes.",
-    //             deleted_count, reclaimed_bytes
-    //         );
-    //     }
-
-    //     Ok(())
-    // }
-
     /// 🧹 PHASE 1: VACUUM SEGMENTS
     #[instrument(skip(self), level = "info")]
     pub async fn vacuum_segments(&self) -> std::io::Result<()> {

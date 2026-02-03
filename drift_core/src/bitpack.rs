@@ -164,14 +164,14 @@ pub fn unpack_u32_scalar<const W: usize>(input: &[u32], n: usize, out: &mut [u32
     let mut bits: usize = 0;
     let mut in_idx: usize = 0;
 
-    for i in 0..n {
+    for out_item in out.iter_mut().take(n) {
         while bits < W {
             bitbuf |= (input[in_idx] as u64) << bits;
             bits += 32;
             in_idx += 1;
         }
 
-        out[i] = (bitbuf & mask) as u32;
+        *out_item = (bitbuf & mask) as u32;
         bitbuf >>= W;
         bits -= W;
     }
@@ -186,7 +186,7 @@ fn max_value_for_width(w: usize) -> u32 {
 }
 
 fn packed_len(n: usize, w: usize) -> usize {
-    (n * w + 31) / 32
+    (n * w).div_ceil(32)
 }
 
 /* -----------------------------------------------------------

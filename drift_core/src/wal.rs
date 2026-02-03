@@ -25,7 +25,7 @@ impl WalWriter {
     pub fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
-            .write(true)
+            // .truncate(false)
             .append(true)
             .open(path)?;
 
@@ -179,7 +179,7 @@ impl WalReader {
             }
             OP_DELETE => {
                 let id = cursor.read_u64::<LittleEndian>()?;
-            Ok(WalEntry::Delete { id })
+                Ok(WalEntry::Delete { id })
             }
             _ => Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown OpCode")),
         }

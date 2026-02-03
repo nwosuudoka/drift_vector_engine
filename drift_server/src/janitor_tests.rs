@@ -379,14 +379,14 @@ mod tests {
         // 1. Cluster A: Around [0,0] (15 items)
         for i in 0..15 {
             ids.push(i);
-            // ⚡ FIX: Add noise to stabilize K-Means
+            //  Add noise to stabilize K-Means
             let noise = (i as f32) * 0.001;
             vecs.push(vec![0.0 + noise, 0.0 + noise]);
         }
         // 2. Cluster B: Around [100,100] (35 items) - The Drift
         for i in 15..50 {
             ids.push(i);
-            // ⚡ FIX: Add noise
+            //  Add noise
             let noise = (i as f32) * 0.001;
             vecs.push(vec![100.0 + noise, 100.0 + noise]);
         }

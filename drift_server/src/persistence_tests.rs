@@ -94,7 +94,7 @@ mod tests {
         {
             let index = create_index_with_storage(dir.path(), "run1.wal");
 
-            // ⚡ FIX: Use distinct data so ranking is deterministic.
+            //  Use distinct data so ranking is deterministic.
             for i in 0..50 {
                 // ID 0 = [10.0, 10.0]
                 // ID 1 = [10.1, 10.1]

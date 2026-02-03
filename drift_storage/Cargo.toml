@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 drift_core = { path = "../drift_core" }
+drift_cache = { path = "../drift_cache" }
 drift_traits = { path = "../drift_traits" }
 bytes = "1.5"                                  # Efficient byte buffer management
 tokio = { version = "1", features = ["full"] } # Async I/O
@@ -22,3 +23,8 @@ opendal = { version = "0.55.0", features = ["services-fs", "services-s3"] }
 url = "2.5"
 async-trait = "0.1"                                                         # For PageManager trait
 bit-set = "0.8.0"
+zerocopy = "0.8.33"
+parking_lot = "0.12"                                                        # For RwLock
+tracing = "0.1.44"
+futures = "0.3"
+atomic_float = "1.1.0"

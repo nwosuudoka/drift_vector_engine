@@ -2,8 +2,8 @@ use clap::Parser;
 use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{InsertRequest, SearchRequest, TrainRequest, Vector};
-use drift_server::manager::CollectionManager;
-use drift_server::server::DriftService;
+use drift_server::manager_v2::CollectionManager;
+use drift_server::server_v2::DriftService;
 use rand::prelude::*;
 use rand_distr::{Distribution, Normal};
 use std::sync::Arc;
@@ -25,7 +25,6 @@ struct DriftingCluster {
 impl DriftingCluster {
     fn new(rng: &mut impl Rng, dim: usize, drift_speed: f32) -> Self {
         let center: Vec<f32> = (0..dim).map(|_| rng.random::<f32>() * 100.0).collect();
-        // Increased velocity variance
         let velocity: Vec<f32> = (0..dim)
             .map(|_| (rng.random::<f32>() - 0.5) * drift_speed)
             .collect();
@@ -33,7 +32,7 @@ impl DriftingCluster {
         Self {
             center,
             velocity,
-            std_dev: 20.0,
+            std_dev: 15.0,
         }
     }
 
@@ -53,7 +52,6 @@ impl DriftingCluster {
 }
 
 struct World {
-    _dim: usize,
     clusters: Vec<DriftingCluster>,
     rng: StdRng,
 }
@@ -64,12 +62,7 @@ impl World {
         let clusters = (0..num_clusters)
             .map(|_| DriftingCluster::new(&mut rng, dim, drift_speed))
             .collect();
-
-        Self {
-            _dim: dim,
-            clusters,
-            rng,
-        }
+        Self { clusters, rng }
     }
 
     fn drift(&mut self) {
@@ -121,32 +114,33 @@ fn calculate_recall(results: &[u64], ground_truth: &[u64]) -> f32 {
     hits as f32 / ground_truth.len() as f32
 }
 
-// 🛑 FORCE FLUSH: Ensures we are testing L1 (Disk) not L0 (RAM)
 async fn force_flush_and_wait(service: &DriftService, collection: &str) {
     let coll = service
         .manager
-        .get_or_create(collection, None)
+        .get_or_create(collection, None, None)
         .await
         .unwrap();
 
-    // Busy wait until MemTable is drained by Janitor
-    // We assume the Janitor is running in the background (spawned by manager)
     let mut retries = 0;
     while coll.index.memtable_len() > 0 {
         sleep(Duration::from_millis(100)).await;
         retries += 1;
         if retries > 100 {
-            // 10s timeout
-            println!("⚠️ Warning: MemTable didn't flush completely.");
+            println!("⚠️ Warning: MemTable flush timeout.");
             break;
         }
     }
-    // Extra buffer for file sys sync
+    loop {
+        if coll.index.get_frozen_count() == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
     sleep(Duration::from_millis(500)).await;
 }
 
 // =================================================================
-// 3. SIMULATION RUNNER
+// 3. MAIN
 // =================================================================
 
 #[derive(Parser)]
@@ -168,48 +162,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir = tempdir()?;
 
-    // ⚡ FIX: Use the new Configuration Strategy Pattern
+    // ⚡ CONFIGURATION
     let config = Config {
-        port: 50052,
+        port: 50055,
         wal_dir: dir.path().join("wal"),
-        // Strategy: File System
+        data_dir: dir.path().join("data"),
         storage: StorageCommand::File(FileConfig {
             path: dir.path().join("storage"),
         }),
         default_dim: args.dim,
-        // 600 * 1.5 = 900.
-        // Since we insert 1000 items, 1000 > 900, so the Janitor WILL split every bucket.
         max_bucket_capacity: 600,
         ef_construction: 64,
-        ef_search: 64,
+        ef_search: 256,
     };
+
+    println!("🌍 Starting Concept Drift Simulation (Instrumented)");
+    println!("   • Clusters: {}", args.clusters);
+    println!("   • Velocity: 5.0 (High)");
+    println!("   • Buckets:  Max capacity {}", config.max_bucket_capacity);
 
     let manager = Arc::new(CollectionManager::new(config));
     let service = DriftService {
         manager: manager.clone(),
     };
-    let collection_name = "sim_world";
+    let collection_name = "drift_simulation";
 
-    // Speed: 3.0 is moderate-high.
-    let mut world = World::new(args.dim, args.clusters, 3.0, 999);
+    let mut world = World::new(args.dim, args.clusters, 5.0, 999);
     let mut shadow_db: Vec<(u64, Vec<f32>)> = Vec::new();
     let mut next_id = 0;
 
-    println!("🌍 Starting Hard-Mode Drift Simulation");
-    println!("   • Clusters: {}", args.clusters);
-    println!("   • Drift Speed: 3.0");
-    println!("   • Bucket Cap: 600 (Forces flush)");
-
-    // ... (Training Phase) ...
-    println!("\n📚 Phase 1: Initial Training...");
+    println!("\n📚 Phase 1: Training...");
     let mut train_batch = world.generate_batch(2000, next_id);
+    next_id += 2000;
 
     if !train_batch.is_empty() {
-        train_batch[0].values = vec![-1000.0; args.dim];
-        train_batch[1].values = vec![1000.0; args.dim];
+        train_batch[0].values = vec![-500.0; args.dim];
+        train_batch[1].values = vec![1500.0; args.dim];
     }
 
-    next_id += 2000;
     for v in &train_batch {
         shadow_db.push((v.id, v.values.clone()));
     }
@@ -219,15 +209,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vectors: train_batch,
     });
     service.train(train_req).await?;
-    println!("✅ Training Complete.");
+    println!("✅ Index Trained.");
 
-    // Loop
+    // Tuning Parameters
+    let lambda = 0.05; // Fuzzier
+    // let tau = 60.0; // Matches bucket cap 600 / 10
+    let tau = 20.0; // Matches bucket cap 600 / 10
+
     for b in 1..=args.batches {
         world.drift();
+
         let batch = world.generate_batch(args.batch_size, next_id);
         next_id += args.batch_size as u64;
 
-        // Ingest
         for v in &batch {
             shadow_db.push((v.id, v.values.clone()));
             service
@@ -238,10 +232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
         }
 
-        // Wait for flush
         force_flush_and_wait(&service, collection_name).await;
 
-        // Measure
         let query_vec = world.clusters[0].generate_point(&mut world.rng);
         let k = 10;
         let ground_truth = calculate_ground_truth(&shadow_db, &query_vec, k);
@@ -250,12 +242,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             collection_name: collection_name.to_string(),
             vector: query_vec,
             k: k as u32,
-            target_confidence: 0.95,
-
-            // FIX: Lower Lambda to allow "fuzzier" matching as data drifts away
-            lambda: 0.1,
-
-            tau: 100.0,
+            target_confidence: 0.99,
+            lambda,
+            tau,
         });
 
         let start_q = Instant::now();
@@ -265,21 +254,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let result_ids: Vec<u64> = response.results.iter().map(|r| r.id).collect();
         let recall = calculate_recall(&result_ids, &ground_truth);
 
-        // Check adaptability
-        let coll = manager.get_or_create(collection_name, None).await.unwrap();
-        let bucket_count = coll.index.get_all_bucket_headers().len();
+        let coll = manager
+            .get_or_create(collection_name, Some(args.dim), None)
+            .await
+            .unwrap();
+        let (_centroids, _ids, counts) = coll.index.get_router().read().get_snapshot_with_counts();
+
+        // ⚡ INSTRUMENTATION: Bucket Stats (via router counts)
+        let bucket_count = counts.len();
+        let mut sorted = counts.clone();
+        sorted.sort_unstable();
+        let min = sorted.first().copied().unwrap_or(0);
+        let max = sorted.last().copied().unwrap_or(0);
+        let p50 = sorted.get(sorted.len() / 2).copied().unwrap_or(0);
+
+        // Count buckets suppressed by Tau
+        let suppressed = counts.iter().filter(|&&c| (c as f32) < tau).count();
 
         println!(
-            "Tick {:02}: Recall: {:>6.2}% | Buckets: {:>2} | Latency: {:>2}ms | Total: {}",
+            "Tick {:02}: Recall: {:>6.2}% | Buckets: {} | Size (Min/P50/Max): {}/{}/{} | <Tau: {} | Latency: {:>2}ms",
             b,
             recall * 100.0,
             bucket_count,
+            min,
+            p50,
+            max,
+            suppressed,
             q_lat.as_millis(),
-            shadow_db.len()
         );
 
-        if recall < 0.7 {
-            println!("   ⚠️  CRITICAL: Recall dropped significantly!");
+        if recall < 0.8 {
+            println!("   ⚠️  Recall Drop Detected! Index might be lagging behind drift.");
         }
     }
 

@@ -74,6 +74,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging so we can see output!
+    tracing_subscriber::fmt::init();
+
     let cli = Cli::parse();
 
     // Connect to gRPC Server

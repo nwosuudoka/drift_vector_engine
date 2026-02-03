@@ -15,6 +15,9 @@ pub struct Config {
     #[arg(long, env = "DRIFT_WAL_DIR", default_value = "./data/wal")]
     pub wal_dir: PathBuf,
 
+    #[arg(long, env = "DRIFT_DATA", default_value = "./data/drift/")]
+    pub data_dir: PathBuf,
+
     /// Default Vector Dimension (if not inferred)
     #[arg(long, env = "DRIFT_DEFAULT_DIM", default_value_t = 128)]
     pub default_dim: usize,

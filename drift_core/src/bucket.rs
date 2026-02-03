@@ -307,6 +307,11 @@ impl Bucket {
 }
 
 /// ⚡ CORE ADC KERNEL
+///
+/// # Safety
+/// - `code_ptr` must be valid for reads of `dim` bytes.
+/// - `lut_ptr` must be valid for reads of `dim * 256` `f32` values.
+/// - Both pointers must be properly aligned for `u8` and `f32` reads.
 #[allow(unsafe_op_in_unsafe_fn)]
 #[inline(always)]
 pub unsafe fn compute_distance_lut(

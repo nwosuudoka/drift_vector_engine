@@ -1257,12 +1257,15 @@ dependencies = [
  "drift_traits",
  "hnsw_rs",
  "parking_lot",
+ "prost",
+ "prost-build",
  "rand 0.9.2",
  "rayon",
  "serde",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
+ "tonic-build",
  "tracing",
  "zerocopy",
 ]
@@ -1284,6 +1287,7 @@ dependencies = [
 name = "drift_server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
@@ -1294,8 +1298,11 @@ dependencies = [
  "crossbeam-epoch",
  "drift_cache",
  "drift_core",
+ "drift_kv",
  "drift_storage",
+ "drift_traits",
  "opendal",
+ "parking_lot",
  "prost",
  "rand 0.9.2",
  "rand_distr",
@@ -1315,6 +1322,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1322,22 +1330,28 @@ name = "drift_storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "atomic_float",
  "bincode 2.0.1",
  "bit-set",
  "byteorder",
  "bytes",
  "crc32fast",
+ "drift_cache",
  "drift_core",
  "drift_traits",
  "fastbloom",
+ "futures",
  "memmap2",
  "opendal",
+ "parking_lot",
  "rand 0.9.2",
  "serde",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
+ "tracing",
  "url",
+ "zerocopy",
 ]
 
 [[package]]
@@ -4830,18 +4844,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.31"
+version = "0.8.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd74ec98b9250adb3ca554bdde269adf631549f51d8a8f8f0a10b50f1cb298c3"
+checksum = "668f5168d10b9ee831de31933dc111a459c97ec93225beb307aed970d1372dfd"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.31"
+version = "0.8.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8a8d209fdf45cf5138cbb5a506f6b52522a25afccc534d1475dad8e31105c6a"
+checksum = "2c7962b26b0a8685668b671ee4b54d007a67d4eaf05fda79ac0ecf41e32270f1"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -23,7 +23,7 @@ where
         } else {
             concurrency.next_power_of_two()
         };
-        let capacity_per_shard = (total_capacity + num_shards - 1) / num_shards;
+        let capacity_per_shard = total_capacity.div_ceil(num_shards);
         let metrics = Arc::new(CacheMetrics::default());
 
         let mut shards = Vec::with_capacity(num_shards);
@@ -62,6 +62,10 @@ where
 
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn stats(&self) -> CacheStats {
