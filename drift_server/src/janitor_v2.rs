@@ -76,6 +76,21 @@ impl Janitor {
         }
     }
 
+    fn update_kv_mapping(&self, bucket_id: u32, ids: &[u64]) {
+        let kv = self.index.get_kv();
+        let bucket_bytes = bucket_id.to_le_bytes();
+        for id in ids {
+            let _ = kv.put(&id.to_le_bytes(), &bucket_bytes);
+        }
+    }
+
+    fn remove_kv_mapping(&self, ids: &[u64]) {
+        let kv = self.index.get_kv();
+        for id in ids {
+            let _ = kv.remove(&id.to_le_bytes());
+        }
+    }
+
     pub async fn run(&self) {
         let mut interval = time::interval(self.vars.check_interval);
         info!("Janitor: Started.");
@@ -117,6 +132,9 @@ impl Janitor {
         for (bucket_id, group) in &partitions {
             // A. Append to Local Staging
             let new_count = self.staging.append_batch(*bucket_id, group).await?;
+
+            // A1. Update KV (VectorID -> BucketID)
+            self.update_kv_mapping(*bucket_id, &group.ids);
 
             // B. Ensure Registered
             if self.bucket_manager.get_version(*bucket_id).is_none() {
@@ -516,6 +534,16 @@ impl Janitor {
         let count_r = self.staging.append_batch(id_right, &proposal.right).await?;
         let file_r = self.staging.get_active_filename(id_right);
 
+        // Update KV mapping for new buckets
+        self.update_kv_mapping(id_left, &proposal.left.ids);
+        self.update_kv_mapping(id_right, &proposal.right.ids);
+
+        // Remove KV mapping for loopback (now L0-only)
+        if !proposal.loopback.is_empty() {
+            let loopback_ids: Vec<u64> = proposal.loopback.iter().map(|(id, _)| *id).collect();
+            self.remove_kv_mapping(&loopback_ids);
+        }
+
         // 3. Register New Files (Local)
         self.bucket_manager
             .register_bucket(id_left, file_l, StorageClass::Local);
@@ -658,6 +686,9 @@ impl Janitor {
             self.staging
                 .write_new_file(&new_filename, &merged_group)
                 .await?;
+
+            // Update KV mapping for all IDs now owned by target_id
+            self.update_kv_mapping(*target_id, &merged_group.ids);
 
             // Track update: (ID, Count, Sum, Centroid, Filename)
             manifest_updates.push((
