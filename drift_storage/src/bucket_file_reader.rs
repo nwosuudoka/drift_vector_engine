@@ -6,7 +6,6 @@ use crate::format::{
     DriftFooter, DriftHeader, HEADER_SIZE, MAGIC_V2, ROW_GROUP_HEADER_SIZE, RowGroupHeader,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
-use drift_core::bucket::compute_distance_lut;
 use drift_core::quantizer::Quantizer;
 use drift_traits::{IoContext, SearchCandidate, TombstoneView};
 use fastbloom::BloomFilter;
@@ -501,4 +500,45 @@ impl BucketFileReader {
 
         Ok(q)
     }
+}
+
+/// CORE ADC KERNEL
+///
+/// # Safety
+/// - `code_ptr` must be valid for reads of `dim` bytes.
+/// - `lut_ptr` must be valid for reads of `dim * 256` `f32` values.
+/// - Both pointers must be properly aligned for `u8` and `f32` reads.
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline(always)]
+pub unsafe fn compute_distance_lut(
+    mut code_ptr: *const u8,
+    lut_ptr: *const f32,
+    dim: usize,
+) -> f32 {
+    let mut sum = 0.0;
+    let mut i = 0;
+    // 4x Loop Unrolling
+    while i + 4 <= dim {
+        let c0 = *code_ptr.add(0) as usize;
+        let c1 = *code_ptr.add(1) as usize;
+        let c2 = *code_ptr.add(2) as usize;
+        let c3 = *code_ptr.add(3) as usize;
+
+        let v0 = *lut_ptr.add((i) * 256 + c0);
+        let v1 = *lut_ptr.add((i + 1) * 256 + c1);
+        let v2 = *lut_ptr.add((i + 2) * 256 + c2);
+        let v3 = *lut_ptr.add((i + 3) * 256 + c3);
+
+        sum += v0 + v1 + v2 + v3;
+        code_ptr = code_ptr.add(4);
+        i += 4;
+    }
+    while i < dim {
+        let c = *code_ptr as usize;
+        let val = *lut_ptr.add(i * 256 + c);
+        sum += val;
+        code_ptr = code_ptr.add(1);
+        i += 1;
+    }
+    sum
 }

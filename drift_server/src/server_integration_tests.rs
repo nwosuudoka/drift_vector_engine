@@ -2,12 +2,12 @@
 mod tests {
     use crate::local_staging::LocalStagingManager;
     use crate::manifest::ServerManifestManager;
-    use crate::persistence_v2::PersistenceManager;
+    use crate::persistence::PersistenceManager;
     use crate::recovery::RecoveryManager;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::partitioner::PartitionGroup;
     use drift_core::quantizer::Quantizer;
-    use drift_core::wal_v2::WalWriter;
+    use drift_core::wal::WalWriter;
     use drift_storage::bucket_file_writer::BucketFileWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
     use drift_traits::StorageEngine;
@@ -228,16 +228,16 @@ mod tests {
 
 #[cfg(test)]
 mod janitor_reaper_integration_tests {
-    use crate::janitor_v2::{Janitor, JanitorConfig, JanitorVars};
+    use crate::janitor::{Janitor, JanitorConfig, JanitorVars};
     use crate::local_staging::LocalStagingManager;
     use crate::manifest::ServerManifestManager;
-    use crate::persistence_v2::PersistenceManager;
-    use drift_core::index_v2::VectorIndex;
+    use crate::persistence::PersistenceManager;
+    use drift_core::index::VectorIndex;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
     use drift_core::quantizer::Quantizer;
     use drift_core::router::Router;
-    use drift_core::wal_v2::WalManager;
+    use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
     use drift_storage::bucket_file_writer::BucketFileWriter;
     use drift_storage::bucket_manager::BucketManager;

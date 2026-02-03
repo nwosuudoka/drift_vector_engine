@@ -26,7 +26,7 @@
 ### Fixed
 
 - **Janitor Resurrection Bug:** Fixed a critical race condition in `promote_segments` where updating the registry to `Promoting` state wiped in-memory tombstones before they could be applied to the new S3 segment. Added logic to snapshot tombstones before registry updates.
-- **Atomic Manifest Updates:** Hardened `janitor_v2` to ensure bucket additions and stat updates happen in a single atomic manifest transaction.
+- **Atomic Manifest Updates:** Hardened `janitor` to ensure bucket additions and stat updates happen in a single atomic manifest transaction.
 
 ### Added
 

@@ -1,384 +1,376 @@
 #[cfg(test)]
-#[cfg(feature = "stress-test")]
 mod tests {
     use crate::config::{Config, FileConfig, StorageCommand};
-    use crate::drift_proto::{
-        InsertBatchRequest, InsertRequest, SearchRequest, Vector, drift_server::Drift,
-    };
     use crate::manager::CollectionManager;
-    use crate::server::DriftService;
-    use rand::Rng;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
     use tempfile::tempdir;
-    use tonic::Request;
 
     const DIM: usize = 128;
-    const TOTAL_VECTORS: usize = 100_000;
-    const BATCH_SIZE: usize = 1_000;
-    const QUERY_COUNT: usize = 100;
 
-    fn generate_random_vector(rng: &mut impl Rng) -> Vec<f32> {
-        (0..DIM).map(|_| rng.random::<f32>()).collect()
+    fn test_config(root: &std::path::Path) -> Config {
+        Config {
+            port: 50051,
+            wal_dir: root.join("wal"),
+            data_dir: root.join("data"),
+            storage: StorageCommand::File(FileConfig {
+                path: root.join("storage"),
+            }),
+            default_dim: DIM,
+            max_bucket_capacity: 1000,
+            ef_construction: 50,
+            ef_search: 50,
+        }
     }
 
     #[tokio::test]
-    // #[ignore]
-    async fn test_server_heavy_load_performance() {
+    async fn test_manager_initializes_v2_architecture() {
         let dir = tempdir().unwrap();
-
-        // ⚡ CHANGE: Use the new nested Configuration structure
-        let config = Config {
-            port: 50051,
-            wal_dir: dir.path().join("wal"),
-            data_dir: dir.path().join("data"),
-
-            // New Storage Strategy
-            storage: StorageCommand::File(FileConfig {
-                path: dir.path().join("storage"),
-            }),
-
-            default_dim: DIM,
-            max_bucket_capacity: 2000,
-            // Tuning for 100k Vectors:
-            ef_construction: 200,
-            ef_search: 200,
-        };
-
+        let config = test_config(dir.path());
+        let data_dir = config.data_dir.clone();
         let manager = Arc::new(CollectionManager::new(config));
-        let service = DriftService {
-            manager: manager.clone(),
-        };
-        let collection = "stress_test";
 
-        println!("🚀 Starting Load Test: {} Vectors", TOTAL_VECTORS);
+        let collection_name = "v2_init_test";
 
-        // 2. Ingestion Phase
-        let start_ingest = Instant::now();
-        let mut rng = rand::rng();
+        // 1. Initialize Collection
+        let collection = manager
+            .get_or_create(collection_name, None, None)
+            .await
+            .expect("Failed to create collection");
 
-        for batch_idx in 0..(TOTAL_VECTORS / BATCH_SIZE) {
-            let start_id = (batch_idx * BATCH_SIZE) as u64;
+        // 2. Verify Directory Structure (The V2 Signature)
+        // Root: data/v2_init_test/
+        let coll_root = data_dir.join(collection_name);
 
-            let mut batch_vecs = Vec::with_capacity(BATCH_SIZE);
-            for i in 0..BATCH_SIZE {
-                let id = start_id + i as u64;
-                let vector = generate_random_vector(&mut rng);
-                batch_vecs.push(Vector { id, values: vector });
-            }
-
-            let req = Request::new(InsertBatchRequest {
-                collection_name: collection.to_string(),
-                vectors: batch_vecs,
-            });
-
-            service
-                .insert_batch(req)
-                .await
-                .expect("Batch Insert failed");
-
-            if batch_idx % 10 == 0 {
-                println!("    Inserted {} vectors...", start_id + BATCH_SIZE as u64);
-            }
-        }
-
-        let ingest_duration = start_ingest.elapsed();
-        println!("✅ Ingestion Complete in {:.2?}", ingest_duration);
-        println!(
-            "    Throughput: {:.0} vec/sec",
-            TOTAL_VECTORS as f64 / ingest_duration.as_secs_f64()
+        // Assert these directories were created by the Manager
+        assert!(coll_root.join("kv").exists(), "KV directory missing");
+        assert!(
+            coll_root.join("staging").exists(),
+            "Staging directory missing"
         );
 
-        // 3. Inject "Needle" for verification
-        let needle_id = 999_999;
-        let needle_vec = vec![0.5; DIM];
-        println!("💉 Injecting Needle (ID {})...", needle_id);
-        service
-            .insert(Request::new(InsertRequest {
-                collection_name: collection.to_string(),
-                vector: Some(Vector {
-                    id: needle_id,
-                    values: needle_vec.clone(),
-                }),
-            }))
+        // The WAL dir is separate in config
+        let wal_dir = dir.path().join("wal").join(collection_name);
+        assert!(wal_dir.exists(), "WAL directory missing");
+
+        // 3. Verify Components are Live
+        let index = &collection.index;
+
+        // Check V2 specific components
+        // KV should be accessible
+        let test_key = 100u64.to_le_bytes();
+        assert!(index.get_kv().get(&test_key).is_ok(), "KV store not active");
+
+        // Check Dimensions
+        assert_eq!(index.get_dim(), DIM);
+    }
+
+    #[tokio::test]
+    async fn test_manager_recovers_state() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let data_dir = config.data_dir.clone();
+        let manager = Arc::new(CollectionManager::new(config.clone()));
+        let name = "recovery_test";
+
+        // 1. Create and Modify
+        {
+            let coll = manager.get_or_create(name, None, None).await.unwrap();
+            // Insert something to trigger WAL/KV creation
+            coll.index.insert(1, &[0.0; DIM]).unwrap();
+        } // Drop collection ref
+
+        // 2. Re-Initialize (Simulate Restart)
+        let manager2 = Arc::new(CollectionManager::new(config));
+        let _coll2 = manager2.get_or_create(name, None, None).await.unwrap();
+
+        // 3. Verify Persistence
+        // The KV/WAL should still exist on disk.
+        // Note: Actual data recovery is tested in core/server integration tests.
+        // Here we just ensure the Manager doesn't crash or blow up the folders.
+
+        let kv_path = data_dir.join(name).join("kv");
+        assert!(kv_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_dimension_mismatch_prevention() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let manager = Arc::new(CollectionManager::new(config));
+
+        // 1. Create with Dim 128
+        let _ = manager
+            .get_or_create("dim_test", Some(128), Some(2000))
             .await
             .unwrap();
-        println!("✅ Needle Injected.");
 
-        // 4. Wait for Janitor / Indexing
-        println!("⏳ Waiting for background flush/indexing...");
-        tokio::time::sleep(Duration::from_secs(4)).await; // Increased wait
+        // 2. Try to get with Dim 64 -> Should Fail
+        let result = manager
+            .get_or_create("dim_test", Some(64), Some(2000))
+            .await;
 
-        // 5. Query Phase
-        println!("🔍 Starting Query Benchmark...");
-        let mut latencies = Vec::with_capacity(QUERY_COUNT);
+        assert!(result.is_err());
 
-        for _ in 0..QUERY_COUNT {
-            let query_vec = generate_random_vector(&mut rng);
-            let start_q = Instant::now();
-            let req = Request::new(SearchRequest {
-                collection_name: collection.to_string(),
-                vector: query_vec,
-                k: 10,
-                target_confidence: 0.95,
-                lambda: 1.0,
-                tau: 100.0,
-            });
-            let _ = service.search(req).await.expect("Search failed");
-            latencies.push(start_q.elapsed());
+        match result {
+            Ok(_) => assert!(false, "should not get here"),
+            Err(e) => assert!(e.to_string().contains("Dimension mismatch")),
         }
-
-        // 6. Verification Query
-        println!("🔎 Verifying Needle...");
-        let verify_req = Request::new(SearchRequest {
-            collection_name: collection.to_string(),
-            vector: needle_vec,
-            k: 5,
-            target_confidence: 0.99,
-            lambda: 1.0,
-            tau: 100.0,
-        });
-
-        let verify_res = service.search(verify_req).await.unwrap().into_inner();
-        let found = verify_res.results.iter().any(|r| r.id == needle_id);
-
-        // 7. Report
-        latencies.sort();
-        let p50 = latencies[latencies.len() / 2];
-        let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
-
-        println!("========================================");
-        println!("📊 LOAD TEST RESULTS");
-        println!("Total Vectors: {}", TOTAL_VECTORS);
-        println!("P50 Latency:   {:.2?}", p50);
-        println!("P99 Latency:   {:.2?}", p99);
-        println!(
-            "Correctness:   {}",
-            if found { "PASS ✅" } else { "FAIL ❌" }
-        );
-        println!("========================================");
-
-        assert!(found, "Failed to find the needle vector!");
     }
 }
 
 #[cfg(test)]
-#[cfg(feature = "stress-test")]
-mod pretrained_tests {
+mod load_and_unload_collection_test {
     use crate::config::{Config, FileConfig, StorageCommand};
-    use crate::drift_proto::{
-        InsertBatchRequest, InsertRequest, SearchRequest, Vector, drift_server::Drift,
-    };
     use crate::manager::CollectionManager;
-    use crate::server::DriftService;
-    use rand::Rng;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
     use tempfile::tempdir;
-    use tonic::Request;
 
-    const DIM: usize = 128;
-    const TOTAL_VECTORS: usize = 100_000;
-    const BATCH_SIZE: usize = 1_000;
-    const QUERY_COUNT: usize = 100;
-
-    fn generate_random_vector(rng: &mut impl Rng) -> Vec<f32> {
-        (0..DIM).map(|_| rng.random::<f32>()).collect()
+    fn test_config(root: &std::path::Path) -> Config {
+        Config {
+            port: 50051,
+            wal_dir: root.join("wal"),
+            data_dir: root.join("data"), // Explicit data root
+            storage: StorageCommand::File(FileConfig {
+                path: root.join("storage_unused"),
+            }),
+            default_dim: 128,
+            max_bucket_capacity: 1000,
+            ef_construction: 50,
+            ef_search: 50,
+        }
     }
 
     #[tokio::test]
-    // #[ignore]
-    async fn test_server_heavy_load_performance() {
-        // =================================================================
-        // 1. SETUP
-        // =================================================================
-
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("drift_server=trace,info") // Show traces for your app, info for others
-            .with_test_writer() // Print to test output
-            .try_init(); // Safe to call multiple times
-
+    async fn test_manager_creates_directory_structure() {
         let dir = tempdir().unwrap();
-
-        // ⚡ CHANGE: Use the new nested Configuration structure
-        let config = Config {
-            port: 50051,
-            wal_dir: dir.path().join("wal"),
-            data_dir: dir.path().join("data"),
-
-            // New Storage Strategy
-            storage: StorageCommand::File(FileConfig {
-                path: dir.path().join("storage"),
-            }),
-
-            default_dim: DIM,
-            max_bucket_capacity: 2_000, // Trigger flushes often
-            ef_construction: 80,
-            ef_search: 200,
-        };
-
+        let config = test_config(dir.path());
         let manager = Arc::new(CollectionManager::new(config));
-        let service = DriftService {
-            manager: manager.clone(),
-        };
-        let collection = "stress_test";
-        let mut rng = rand::rng();
 
-        // =================================================================
-        // 🚦 PHASE 1: WARM-UP & TRAINING
-        // =================================================================
-        // We insert enough vectors to exceed max_bucket_capacity (2000)
-        // to force the FIRST flush and TRAIN the index now.
-        println!("🔥 WARM-UP: Inserting 3,000 vectors to force initial training...");
+        let name = "test_struct";
+        manager.get_or_create(name, None, None).await.unwrap();
 
-        let warmup_count = 3000;
-        let mut warmup_vecs = Vec::with_capacity(warmup_count);
+        // Verify Structure:
+        // root/data/test_struct/
+        //   |-- staging/
+        //   |-- kv/
+        //   |-- manifest.pb
+        // root/wal/test_struct/
 
-        for i in 0..warmup_count {
-            // Use high IDs for warmup to avoid collision with main test (optional but cleaner)
-            let id = 10_000_000 + i as u64;
-            warmup_vecs.push(Vector {
-                id,
-                values: generate_random_vector(&mut rng),
-            });
+        let coll_root = dir.path().join("data").join(name);
+        assert!(coll_root.exists());
+        assert!(coll_root.join("staging").exists());
+        assert!(coll_root.join("kv").exists());
+
+        // let err_log = format!("{:?}", coll_root.join("manifest.pb"));
+        assert!(coll_root.join("manifest.pb").exists());
+
+        let wal_root = dir.path().join("wal").join(name);
+        assert!(wal_root.exists());
+    }
+
+    #[tokio::test]
+    async fn test_manager_reloads_collection() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let name = "persist";
+
+        // 1. Initial Run
+        {
+            let manager = Arc::new(CollectionManager::new(config.clone()));
+            let coll = manager.get_or_create(name, None, None).await.unwrap();
+
+            // Insert Data (Writes to WAL)
+            coll.index.insert(1, &[0.0; 128]).unwrap();
+
+            // Force WAL sync to ensure data is on disk before we drop
+            // We lock the WAL and call sync manually
+            // (Note: In production, OS page cache usually handles this on process exit,
+            // but for unit tests with immediate reopen, explicit sync is safer).
+            coll.index.get_wal().lock().current().sync().unwrap();
         }
+        // Drop manager -> Closes files
 
-        service
-            .insert_batch(Request::new(InsertBatchRequest {
-                collection_name: collection.to_string(),
-                vectors: warmup_vecs,
-            }))
-            .await
-            .expect("Warmup insert failed");
+        // 2. Re-open (Simulate Restart)
+        let manager2 = Arc::new(CollectionManager::new(config));
+        let coll2 = manager2.get_or_create(name, None, None).await.unwrap();
 
-        println!("⏳ WARM-UP: Sleeping 5s to allow Janitor to train and persist...");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        println!("✅ WARM-UP: Complete. Index is trained. Starting Main Load Test.");
-
-        // =================================================================
-        // 🚀 PHASE 2: MAIN INGESTION
-        // =================================================================
-        println!("🚀 Starting Load Test: {} Vectors", TOTAL_VECTORS);
-        let start_ingest = Instant::now();
-
-        for batch_idx in 0..(TOTAL_VECTORS / BATCH_SIZE) {
-            let start_id = (batch_idx * BATCH_SIZE) as u64;
-
-            let mut batch_vecs = Vec::with_capacity(BATCH_SIZE);
-            for i in 0..BATCH_SIZE {
-                let id = start_id + i as u64;
-                let vector = generate_random_vector(&mut rng);
-                batch_vecs.push(Vector { id, values: vector });
-            }
-
-            let req = Request::new(InsertBatchRequest {
-                collection_name: collection.to_string(),
-                vectors: batch_vecs,
-            });
-
-            service
-                .insert_batch(req)
-                .await
-                .expect("Batch Insert failed");
-
-            // Optional: Print rate every 10 batches
-            if batch_idx > 0 && batch_idx % 10 == 0 {
-                let elapsed = start_ingest.elapsed();
-                let count = (batch_idx + 1) * BATCH_SIZE;
-                let rate = count as f64 / elapsed.as_secs_f64();
-                println!(
-                    "    Inserted {} vectors... (Avg Rate: {:.0} vec/s)",
-                    count, rate
-                );
-            }
-        }
-
-        let ingest_duration = start_ingest.elapsed();
-        println!("✅ Ingestion Complete in {:.2?}", ingest_duration);
-        println!(
-            "    Throughput: {:.0} vec/sec",
-            TOTAL_VECTORS as f64 / ingest_duration.as_secs_f64()
-        );
-
-        // =================================================================
-        // 3. INJECT NEEDLE
-        // =================================================================
-        let needle_id = 999_999;
-        let needle_vec = vec![0.5; DIM];
-        println!("💉 Injecting Needle (ID {})...", needle_id);
-        service
-            .insert(Request::new(InsertRequest {
-                collection_name: collection.to_string(),
-                vector: Some(Vector {
-                    id: needle_id,
-                    values: needle_vec.clone(),
-                }),
-            }))
+        // 3. Verify data via search (WAL replay should have restored ID 1)
+        let res = coll2
+            .index
+            .search(&[0.0; 128], 1, 0.9, 1.0, 100.0)
             .await
             .unwrap();
-        println!("✅ Needle Injected.");
 
-        // =================================================================
-        // 4. WAIT FOR JANITOR
-        // =================================================================
-        println!("⏳ Waiting for background flush/indexing...");
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(res.len(), 1, "WAL Replay failed: Index is empty");
+        assert_eq!(res[0].0, 1, "WAL Replay failed: ID mismatch");
+    }
+}
 
-        // =================================================================
-        // 5. QUERY PHASE
-        // =================================================================
-        println!("🔍 Starting Query Benchmark...");
-        let mut latencies = Vec::with_capacity(QUERY_COUNT);
+#[cfg(test)]
+mod bucket_fetch_test {
+    // use crate::bucket_file_writer::BucketFileWriter;
+    // use crate::bucket_manager::{BucketManager, StorageClass};
+    use drift_core::lock_manager::BucketCoordinator;
+    use drift_core::quantizer::Quantizer;
+    use drift_storage::{
+        bucket_file_writer::BucketFileWriter,
+        bucket_manager::{BucketManager, StorageClass},
+    };
+    use drift_traits::StorageEngine;
+    use opendal::{Operator, services};
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
-        for _ in 0..QUERY_COUNT {
-            let query_vec = generate_random_vector(&mut rng);
-            let start_q = Instant::now();
-            let req = Request::new(SearchRequest {
-                collection_name: collection.to_string(),
-                vector: query_vec,
-                k: 10,
-                target_confidence: 0.95,
-                lambda: 1.0,
-                tau: 100.0,
-            });
-            let _ = service.search(req).await.expect("Search failed");
-            latencies.push(start_q.elapsed());
-        }
+    // --- Helpers ---
 
-        // =================================================================
-        // 6. VERIFICATION
-        // =================================================================
-        println!("🔎 Verifying Needle...");
-        let verify_req = Request::new(SearchRequest {
-            collection_name: collection.to_string(),
-            vector: needle_vec,
-            k: 5,
-            target_confidence: 0.99,
-            lambda: 1.0,
-            tau: 100.0,
-        });
+    fn create_local_operator(path: &std::path::Path) -> Operator {
+        let builder = services::Fs::default().root(path.to_str().unwrap());
+        Operator::new(builder).unwrap().finish()
+    }
 
-        let verify_res = service.search(verify_req).await.unwrap().into_inner();
-        let found = verify_res.results.iter().any(|r| r.id == needle_id);
+    /// Creates a valid .drift file with specific data
+    async fn create_bucket_file(
+        dir: &std::path::Path,
+        filename: &str,
+        ids: &[u64],
+        vecs: &[Vec<f32>],
+        dim: usize,
+    ) {
+        let path = dir.join(filename);
+        let file = std::fs::File::create(&path).unwrap();
 
-        // =================================================================
-        // 7. REPORT
-        // =================================================================
-        latencies.sort();
-        let p50 = latencies[latencies.len() / 2];
-        let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
+        let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
+        let q = Quantizer::train(&flat, dim);
+        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
+        writer.write_batch(ids, &flat).unwrap();
+        writer.finalize().unwrap();
+    }
 
-        println!("========================================");
-        println!("📊 LOAD TEST RESULTS (Pre-Trained)");
-        println!("Total Vectors: {}", TOTAL_VECTORS);
-        println!("P50 Latency:   {:.2?}", p50);
-        println!("P99 Latency:   {:.2?}", p99);
-        println!(
-            "Correctness:   {}",
-            if found { "PASS ✅" } else { "FAIL ❌" }
+    // --- TEST 1: Tiered Fetch (Base + Delta) ---
+    #[tokio::test]
+    async fn test_fetch_bucket_merges_tiered_storage() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+
+        let dim = 2;
+        let bucket_id = 100;
+
+        // 1. Create Remote Base (IDs 0-9)
+        let base_ids: Vec<u64> = (0..10).collect();
+        let base_vecs = vec![vec![1.0, 1.0]; 10];
+        create_bucket_file(dir.path(), "base.drift", &base_ids, &base_vecs, dim).await;
+
+        // 2. Create Local Delta (IDs 10-14)
+        let delta_ids: Vec<u64> = (10..15).collect();
+        let delta_vecs = vec![vec![2.0, 2.0]; 5];
+        create_bucket_file(dir.path(), "delta.drift", &delta_ids, &delta_vecs, dim).await;
+
+        // 3. Register Tiered
+        manager.register_bucket_with_count(
+            bucket_id,
+            "ignored.drift".to_string(),
+            StorageClass::Tiered {
+                remote_path: "base.drift".to_string(),
+                local_path: "delta.drift".to_string(),
+            },
+            15,
         );
-        println!("========================================");
 
-        assert!(found, "Failed to find the needle vector!");
+        // 4. Fetch
+        let (ids, flat_vecs) = manager.fetch_bucket(bucket_id).await.expect("Fetch failed");
+
+        // 5. Verify Merge
+        assert_eq!(ids.len(), 15, "Should have 15 total items");
+        assert_eq!(flat_vecs.len(), 30, "Should have 30 floats (15 * 2)");
+
+        // Check content
+        // Base items
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&9));
+        // Delta items
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&14));
+
+        // Verify values (approx check due to quantization)
+        // Find index of ID 0
+        let idx_0 = ids.iter().position(|&x| x == 0).unwrap();
+        assert!(
+            (flat_vecs[idx_0 * 2] - 1.0).abs() < 0.05,
+            "Base value mismatch"
+        );
+
+        // Find index of ID 10
+        let idx_10 = ids.iter().position(|&x| x == 10).unwrap();
+        assert!(
+            (flat_vecs[idx_10 * 2] - 2.0).abs() < 0.05,
+            "Delta value mismatch"
+        );
+    }
+
+    // --- TEST 2: Promoting Fetch (Active + Frozen + Remote) ---
+    #[tokio::test]
+    async fn test_fetch_bucket_merges_promoting_storage() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let dim = 2;
+        let bucket_id = 200;
+
+        // 1. Remote Base (ID 1)
+        create_bucket_file(dir.path(), "remote.drift", &[1], &[vec![1.0; dim]], dim).await;
+
+        // 2. Local Frozen (ID 2)
+        create_bucket_file(dir.path(), "frozen.drift", &[2], &[vec![2.0; dim]], dim).await;
+
+        // 3. Local Active (ID 3)
+        create_bucket_file(dir.path(), "active.drift", &[3], &[vec![3.0; dim]], dim).await;
+
+        // 4. Register Promoting
+        manager.register_bucket(
+            bucket_id,
+            "active.drift".to_string(),
+            StorageClass::Promoting {
+                local_active: "active.drift".to_string(),
+                local_frozen: "frozen.drift".to_string(),
+                remote_path: Some("remote.drift".to_string()),
+            },
+        );
+
+        // 5. Fetch
+        let (ids, _) = manager.fetch_bucket(bucket_id).await.expect("Fetch failed");
+
+        // 6. Verify Full Merge
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&1), "Missing Remote");
+        assert!(ids.contains(&2), "Missing Frozen");
+        assert!(ids.contains(&3), "Missing Active");
+    }
+
+    // --- TEST 3: Missing Component Failure ---
+    // --- TEST 3: Missing Component Failure ---
+    #[tokio::test]
+    async fn test_fetch_bucket_returns_empty_on_missing_files() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+
+        // Register bucket pointing to non-existent file
+        manager.register_bucket(999, "ghost.drift".to_string(), StorageClass::Local);
+
+        // Fetch should NOT fail. It should return empty data.
+        let res = manager.fetch_bucket(999).await;
+
+        assert!(
+            res.is_ok(),
+            "Should not error on missing file (treated as empty)"
+        );
+
+        let (ids, vecs) = res.unwrap();
+        assert!(ids.is_empty(), "IDs should be empty");
+        assert!(vecs.is_empty(), "Vectors should be empty");
     }
 }

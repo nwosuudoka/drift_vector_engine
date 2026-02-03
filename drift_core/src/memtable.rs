@@ -1,22 +1,20 @@
+use drift_traits::TombstoneView;
 use parking_lot::{RwLock, RwLockReadGuard};
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 
 /// Level 0: High-Density In-Memory Buffer.
 /// Used for both Active Ingestion and Frozen Flushing.
 pub struct MemTable {
     ids: RwLock<Vec<u64>>,
     data: RwLock<Vec<f32>>,
-    tombstones: RwLock<HashSet<u64>>,
     options: MemTableOptions,
 }
 
 pub struct MemTableOptions {
     pub capacity: usize,
     pub dim: usize,
-    // pub ef: usize,
-    // pub layers: usize,
 }
 
 impl MemTable {
@@ -24,7 +22,6 @@ impl MemTable {
         Self {
             ids: RwLock::new(Vec::with_capacity(options.capacity)),
             data: RwLock::new(Vec::with_capacity(options.capacity * options.dim)),
-            tombstones: RwLock::new(HashSet::new()),
             options,
         }
     }
@@ -41,25 +38,34 @@ impl MemTable {
             let mut data = self.data.write();
             ids.push(id);
             data.extend_from_slice(vector);
-            self.tombstones.write().remove(&id);
         } // Locks released
 
         self.len() >= self.options.capacity
     }
 
-    pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) {
-        let mut ids = self.ids.write();
-        let mut data = self.data.write();
-        let mut tombstones = self.tombstones.write();
-        for (id, vector) in batch {
-            ids.push(*id);
-            data.extend_from_slice(vector);
-            tombstones.remove(id);
+    /// Batch insert. Returns `true` if capacity is reached/exceeded.
+    pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) -> bool {
+        let batch_len = batch.len();
+        if batch_len == 0 {
+            return false;
         }
-    }
 
-    pub fn delete(&self, id: u64) {
-        self.tombstones.write().insert(id);
+        let new_len = {
+            let mut ids = self.ids.write();
+            let mut data = self.data.write();
+
+            // Pre-reserve to avoid reallocations
+            ids.reserve(batch_len);
+            data.reserve(batch_len * self.options.dim);
+
+            for (id, vector) in batch {
+                ids.push(*id);
+                data.extend_from_slice(vector);
+            }
+            ids.len()
+        }; // 🔓 Locks released
+
+        new_len >= self.options.capacity
     }
 
     pub fn len(&self) -> usize {
@@ -81,19 +87,14 @@ impl MemTable {
     /// Reads (Search) can still happen concurrently.
     pub fn get_data_guards(
         &self,
-    ) -> (
-        RwLockReadGuard<'_, Vec<u64>>,
-        RwLockReadGuard<'_, Vec<f32>>,
-        RwLockReadGuard<'_, HashSet<u64>>,
-    ) {
-        (self.ids.read(), self.data.read(), self.tombstones.read())
+    ) -> (RwLockReadGuard<'_, Vec<u64>>, RwLockReadGuard<'_, Vec<f32>>) {
+        (self.ids.read(), self.data.read())
     }
 
     /// Parallel Scan Search
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+    pub fn search<TV: TombstoneView>(&self, query: &[f32], k: usize, view: &TV) -> Vec<(u64, f32)> {
         let ids = self.ids.read();
         let data = self.data.read();
-        let tombstones = self.tombstones.read();
         let dim = self.options.dim;
 
         let n = ids.len();
@@ -105,7 +106,8 @@ impl MemTable {
                 || BinaryHeap::with_capacity(k + 1),
                 |mut heap, i| {
                     let id = ids[i];
-                    if tombstones.contains(&id) {
+
+                    if view.contains(id) {
                         return heap;
                     }
 
@@ -153,19 +155,13 @@ impl MemTable {
     /// Creates a lightweight snapshot of the data for flushing.
     /// Returns (IDs, Flat Vectors, Tombstones).
     /// Used by the Partitioner.
-    pub fn snapshot(&self) -> (Vec<u64>, Vec<f32>, HashSet<u64>) {
+    pub fn snapshot(&self) -> (Vec<u64>, Vec<f32>) {
         // We acquire read locks and clone the data.
         // Since we rotate MemTables before flushing, this is done on a "Frozen" table
         // so contention should be zero.
         let ids = self.ids.read().clone();
         let data = self.data.read().clone();
-        let tombstones = self.tombstones.read().clone();
-        (ids, data, tombstones)
-    }
-
-    // NEW: Expose tombstones for the global search merger
-    pub fn get_tombstones_snapshot(&self) -> HashSet<u64> {
-        self.tombstones.read().clone()
+        (ids, data)
     }
 }
 

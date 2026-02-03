@@ -1,5 +1,5 @@
 use crate::local_staging::LocalStagingManager;
-use crate::persistence_v2::PersistenceManager; // ⚡ Import this
+use crate::persistence::PersistenceManager; // ⚡ Import this
 use drift_storage::bucket_manager::{BucketVersion, StorageClass};
 use std::collections::VecDeque;
 use std::sync::Arc;

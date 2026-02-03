@@ -2,8 +2,8 @@ use clap::Parser;
 use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{InsertBatchRequest, SearchRequest, Vector};
-use drift_server::manager_v2::CollectionManager;
-use drift_server::server_v2::DriftService;
+use drift_server::manager::CollectionManager;
+use drift_server::server::DriftService;
 use rand::prelude::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ fn percentile(sorted: &[Duration], pct: f64) -> Duration {
 }
 
 async fn wait_for_flush(
-    coll: &Arc<drift_server::manager_v2::Collection>,
+    coll: &Arc<drift_server::manager::Collection>,
     wait_active_empty: bool,
     timeout: Duration,
 ) -> (usize, usize) {
@@ -107,7 +107,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let collection = "bench_rw";
 
     println!("🏁 Bench RW (v2)");
-    println!("   • Vectors: {} (batch {})", args.total_vectors, args.batch_size);
+    println!(
+        "   • Vectors: {} (batch {})",
+        args.total_vectors, args.batch_size
+    );
     println!("   • Queries: {} (k={})", args.query_count, args.k);
     println!(
         "   • Routing: target_confidence={:.2}, lambda={:.3}, tau={:.1}",
