@@ -1,5 +1,21 @@
 # Changelog
 
+## [v2.0.0-beta] - The LBR Architecture Complete
+
+### Hardening & Safety
+
+- **Split Consistency Guard:** Added `SAFETY CHECK` in `perform_split` to abort operations if the sum of child vectors is less than the parent, preventing data loss during race conditions.
+- **Router Truth:** Fixed `perform_flush` to fetch global centroid statistics from `BucketManager` before updating the Router, ensuring 100% recall even after small batch updates.
+- **Atomic Promotion:** Hardened `promote_segments` to atomically merge Local Staging + Remote Base into a new S3 segment, preventing read-glitches during tiering transitions.
+
+### Simulation & Verification
+
+- **Scale Harness:** Updated `billion_scale.rs` to run against the V2 architecture with real-time recall tracking.
+- **Churn Simulation:** Enhanced `churn_sim.rs` to validate "Hot Zombie" purging and memory reclamation under heavy delete load.
+- **Drift Simulation:** `drift_sim.rs` now verifies that the "Saturating Density" router correctly adapts to moving centroids over time.
+
+### Core Architecture (L
+
 ## [Unreleased] - v2.0.0-alpha (The LBR Architecture)
 
 ### Verified

@@ -509,7 +509,14 @@ impl Janitor {
     pub(crate) async fn perform_split(&self, bucket_id: u32) -> io::Result<()> {
         info!("Janitor: ✂️ Calculating split for Bucket {}", bucket_id);
 
-        // 1. Calculate (The Brain)
+        // 1. Snapshot Parent State
+        let parent_stats = self
+            .bucket_manager
+            .get_bucket_stats(bucket_id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Parent bucket missing"))?;
+
+        // a. Calculate
+        // b. Calculate (The Brain)
         // This is read-only and safe.
         let proposal = match self.index.calculate_split(bucket_id).await? {
             Ok(p) => p,
@@ -519,6 +526,17 @@ impl Janitor {
                 return Ok(());
             }
         };
+
+        // c. ️ SAFETY CHECK ️
+        let child_sum = proposal.left.count + proposal.right.count + proposal.loopback.len();
+        if (child_sum as u32) < parent_stats.total_count {
+            tracing::error!(
+                "Janitor: 🚨 CRITICAL SPLIT FAILURE! Data loss detected. Parent: {}, Children: {}. Aborting.",
+                parent_stats.total_count,
+                child_sum
+            );
+            return Ok(());
+        }
 
         // 2. Write New Buckets (Staging)
         // We allocate new IDs for the children

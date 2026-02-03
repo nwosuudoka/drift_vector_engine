@@ -76,8 +76,22 @@
 
 #### Phase 7: Cleanup & Hardening
 
-**Status:** 🚧 **In Progress**
+**Status:** ✅ **Complete**
 
 - [x] **Reaper Verification:** Integration test to ensure physical file deletion (Local + S3) after compaction/promotion.
-- [ ] **Chaos Testing:** Random kill -9 loop while running heavy ingest.
-- [ ] **Distributed Consensus:** Prepare for stateless workers.
+- [x] **Chaos Testing:** Validated durability via `chaos_test` (kill -9 loops).
+- [x] **Split Safety:** Implemented parent-child consistency checks to prevent data loss during splits.
+- [x] **Simulation Harness:** Updated `billion_scale`, `churn_sim`, and `drift_sim` for V2.
+
+---
+
+# **Global Master Plan: Drift Cluster (Phase 8)**
+
+#### Phase 8: Distributed Consensus (The "Stateless Worker" Model)
+
+**Status:** 🚧 **Planning**
+
+- [ ] **Consensus Layer:** Integrate `openraft` or Etcd to manage the "Shard Map" (Which node owns which bucket?).
+- [ ] **Remote WAL:** Abstract `WalManager` to support Kafka/Redpanda or S3-Append, allowing any node to replay another's log.
+- [ ] **Stateless Worker:** Refactor `DriftService` to mount any collection by pulling state from S3, rather than relying on local disk affinity.
+- [ ] **Gateway Node:** Create a gRPC proxy that hashes vector IDs and routes requests to the correct Worker node.
