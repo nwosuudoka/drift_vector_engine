@@ -148,7 +148,7 @@ cargo run -p drift_server --bin drift -- --help
 
 ```
 # v2 drift simulation
-cargo run -p drift_server --bin drift_sim_2 --release
+cargo run -p drift_server --bin drift_sim --release
 
 # v2 churn/tombstone simulation
 cargo run -p drift_server --bin churn_sim --release
