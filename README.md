@@ -19,7 +19,7 @@ and files consistent.
 
 ### Core components
 
-- **L0 MemTable (v2)**: append-only in-memory buffer with parallel scan search.
+- **L0 MemTable**: append-only in-memory buffer with parallel scan search.
 - **WAL**: per-collection WAL for durable inserts/deletes, replayed on recovery.
 - **L1 Bucket Files**: columnar `.drift` files with hot SQ8 + cold ALP data, multiple
   row groups for local staging, and a single run id for remote base files.
@@ -28,7 +28,7 @@ and files consistent.
 - **BucketManager**: tracks bucket state (Local/Remote/Tiered/Promoting), tombstones,
   and provides unified search across local/remote tiers.
 - **BitStore (KV)**: persistent `VectorID -> BucketID` mapping used for L1 tombstones.
-- **Janitor v2**: background loop for flush, promotion, split, scatter merge, tombstone
+- **Janitor**: background loop for flush, promotion, split, scatter merge, tombstone
   persistence, and reaper cleanup.
 
 ### Data layout (on disk)
