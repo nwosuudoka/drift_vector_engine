@@ -63,8 +63,8 @@ pub struct SearchCandidate {
     pub file_id: u32,
     pub cold_offset: u64,  // Offset of the Cold RowGroup blob
     pub cold_length: u32,  // Length of the Cold RowGroup blob
-    pub index_in_rg: u16,  // Index of this vector inside the RG
-    pub vector_count: u16, // Index of this vector inside the RG
+    pub index_in_rg: u32,  // Index of this vector inside the RG
+    pub vector_count: u32, // Vector count for the RG
 }
 
 // ⚡ NEW: Shared Stats Struct

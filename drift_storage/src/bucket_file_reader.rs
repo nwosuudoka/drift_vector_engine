@@ -169,6 +169,24 @@ impl BucketFileReader {
         let q = self.quantizer.as_ref().unwrap();
         let lut = q.precompute_lut(query);
         let dim = query.len();
+        let q_dim = q.min.len();
+
+        if q_dim != dim {
+            tracing::warn!(
+                "⚠️ Scan dim mismatch: path={} query_dim={} quant_dim={}",
+                self.manager.path,
+                dim,
+                q_dim
+            );
+        }
+        tracing::info!(
+            "🔎 Scan start: path={} k={} query_dim={} quant_dim={} row_groups={}",
+            self.manager.path,
+            k,
+            dim,
+            q_dim,
+            self.row_groups.len()
+        );
 
         let mut heap: BinaryHeap<CandidateWrapper> = BinaryHeap::with_capacity(k + 1);
 
@@ -180,6 +198,8 @@ impl BucketFileReader {
         };
 
         // Iterate Cached RowGroups
+        let mut total_vectors = 0usize;
+        let mut total_hot_bytes = 0usize;
         for rg in &self.row_groups {
             // Read Hot Index Blob
             // Hot Layout: [IDs: u64 * N] [Codes: u8 * N * D] [Tombstones...]
@@ -195,6 +215,8 @@ impl BucketFileReader {
                 .read_at(rg.hot_offset, rg.hot_length as usize)
                 .await?;
 
+            total_vectors += count;
+            total_hot_bytes += hot_blob.len();
             self.scan_row_group_filtered(rg, &hot_blob, &params, &mut heap);
         }
 
@@ -204,6 +226,13 @@ impl BucketFileReader {
                 .partial_cmp(&b.approx_dist)
                 .unwrap_or(Ordering::Equal)
         });
+        tracing::info!(
+            "🔎 Scan done: path={} total_vectors={} total_hot_bytes={} candidates={}",
+            self.manager.path,
+            total_vectors,
+            total_hot_bytes,
+            results.len()
+        );
         Ok(results)
     }
 
@@ -226,6 +255,14 @@ impl BucketFileReader {
 
         let ids_size = cursor.position() as usize;
         if ids_size >= hot_blob.len() {
+            tracing::warn!(
+                "⚠️ Scan RG: ids_size {} >= hot_blob_len {} path={} cold_offset={} cold_len={}",
+                ids_size,
+                hot_blob.len(),
+                self.manager.path,
+                header.cold_offset,
+                header.cold_length
+            );
             return;
         }
         let codes = &hot_blob[ids_size..];
@@ -233,8 +270,14 @@ impl BucketFileReader {
         let lut_ptr = params.lut.as_ptr();
         let codes_ptr = codes.as_ptr();
 
+        let mut considered = 0usize;
+        let mut tombstoned = 0usize;
+        let mut min_dist = f32::MAX;
+        let mut max_dist = 0.0f32;
+
         for (i, &id) in ids.iter().enumerate() {
             if params.tombstones.contains(id) {
+                tombstoned += 1;
                 continue;
             }
 
@@ -244,6 +287,13 @@ impl BucketFileReader {
             }
 
             let dist = unsafe { compute_distance_lut(codes_ptr.add(offset), lut_ptr, params.dim) };
+            considered += 1;
+            if dist < min_dist {
+                min_dist = dist;
+            }
+            if dist > max_dist {
+                max_dist = dist;
+            }
 
             let candidate = SearchCandidate {
                 id,
@@ -251,8 +301,8 @@ impl BucketFileReader {
                 file_id: 0, // Managed by BucketManager
                 cold_offset: header.cold_offset,
                 cold_length: header.cold_length,
-                index_in_rg: i as u16,
-                vector_count: count as u16,
+                index_in_rg: i as u32,
+                vector_count: count as u32,
             };
 
             if heap.len() < params.k {
@@ -264,6 +314,20 @@ impl BucketFileReader {
                 heap.push(CandidateWrapper(candidate));
             }
         }
+
+        tracing::info!(
+            "🔎 Scan RG: path={} vectors={} hot_len={} ids_bytes={} codes_len={} dim={} considered={} tombstoned={} min_dist={:.4} max_dist={:.4}",
+            self.manager.path,
+            count,
+            hot_blob.len(),
+            ids_size,
+            codes.len(),
+            params.dim,
+            considered,
+            tombstoned,
+            min_dist,
+            max_dist
+        );
     }
 
     /// REFINE PATH: Fetch & Decompress Cold Data
@@ -273,8 +337,9 @@ impl BucketFileReader {
         query: &[f32],
         dim: usize,
     ) -> io::Result<Vec<(u64, f32)>> {
-        let mut results = Vec::with_capacity(candidates.len());
-        let mut groups: BTreeMap<u64, (u32, u16, Vec<SearchCandidate>)> = BTreeMap::new();
+        let candidate_count = candidates.len();
+        let mut results = Vec::with_capacity(candidate_count);
+        let mut groups: BTreeMap<u64, (u32, u32, Vec<SearchCandidate>)> = BTreeMap::new();
 
         for c in candidates {
             groups
@@ -284,12 +349,21 @@ impl BucketFileReader {
                 .push(c);
         }
 
+        tracing::info!(
+            "🔍 Refine start: path={} groups={} candidates={} dim={}",
+            self.manager.path,
+            groups.len(),
+            candidate_count,
+            dim
+        );
+
         for (offset, (length, count, group)) in groups {
             tracing::info!(
-                "🔍 Refine: Reading Cold Blob at Offset {} (Len {}). Expecting {} vectors.",
+                "🔍 Refine: Reading Cold Blob at Offset {} (Len {}). Expecting {} vectors. Candidates={}",
                 offset,
                 length,
-                count
+                count,
+                group.len()
             );
             let cold_blob = self.manager.read_at(offset, length as usize).await?;
 
@@ -303,6 +377,12 @@ impl BucketFileReader {
             }
 
             let vectors = self.decompress_row_group(&cold_blob, dim, count as usize)?;
+            tracing::info!(
+                "🔍 Refine: Decompressed vectors len={} (expected={}) path={}",
+                vectors.len(),
+                count as usize * dim,
+                self.manager.path
+            );
 
             for c in group {
                 let idx = c.index_in_rg as usize;

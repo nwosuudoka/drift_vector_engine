@@ -533,20 +533,32 @@ impl VectorIndex {
     pub async fn apply_split_update(
         &self,
         old_id: u32,
-        left: (u32, Vec<f32>),
-        right: (u32, Vec<f32>),
+        left: (u32, Vec<f32>, u32),
+        right: (u32, Vec<f32>, u32),
     ) {
         let mut guard = self.router.write();
         // Remove old
         guard.remove_bucket(old_id);
         // Add new
-        guard.add_bucket(left.0, left.1);
-        guard.add_bucket(right.0, right.1);
+        guard.add_bucket(left.0, left.1.clone());
+        guard.update_bucket(left.0, left.2, left.1);
+        guard.add_bucket(right.0, right.1.clone());
+        guard.update_bucket(right.0, right.2, right.1);
     }
 
     // For testing purposes
     pub fn get_router(&self) -> &Arc<RwLock<Router>> {
         &self.router
+    }
+
+    pub fn update_router_count(&self, bucket_id: u32, count: u32, centroid: Option<Vec<f32>>) {
+        let mut r = self.router.write();
+        if !r.update_bucket_count(bucket_id, count) {
+            if let Some(c) = centroid {
+                r.add_bucket(bucket_id, c);
+                let _ = r.update_bucket_count(bucket_id, count);
+            }
+        }
     }
 
     /// This is Read-Only. It does not modify disk or memory.
@@ -667,5 +679,48 @@ impl VectorIndex {
         for (target_id, new_count, _, new_centroid) in updates {
             r.update_bucket(*target_id, *new_count as u32, new_centroid.clone());
         }
+    }
+
+    pub fn debug_find_needles_in_l0(&self, needle_ids: &HashSet<u64>) -> HashSet<u64> {
+        let mut found = HashSet::new();
+
+        let active = self.active.read();
+        let (ids, _) = active.snapshot();
+        for id in ids {
+            if needle_ids.contains(&id) {
+                found.insert(id);
+            }
+        }
+
+        let frozen = self.frozen.read();
+        for ft in frozen.iter() {
+            let (ids, _) = ft.table.snapshot();
+            for id in ids {
+                if needle_ids.contains(&id) {
+                    found.insert(id);
+                }
+            }
+        }
+
+        found
+    }
+
+    pub async fn debug_fetch_bucket_ids(&self, bucket_id: u32) -> io::Result<Vec<u64>> {
+        let (ids, _vecs) = self.storage.fetch_bucket(bucket_id).await?;
+        Ok(ids)
+    }
+
+    pub async fn debug_fetch_bucket(&self, bucket_id: u32) -> io::Result<(Vec<u64>, Vec<f32>)> {
+        self.storage.fetch_bucket(bucket_id).await
+    }
+
+    /// Returns the number of vectors in the active MemTable.
+    pub fn memtable_len(&self) -> usize {
+        self.active.read().len()
+    }
+
+    /// Returns the number of frozen MemTables waiting to be flushed.
+    pub fn get_frozen_count(&self) -> usize {
+        self.frozen.read().len()
     }
 }

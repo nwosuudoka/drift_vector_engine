@@ -209,6 +209,14 @@ impl Router {
         (self.flat_centroids.clone(), self.bucket_ids.clone())
     }
 
+    pub fn get_snapshot_with_counts(&self) -> (Vec<f32>, Vec<u32>, Vec<u32>) {
+        (
+            self.flat_centroids.clone(),
+            self.bucket_ids.clone(),
+            self.bucket_counts.clone(),
+        )
+    }
+
     pub fn remove_bucket(&mut self, bucket_id: u32) {
         if let Some(idx) = self.bucket_ids.iter().position(|&id| id == bucket_id) {
             // Remove ID
@@ -239,13 +247,16 @@ impl Router {
         self.flat_centroids.clone()
     }
 
-    // /// ⚡ NEW: Updates the vector count for a specific bucket.
-    // /// Critical for maintaining the Reliability score R(b) after a merge.
-    // pub fn update_bucket_count(&mut self, bucket_id: u32, count: u32) {
-    //     if let Some(idx) = self.bucket_ids.iter().position(|&id| id == bucket_id) {
-    //         self.bucket_counts[idx] = count;
-    //     }
-    // }
+    /// Updates the vector count for a specific bucket.
+    /// Returns false if the bucket_id is not present.
+    pub fn update_bucket_count(&mut self, bucket_id: u32, count: u32) -> bool {
+        if let Some(idx) = self.bucket_ids.iter().position(|&id| id == bucket_id) {
+            self.bucket_counts[idx] = count;
+            true
+        } else {
+            false
+        }
+    }
 
     /// NEW: Updates a bucket's centroid and count after a merge/split.
     pub fn update_bucket(&mut self, bucket_id: u32, count: u32, new_centroid: Vec<f32>) {

@@ -117,6 +117,10 @@ impl Janitor {
             let new_count = self.staging.append_batch(*bucket_id, group).await?;
             updates.push((*bucket_id, new_count, group.centroid.clone()));
 
+            // Keep router counts in sync with actual bucket size.
+            self.index
+                .update_router_count(*bucket_id, new_count as u32, group.centroid.clone());
+
             // If we update stats for a non-existent bucket, BucketManager ignores it.
             if self.bucket_manager.get_version(*bucket_id).is_none() {
                 let filename = self.staging.get_active_filename(*bucket_id);
@@ -222,7 +226,7 @@ impl Janitor {
             return Ok(());
         }
 
-        info!("JanitorV2: Promoting {} buckets to S3...", candidates.len());
+        info!("Janitor: Promoting {} buckets to S3...", candidates.len());
 
         for bucket_id in candidates {
             // 🔒 Lock Bucket (Prevents split/merge/compact during promotion)
@@ -339,6 +343,10 @@ impl Janitor {
                 final_count,
             );
 
+            // Keep router counts in sync after promotion.
+            self.index
+                .update_router_count(bucket_id, final_count, None);
+
             // 4. ⚡ RECONCILE: Prune the specific deletions we just handled
             self.bucket_manager
                 .prune_tombstones(bucket_id, &tombstone_snapshot);
@@ -417,8 +425,8 @@ impl Janitor {
         self.index
             .apply_split_update(
                 bucket_id,
-                (id_left, proposal.left.centroid.unwrap()),
-                (id_right, proposal.right.centroid.unwrap()),
+                (id_left, proposal.left.centroid.unwrap(), count_l as u32),
+                (id_right, proposal.right.centroid.unwrap(), count_r as u32),
             )
             .await;
 
