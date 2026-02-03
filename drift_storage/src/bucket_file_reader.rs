@@ -178,7 +178,7 @@ impl BucketFileReader {
                 q_dim
             );
         }
-        tracing::info!(
+        tracing::debug!(
             "🔎 Scan start: path={} k={} query_dim={} quant_dim={} row_groups={}",
             self.manager.path,
             k,
@@ -225,7 +225,7 @@ impl BucketFileReader {
                 .partial_cmp(&b.approx_dist)
                 .unwrap_or(Ordering::Equal)
         });
-        tracing::info!(
+        tracing::debug!(
             "🔎 Scan done: path={} total_vectors={} total_hot_bytes={} candidates={}",
             self.manager.path,
             total_vectors,
@@ -314,7 +314,7 @@ impl BucketFileReader {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "🔎 Scan RG: path={} vectors={} hot_len={} ids_bytes={} codes_len={} dim={} considered={} tombstoned={} min_dist={:.4} max_dist={:.4}",
             self.manager.path,
             count,
@@ -348,7 +348,7 @@ impl BucketFileReader {
                 .push(c);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "🔍 Refine start: path={} groups={} candidates={} dim={}",
             self.manager.path,
             groups.len(),
@@ -357,7 +357,7 @@ impl BucketFileReader {
         );
 
         for (offset, (length, count, group)) in groups {
-            tracing::info!(
+            tracing::debug!(
                 "🔍 Refine: Reading Cold Blob at Offset {} (Len {}). Expecting {} vectors. Candidates={}",
                 offset,
                 length,
@@ -376,7 +376,7 @@ impl BucketFileReader {
             }
 
             let vectors = self.decompress_row_group(&cold_blob, dim, count as usize)?;
-            tracing::info!(
+            tracing::debug!(
                 "🔍 Refine: Decompressed vectors len={} (expected={}) path={}",
                 vectors.len(),
                 count as usize * dim,
