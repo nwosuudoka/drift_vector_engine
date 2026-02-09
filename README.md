@@ -1,12 +1,12 @@
-# Drift Vector Engine (v2)
+# Drift Vector Engine
 
 Rust workspace implementing a drift-aware vector index with WAL-backed ingestion, unified
 on-disk row-group storage, and background maintenance for evolving data distributions.
-This README describes the **current v2 system** as implemented in this repository.
+This README describes the **current system** as implemented in this repository.
 
 ## Overview
 
-v2 is organized around **Logical Buckets** that can live in multiple physical locations:
+System is organized around **Logical Buckets** that can live in multiple physical locations:
 
 - **Local staging**: mutable `.drift` files under `data/<collection>/staging/`.
 - **Remote base**: immutable `.drift` files in the configured storage root (local or S3).
@@ -15,7 +15,7 @@ v2 is organized around **Logical Buckets** that can live in multiple physical lo
 Search and maintenance operate on this logical view, while the Janitor keeps metadata
 and files consistent.
 
-## Architecture (v2)
+## Architecture
 
 ### Core components
 
@@ -40,7 +40,7 @@ For a collection named `my_collection`:
 - KV store: `DATA_DIR/my_collection/kv/`
 - Remote storage root (local or S3): `STORAGE_ROOT/my_collection/`
 
-## Write path (v2)
+## Write path
 
 1. **Insert/Train** writes to WAL first.
 2. **MemTable** receives the vector (L0 visibility).
@@ -50,7 +50,7 @@ For a collection named `my_collection`:
 5. **Router and KV** are updated: centroids/counts are recalculated and KV mappings
    are written for each flushed ID.
 
-## Read path (v2)
+## Read path
 
 1. **Snapshot** L0 tombstones and active/frozen tables.
 2. **L0 scan**: parallel scan of memtables, filtered by L0 tombstones.
@@ -129,7 +129,7 @@ Storage:
 - S3 backend: `DRIFT_S3_BUCKET`, `DRIFT_S3_REGION`, `DRIFT_S3_ENDPOINT`,
   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 
-## How to use (v2)
+## How to use
 
 ### Run the server
 
@@ -147,14 +147,14 @@ cargo run -p drift_server --bin drift -- --help
 ### Simulations
 
 ```
-# v2 drift simulation
+# drift simulation
 cargo run -p drift_server --bin drift_sim --release
 
-# v2 churn/tombstone simulation
+# churn/tombstone simulation
 cargo run -p drift_server --bin churn_sim --release
 ```
 
-### Benchmarking (v2)
+### Benchmarking
 
 ```
 # Read/write benchmark (in-process)
@@ -166,16 +166,17 @@ scripts/bench_rw.sh -- --total-vectors 50000 --query-count 500
 
 ## Workspace layout
 
-- `drift_core`: v2 index, router, memtable, WAL, maintenance algorithms.
+- `drift_core`: index, router, memtable, WAL, maintenance algorithms.
 - `drift_storage`: `.drift` file format, row groups, quantization, compression.
 - `drift_kv`: BitStore mapping for `VectorID -> BucketID`.
-- `drift_server`: gRPC server, v2 manager, janitor, persistence, and sims.
+- `drift_server`: gRPC server, manager, janitor, persistence, and sims.
 
-## Current status (v2)
+## Current status
 
-- v2 server/manager/janitor are active and used by default (`drift_server` binary).
-- L0 uses a parallel scan MemTable; HNSW-based L0 is legacy v1.
-- v2 maintenance includes split with defector loopback and scatter merge.
+- server/manager/janitor are active and used by default (`drift_server` binary).
+- L0 uses a parallel scan MemTable;
+  - Reason for this is that inserts were slow for high throughput writes (this can be changed in the future if the parallel scans in your system becomes a bottle neck).
+- maintenance includes split with defector loopback and scatter merge.
 - Promotion supports Local/Remote/Tiered/Promoting states.
 
-If you want to map features to v1/v2 explicitly, see `SYSTEM_VIEW.md` and `TODO.v2.2.md`.
+Reference #[System View](./SYSTEM_VIEW.md) for a vector lifecycle
