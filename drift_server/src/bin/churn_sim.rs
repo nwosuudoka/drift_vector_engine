@@ -1,10 +1,10 @@
 use clap::Parser;
-use drift_core::index_v2::VectorIndex;
+use drift_core::index::VectorIndex;
 use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{SearchRequest, Vector};
-use drift_server::manager_v2::CollectionManager; // ⚡ UPDATED IMPORT
-use drift_server::server_v2::DriftService; // ⚡ UPDATED IMPORT
+use drift_server::manager::CollectionManager; // ⚡ UPDATED IMPORT
+use drift_server::server::DriftService; // ⚡ UPDATED IMPORT
 use rand::prelude::*;
 use rand_distr::{Distribution, Normal};
 use std::collections::{HashSet, VecDeque};
@@ -119,7 +119,7 @@ fn get_dir_size(path: &std::path::Path) -> u64 {
         .sum()
 }
 
-async fn force_flush_and_wait(coll: &Arc<drift_server::manager_v2::Collection>) {
+async fn force_flush_and_wait(coll: &Arc<drift_server::manager::Collection>) {
     let mut retries = 0;
     // Wait for MemTable to empty
     while coll.index.memtable_len() > 0 {
@@ -142,7 +142,7 @@ async fn force_flush_and_wait(coll: &Arc<drift_server::manager_v2::Collection>) 
 }
 
 async fn wait_for_router_ready(
-    coll: &Arc<drift_server::manager_v2::Collection>,
+    coll: &Arc<drift_server::manager::Collection>,
     min_buckets: usize,
     timeout: Duration,
 ) -> usize {

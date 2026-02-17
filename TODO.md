@@ -1,105 +1,97 @@
-# **Global Master Plan: Drift-Aware Vector Engine**
+# **Global Master Plan: Drift-Aware Vector Engine (V2 LBR)**
 
-#### **Section 1: Storage Layer (Level 1)**
-
-**Status:** ✅ **Complete**
-
-- ✅ **Custom `.drift` File Format:** `SegmentWriter`/`SegmentReader` with Versioning & Magic Bytes.
-- ✅ **Disk Manager:** Abstracted via `opendal` for local/cloud transparency.
-- ✅ **Block Alignment:** 4KB aligned pages for O_DIRECT compatibility.
-- ✅ **Compression:** ALP/ALP_RD quantization for high-ratio float compression.
-- ✅ **Dual-Tier Storage Strategy:** Implemented architecture for Fast (SQ8) vs Cold (ALP) paths.
-- ✅ **"The Blob" Alignment:**
-  - [x] `SegmentWriter` writes contiguous `BucketData` blobs (Header+Codes+IDs) for the index.
-  - [x] `SegmentReader` supports fetching Raw SQ8 blobs and lazy-loading High-Fidelity data.
-  - [x] `PersistenceManager` implements fallback logic to hydrate from SQ8 if ALP is missing (Robustness).
-
-#### **Section 2: Core Indexing Logic (Level 1)**
+#### **Phase 1: The Unified Storage Format (`drift_storage`)**
 
 **Status:** ✅ **Complete**
 
-- ✅ **Bucket Structure:** RAM Header + Disk Data (Hybrid Layout).
-- ✅ **Maintenance:** Drift-Aware Split & Strict Hysteresis Merge.
-- ✅ **Safety:** Singularity Guard prevents infinite loops on duplicate data.
+- [x] **Physical Layout:** `DriftHeader`, `RowGroupHeader`, `DriftFooter`.
+- [x] **RowGroupWriter:** Transpose -> Compress (ALP) -> Quantize (SQ8) -> Serialize.
+- [x] **BucketFileWriter:** Supports `Append Mode` (Local) and `Stream Mode` (S3).
+- [x] **BucketFileReader:** Stream-first scan with footer validation.
 
-#### **Section 3: Memory Structure (Level 0)**
-
-**Status:** ✅ **Complete**
-
-- ✅ **MemTable:** Thread-safe HNSW Graph for low-latency ingest.
-- [cite_start]✅ **Lazy Indexing:** Removed synchronous HNSW build from the hot write path. [cite: 1067]
-- ✅ **Durability:** Write-Ahead Log (WAL) with crash recovery.
-- ✅ **Janitor:** Background process for operation budgeting and auto-flushing.
-- ✅ **Tiered Cache:** Implemented chunk-aligned read-ahead for S3/NVMe.
-- ✅ **Tombstone Persistence:**
-  - [x] Implemented `TombstoneFile` format (Magic + CRC + IDs).
-  - [x] Added `flush_tombstones` to PersistenceManager.
-  - [x] Startup hydration merges deleted IDs into global filter.
-- ✅ **Compaction (The Scavenger):**
-  - [x] Implemented Copy-on-Write `compact_bucket` to rewrite dirty buckets.
-  - [x] Added `scavenge()` loop to Janitor to identify and clean buckets > 20% dirty.
-  - [x] Verified memory reclamation and KV update integrity.
-
-#### **Section 4: Execution Engine**
+#### **Phase 2: The Control Plane (Durability & Metadata)**
 
 **Status:** ✅ **Complete**
 
-- ✅ **Async Architecture:** Fully non-blocking core using `tokio`.
-- [cite_start]✅ **Hybrid Search:** Merges results from Parallel Scan (RAM) and HNSW (Disk). [cite: 701]
-- ✅ **Routing:** Saturating Density model (Lambda/Tau) for query routing.
-- ✅ **Parallelism:** `rayon` integration for high-speed brute-force scanning of unindexed data.
-- ✅ **Correctness Hardening:**
-  - [x] **Phase Separation:** Split Search into Async I/O -> Sync CPU phases to fix `!Send` panic.
-  - [x] **RAM-First Search:** Fixed "Hole in the Timeline" race condition by searching MemTable before yielding.
-  - [x] **Recall Guardrail:** Added geometric fallback to prevent density starvation for new/small buckets.
-- ✅ **ADC Optimization (Critique A):**
-  - [x] Implement `Quantizer::precompute_lut`.
-  - [x] Update `Bucket::scan` to use LUT instead of float math.
-- ✅ **Storage Format Alignment (Critique B):**
-  - [x] Store raw SQ8 bytes in `index_blob` for fast mapping.
-  - [x] Store ALP bytes in `data_blob` for high-fidelity retrieval.
+- [x] **Manifest V2:** Atomic `apply_atomic` updates for Buckets and Centroids.
+- [x] **WAL V2:** Transactional WAL (Begin/Commit/Rollback) with CRC checksums.
+- [x] **Recovery Manager:**
+  - [x] Rebuild Router from Manifest.
+  - [x] Re-register Local Staging files.
+  - [x] Replay WAL for MemTable restoration.
 
-#### **Section 5: Server & API**
+#### **Phase 3: Core Logic Pivot (Incrementalism)**
 
 **Status:** ✅ **Complete**
 
-- ✅ **gRPC Interface:** `Train`, `Insert`, `Search` via `tonic`.
-- ✅ **CLI Tool:** `drift-cli` for human interaction and management.
-- ✅ **Dynamic Config:** Auto-dimension sizing and URI-based storage handling.
+- [x] **Static Router:** Router is now stable; points don't move until explicit Split/Merge.
+- [x] **BucketManager:** The new "Source of Truth" for where data lives (Local vs Remote vs Tiered).
+- [x] **VectorIndex V2:**
+  - [x] Decoupled Storage (`StorageEngine` trait).
+  - [x] Atomic ID Allocation (`AtomicU32`).
+  - [x] `insert_batch` with internal Rotation.
 
-#### **Section 6: Scaling & Optimization**
-
-**Status:** ✅ **Complete**
-
-- ✅ **Global ID Index:** O(1) `VectorID -> BucketID` mapping.
-- ✅ **Bloom Filters:** Integrated per-segment probabilistic filters for fast negative lookups.
-- ✅ **Drift Correction:** Geometric center tracking for data distribution shifts.
-
-#### **Section 7: Cloud-Native Infrastructure**
-
-**Status:** 🚧 **In Progress**
-
-- ✅ **Storage Abstraction:** Replaced `std::fs` with `apache-opendal` to support S3, GCS, Azure, and Local FS uniformly.
-- ✅ **Immutable Write Pattern:** Implemented "Scratch File" strategy to build segments locally and upload atomically.
-- ✅ **Error Propagation:** Hardened `DiskManager` against silent IO failures.
-- ✅ **Metric Unification:** Standardize on Squared Euclidean distance to fix L0/L1 ranking mismatches.
-- ⬜ **Distributed Consensus:** Design the "Stateless Worker" clustering model for horizontal scaling.
-
-#### **Section 8: Benchmarking & Correctness**
-
-**Status:** ✅ **Complete** (Core Verification)
-
-- ✅ **Drift Simulation:** Implemented `drift_sim` harness to inject concept drift (moving clusters).
-- ✅ **Recall Verification:** Verified >90% recall under heavy drift (Speed 5.0).
-- ✅ **Adaptive Indexing Test:** Validated `Split` logic expands capacity and heals recall drops automatically.
-
-#### **Section 9: Garbage Collection (Disk Maintenance)**
+#### **Phase 4: The Local-Buffered Write Path (LBR)**
 
 **Status:** ✅ **Complete**
 
-- ✅ **Segment Compaction (The Vacuum):**
-  - [x] Implemented `get_physical_path` trait in `PageManager`.
-  - [x] Created `SegmentCompactor` for Mark-and-Sweep GC.
-  - [x] Implemented `vacuum_segments()` with "Safety Belt".
-  - [x] Implemented `compact_tombstones()` to prevent log explosion.
-  - [x] Integrated into `Janitor` loop (Every 100 ticks).
+- [x] **Local Staging Manager:** Manages `bucket_{id}.drift` files in `data/staging/`.
+- [x] **Append Logic:** `append_batch` detects existing file, reads footer, appends RG, rewrites footer.
+- [x] **Janitor Flush:**
+  - [x] `rotate_and_freeze` MemTable.
+  - [x] Partition data by Router.
+  - [x] Append to Local Staging files.
+  - [x] Update Drift Stats (`vector_sum`).
+
+#### **Phase 5: Maintenance & Self-Healing**
+
+**Status:** ✅ **Complete**
+
+- [x] **Drift Tracking:** Real-time `calculate_drift()` based on `vector_sum`.
+- [x] **Smart Split:**
+  - [x] `calculate_split`: K-Means (K=2) + Defector Loopback.
+  - [x] **Singularity Guard:** Abort if variance is too low.
+  - [x] **Atomic Execution:** Write 2 new buckets -> Swap Manifest -> Update Router.
+- [x] **Promotion (Tiering):**
+  - [x] `promote_to_s3`: Merge Local + Remote -> New S3 Segment.
+  - [x] **Reaper:** Background deletion of obsolete files.
+- [x] **Scatter-Merge (Zombie Healing):**
+  - [x] **Detection:** Identify buckets with `Urgency > 1.5`.
+  - [x] **Calculation:** `calculate_merge` routes orphans to nearest neighbors.
+  - [x] **Execution:** Delta-CoW to Neighbor Staging Files.
+  - [x] **Cleanup:** Atomic Manifest Update + Physical Deletion.
+
+#### Phase 6: Unified Search & Operations
+
+**Status:** ✅ **Complete**
+
+- [x] **Unified Searcher:**
+  - [x] `search_async` scans MemTable (L0).
+  - [x] `BucketManager` scans Local + Remote files (L1).
+  - [x] `Refine`: Loads High-Fidelity data (ALP) for top candidates.
+- [x] **Tombstone Handling V2 (Hardening):**
+  - [x] `mark_delete` updates in-memory bitsets.
+  - [x] **Persistent Deletes:** Verified tombstone propagation during Promotion/Compaction cycles.
+  - [x] **Global Filter:** Optimize global tombstone filter for large-scale deletes.
+
+#### Phase 7: Cleanup & Hardening
+
+**Status:** ✅ **Complete**
+
+- [x] **Reaper Verification:** Integration test to ensure physical file deletion (Local + S3) after compaction/promotion.
+- [x] **Chaos Testing:** Validated durability via `chaos_test` (kill -9 loops).
+- [x] **Split Safety:** Implemented parent-child consistency checks to prevent data loss during splits.
+- [x] **Simulation Harness:** Updated `billion_scale`, `churn_sim`, and `drift_sim` for V2.
+
+---
+
+# **Global Master Plan: Drift Cluster (Phase 8)**
+
+#### Phase 8: Distributed Consensus (The "Stateless Worker" Model)
+
+**Status:** 🚧 **Planning**
+
+- [ ] **Consensus Layer:** Integrate `openraft` or Etcd to manage the "Shard Map" (Which node owns which bucket?).
+- [ ] **Remote WAL:** Abstract `WalManager` to support Kafka/Redpanda or S3-Append, allowing any node to replay another's log.
+- [ ] **Stateless Worker:** Refactor `DriftService` to mount any collection by pulling state from S3, rather than relying on local disk affinity.
+- [ ] **Gateway Node:** Create a gRPC proxy that hashes vector IDs and routes requests to the correct Worker node.

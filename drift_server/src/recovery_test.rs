@@ -3,7 +3,7 @@ mod tests {
     use crate::manifest::ServerManifestManager;
     use crate::recovery::RecoveryManager;
     use drift_core::lock_manager::BucketCoordinator;
-    use drift_core::wal_v2::WalWriter;
+    use drift_core::wal::WalWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
     use opendal::Operator;
     use opendal::services::Fs;

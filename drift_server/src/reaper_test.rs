@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::local_staging::LocalStagingManager;
-    use crate::persistence_v2::PersistenceManager;
+    use crate::persistence::PersistenceManager;
     use crate::reaper::Reaper;
     use drift_storage::bucket_manager::{BucketVersion, StorageClass};
     use opendal::{Operator, services};

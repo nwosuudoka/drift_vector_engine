@@ -48,9 +48,7 @@ impl StorageFactory {
             builder = builder.secret_access_key(secret);
         }
 
-        let op = Operator::new(builder)
-            .map_err(io::Error::other)?
-            .finish();
+        let op = Operator::new(builder).map_err(io::Error::other)?.finish();
         Ok(op)
     }
 }

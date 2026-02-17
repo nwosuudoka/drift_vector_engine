@@ -1,176 +1,215 @@
 #[cfg(test)]
 mod tests {
     use crate::memtable::{MemTable, MemTableOptions};
+    use drift_traits::TombstoneView;
+    use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    const DIM: usize = 2;
+    #[derive(Debug, Default)]
+    struct TestView {
+        ids: HashSet<u64>,
+    }
 
-    // --- 1. Basic Correctness Tests ---
+    impl TestView {
+        fn with_ids(ids: &[u64]) -> Self {
+            let mut view = Self::default();
+            for id in ids {
+                view.ids.insert(*id);
+            }
+            view
+        }
+    }
+
+    impl TombstoneView for TestView {
+        fn contains(&self, id: u64) -> bool {
+            self.ids.contains(&id)
+        }
+
+        fn len(&self) -> usize {
+            self.ids.len()
+        }
+    }
+
+    fn make_table(capacity: usize, dim: usize) -> MemTable {
+        MemTable::new(MemTableOptions { capacity, dim })
+    }
 
     #[test]
-    fn test_memtable_basic_crud() {
-        let m_opts = MemTableOptions {
-            capacity: 100,
-            dim: DIM,
-        };
-        let memtable = MemTable::new(m_opts);
+    fn test_empty_and_len() {
+        let table = make_table(4, 2);
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+    }
 
-        // A. Insert
-        memtable.insert(1, &[10.0, 10.0]); // Far
-        memtable.insert(2, &[0.0, 0.0]); // Target
-        memtable.insert(3, &[0.1, 0.1]); // Close to Target
+    #[test]
+    fn test_insert_capacity_threshold() {
+        let table = make_table(3, 2);
 
-        // B. Search (Expect ID 2 and 3)
-        let results = memtable.search(&[0.0, 0.0], 2);
+        assert!(!table.insert(1, &[0.0, 0.0]));
+        assert!(!table.insert(2, &[1.0, 1.0]));
+        assert!(table.insert(3, &[2.0, 2.0]));
+
+        assert_eq!(table.len(), 3);
+        assert!(!table.is_empty());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_insert_dim_mismatch_panics() {
+        let table = make_table(2, 2);
+        table.insert(1, &[0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_insert_batch_empty_noop() {
+        let table = make_table(4, 2);
+        let batch: Vec<(u64, Vec<f32>)> = Vec::new();
+        assert!(!table.insert_batch(&batch));
+        assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn test_insert_batch_capacity_threshold() {
+        let table = make_table(5, 3);
+
+        let batch_a = vec![
+            (1, vec![0.0, 0.0, 0.0]),
+            (2, vec![1.0, 1.0, 1.0]),
+            (3, vec![2.0, 2.0, 2.0]),
+            (4, vec![3.0, 3.0, 3.0]),
+        ];
+        assert!(!table.insert_batch(&batch_a));
+        assert_eq!(table.len(), 4);
+
+        let batch_b = vec![(5, vec![4.0, 4.0, 4.0]), (6, vec![5.0, 5.0, 5.0])];
+        assert!(table.insert_batch(&batch_b));
+        assert_eq!(table.len(), 6);
+    }
+
+    #[test]
+    fn test_data_layout_ids_and_vectors() {
+        let table = make_table(4, 2);
+        table.insert(10, &[1.0, 2.0]);
+        table.insert(20, &[3.0, 4.0]);
+
+        let (ids, data) = table.get_data_guards();
+        assert_eq!(ids.as_slice(), &[10, 20]);
+        assert_eq!(data.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(data.len(), ids.len() * 2);
+    }
+
+    #[test]
+    fn test_snapshot_isolated_copy() {
+        let table = make_table(10, 2);
+        table.insert(1, &[0.0, 0.0]);
+        table.insert(2, &[1.0, 1.0]);
+
+        let (ids_snapshot, data_snapshot) = table.snapshot();
+        assert_eq!(ids_snapshot, vec![1, 2]);
+        assert_eq!(data_snapshot, vec![0.0, 0.0, 1.0, 1.0]);
+
+        table.insert(3, &[2.0, 2.0]);
+        let (ids_after, data_after) = table.snapshot();
+
+        assert_eq!(ids_snapshot, vec![1, 2]);
+        assert_eq!(data_snapshot, vec![0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(ids_after, vec![1, 2, 3]);
+        assert_eq!(data_after, vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn test_search_orders_by_distance() {
+        let table = make_table(10, 2);
+        table.insert(1, &[0.0, 0.0]);
+        table.insert(2, &[1.0, 1.0]);
+        table.insert(3, &[2.0, 2.0]);
+
+        let view = TestView::default();
+        let results = table.search(&[0.0, 0.0], 3, &view);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert!(results[0].1 <= results[1].1);
+        assert!(results[1].1 <= results[2].1);
+    }
+
+    #[test]
+    fn test_search_k_greater_than_len() {
+        let table = make_table(10, 2);
+        table.insert(1, &[0.0, 0.0]);
+        table.insert(2, &[1.0, 1.0]);
+
+        let view = TestView::default();
+        let results = table.search(&[0.5, 0.5], 10, &view);
+
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, 2, "ID 2 should be exact match");
-        assert_eq!(results[1].0, 3, "ID 3 should be second closest");
-
-        // C. Delete
-        memtable.delete(2);
-
-        // D. Search again (ID 2 should be gone)
-        let results_after = memtable.search(&[0.0, 0.0], 2);
-        assert_eq!(results_after.len(), 2);
-        assert_eq!(results_after[0].0, 3, "ID 3 promoted to first");
-        assert_eq!(results_after[1].0, 1, "ID 1 included to fill K");
     }
 
     #[test]
-    fn test_flat_buffer_alignment() {
-        // Verify that the contiguous buffer logic actually packs floats correctly
-        const TEST_DIM: usize = 4;
-        let m_opts = MemTableOptions {
-            capacity: 10,
-            dim: TEST_DIM,
-        };
-        let memtable = MemTable::new(m_opts);
-
-        memtable.insert(100, &[1.0, 2.0, 3.0, 4.0]);
-        memtable.insert(101, &[5.0, 6.0, 7.0, 8.0]);
-
-        // Manually inspect the lock-protected data
-        let (_, data, _) = memtable.get_data_guards();
-
-        // Vector 1
-        assert_eq!(data[0], 1.0);
-        assert_eq!(data[3], 4.0);
-
-        // Vector 2 starts immediately after
-        assert_eq!(data[4], 5.0);
-        assert_eq!(data[7], 8.0);
-    }
-
-    // --- 2. Zero-Copy Architecture Tests ---
-
-    #[test]
-    fn test_freeze_is_cheap_pointer_copy() {
-        let m_opts = MemTableOptions {
-            capacity: 1000,
-            dim: DIM,
-        };
-        let memtable = Arc::new(MemTable::new(m_opts));
-
-        // Insert some data
-        for i in 0..100 {
-            memtable.insert(i, &[0.0, 0.0]);
-        }
-
-        // "Freeze" the memtable (Simulating Index::rotate_and_freeze)
-        // This is just an Arc clone.
-        let frozen_ref = memtable.clone();
-
-        // 1. Verify Data Visibility
-        assert_eq!(frozen_ref.len(), 100);
-
-        // 2. Verify Shared Underlying Memory
-        // Modifying the "active" handle (if we allowed it) would be visible
-        // to the "frozen" handle because they point to the same RwLocks.
-        // In the real architecture, we drop the 'active' pointer from the Index
-        // after cloning, so writes stop going to this instance.
-
-        // Let's verify they are indeed the same object in memory
-        assert!(Arc::ptr_eq(&memtable, &frozen_ref));
+    #[should_panic]
+    fn test_search_k_zero_panics() {
+        let table = make_table(10, 2);
+        table.insert(1, &[0.0, 0.0]);
+        let view = TestView::default();
+        let _ = table.search(&[0.0, 0.0], 0, &view);
     }
 
     #[test]
-    fn test_concurrent_janitor_and_search_access() {
-        // This is the CRITICAL test for the "Shared Frozen State" architecture.
-        // It proves that the Janitor reading data (to flush) does NOT block Search.
+    fn test_search_respects_tombstones() {
+        let table = make_table(10, 2);
+        table.insert(10, &[0.0, 0.0]);
+        table.insert(20, &[1.0, 1.0]);
+        table.insert(30, &[2.0, 2.0]);
 
-        let m_opts = MemTableOptions {
-            capacity: 100,
-            dim: DIM,
-        };
-        let memtable = Arc::new(MemTable::new(m_opts));
+        let view = TestView::with_ids(&[20]);
+        let results = table.search(&[0.0, 0.0], 3, &view);
+        let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+
+        assert_eq!(ids, vec![10, 30]);
+    }
+
+    #[test]
+    fn test_get_data_guards_allows_concurrent_reads() {
+        let table = Arc::new(make_table(100, 2));
         for i in 0..50 {
-            memtable.insert(i, &[i as f32, i as f32]);
+            table.insert(i, &[i as f32, i as f32]);
         }
 
-        let janitor_ref = memtable.clone();
-        let search_ref = memtable.clone();
-
+        let reader = table.clone();
+        let searcher = table.clone();
         let barrier = Arc::new(Barrier::new(2));
-        let barrier_c = barrier.clone();
+        let barrier_a = barrier.clone();
 
-        // --- Thread A: Janitor (Flush) ---
-        let janitor_handle = thread::spawn(move || {
-            // 1. Acquire Read Lock (Simulating extraction for flush)
-            let (_ids, _vecs, _) = janitor_ref.get_data_guards();
-
-            // 2. Signal we have the lock
-            barrier_c.wait();
-
-            // 3. Sleep to simulate heavy K-Means/Compression
-            thread::sleep(Duration::from_millis(500));
-
-            // Lock is held this entire time!
+        let handle = thread::spawn(move || {
+            let (_ids, _data) = reader.get_data_guards();
+            barrier_a.wait();
+            thread::sleep(Duration::from_millis(200));
         });
 
-        // --- Thread B: Searcher ---
-        // Wait for Janitor to acquire lock
         barrier.wait();
-
-        // Try to Search IMMEDIATELY.
-        // If RwLock implementation is correct, this should NOT block.
-        let start = std::time::Instant::now();
-
-        let results = search_ref.search(&[0.0, 0.0], 5);
-
-        let duration = start.elapsed();
+        let view = TestView::default();
+        let start = Instant::now();
+        let results = searcher.search(&[0.0, 0.0], 5, &view);
+        let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);
+        assert!(elapsed < Duration::from_millis(50));
 
-        // Assert it was fast (non-blocking).
-        // If it blocked, duration would be > 500ms.
-        assert!(
-            duration < Duration::from_millis(50),
-            "Search was blocked by Janitor!"
-        );
-
-        janitor_handle.join().unwrap();
+        handle.join().unwrap();
     }
 
     #[test]
-    fn test_tombstones_propagate_to_shared_view() {
-        let m_opts = MemTableOptions {
-            capacity: 100,
-            dim: DIM,
-        };
-        let memtable = Arc::new(MemTable::new(m_opts));
-        memtable.insert(1, &[10.0, 10.0]);
+    fn test_insert_batch_then_single_insert() {
+        let table = make_table(10, 2);
+        let batch = vec![(1, vec![0.0, 0.0]), (2, vec![1.0, 1.0])];
+        assert!(!table.insert_batch(&batch));
 
-        let frozen_view = memtable.clone();
+        assert!(!table.insert(3, &[2.0, 2.0]));
 
-        // User deletes ID 1
-        memtable.delete(1);
-
-        // The "Frozen" view (used by search) should immediately see the tombstone
-        // because it shares the same RwLock<HashSet>.
-        let results = frozen_view.search(&[10.0, 10.0], 1);
-
-        assert!(results.is_empty(), "Frozen view failed to see deletion");
+        let (ids, data) = table.get_data_guards();
+        assert_eq!(ids.as_slice(), &[1, 2, 3]);
+        assert_eq!(data.as_slice(), &[0.0, 0.0, 1.0, 1.0, 2.0, 2.0]);
     }
 }

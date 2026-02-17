@@ -1,8 +1,8 @@
 use clap::Parser;
 use drift_server::config::Config;
 use drift_server::drift_proto::drift_server::DriftServer as GrpcServer;
-use drift_server::manager_v2::CollectionManager;
-use drift_server::server_v2::DriftService;
+use drift_server::manager::CollectionManager;
+use drift_server::server::DriftService;
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::info;

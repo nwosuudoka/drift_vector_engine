@@ -1,26 +1,34 @@
-use crate::compactor::SegmentCompactor;
 use crate::config::Config;
-use crate::janitor::Janitor;
+use crate::janitor::{Janitor, JanitorConfig, JanitorVars};
+use crate::local_staging::LocalStagingManager;
+use crate::manifest::ServerManifestManager;
 use crate::persistence::PersistenceManager;
+use crate::recovery::RecoveryManager;
 use crate::storage_factory::StorageFactory;
-use drift_cache::LocalDiskManager;
-use drift_cache::tiered_store::TieredPageManager;
-use drift_core::index::{IndexOptions, VectorIndex};
-use drift_storage::disk_manager::DriftPageManager;
+use drift_core::index::VectorIndex;
+use drift_core::lock_manager::BucketCoordinator;
+use drift_core::wal::WalManager;
+use drift_kv::bitstore::BitStore;
+use drift_storage::bucket_manager::BucketManager;
+use drift_traits::StorageEngine;
+use opendal::Operator;
+use opendal::services::Fs;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tracing::info; // Updated import
+use tracing::{error, info};
 
 pub struct Collection {
     pub index: Arc<VectorIndex>,
     pub name: String,
+    // We hold the handle so it runs in the background. Dropping this struct (e.g. shutdown) will abort it.
+    pub janitor_task: tokio::task::JoinHandle<()>,
 }
 
 pub struct CollectionManager {
-    // base_path: PathBuf,
     config: Config,
     collections: RwLock<HashMap<String, Arc<Collection>>>,
 }
@@ -28,30 +36,39 @@ pub struct CollectionManager {
 impl CollectionManager {
     pub fn new(config: Config) -> Self {
         std::fs::create_dir_all(&config.wal_dir).expect("Failed to create WAL root");
-
         Self {
             config,
             collections: RwLock::new(HashMap::new()),
         }
     }
 
+    fn create_local_operator(path: &Path) -> std::io::Result<Operator> {
+        let builder = Fs::default().root(path.to_str().unwrap());
+        Ok(Operator::new(builder)
+            .map_err(std::io::Error::other)?
+            .finish())
+    }
+
     pub async fn get_or_create(
         &self,
         name: &str,
         dim_hint: Option<usize>,
-    ) -> io::Result<Arc<Collection>> {
+        max_bucket_capacity: Option<usize>,
+    ) -> std::io::Result<Arc<Collection>> {
         // 1. Fast Path
         {
+            // await the lock
             let map = self.collections.read().await;
             if let Some(coll) = map.get(name) {
                 if let Some(d) = dim_hint
-                    && coll.index.config.dim != d
+                    && coll.index.get_dim() != d
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
                             "Dimension mismatch: Existing={}, Requested={}",
-                            coll.index.config.dim, d
+                            coll.index.get_dim(),
+                            d
                         ),
                     ));
                 }
@@ -65,100 +82,141 @@ impl CollectionManager {
             return Ok(coll.clone());
         }
 
-        info!("Manager: Initializing collection '{}'", name);
+        info!("Manager: Initializing collection '{}' (v2)", name);
 
-        // A. Resolve Paths
-        let coll_wal_dir = self.config.wal_dir.join(name);
-        std::fs::create_dir_all(&coll_wal_dir)?;
-        let wal_path = coll_wal_dir.join("current.wal");
+        // --- PATH RESOLUTION ---
+        let wal_dir = self.config.wal_dir.join(name);
+        let coll_root = self.config.data_dir.join(name);
+        let staging_dir = coll_root.join("staging");
+        let kv_dir = coll_root.join("kv");
 
-        // B. Storage Setup (Tiered)
+        // Note: fs::create_dir_all is blocking. In a high-throughput scenario,
+        // we might wrap this in spawn_blocking, but for initialization it's usually acceptable.
+        std::fs::create_dir_all(&wal_dir)?;
+        std::fs::create_dir_all(&coll_root)?;
+        std::fs::create_dir_all(&staging_dir)?;
+        std::fs::create_dir_all(&kv_dir)?;
 
-        let op = StorageFactory::build(&self.config.storage, name)?;
-        let remote_storage = Arc::new(DriftPageManager::new(op.clone()));
-
-        // C. Local Cache (NVMe)
-        let cache_dir = self
-            .config
-            .wal_dir
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("cache")
-            .join(name);
-        std::fs::create_dir_all(&cache_dir)?;
-        let local_storage = Arc::new(LocalDiskManager::new(cache_dir));
-        let storage = Arc::new(TieredPageManager::new(local_storage, remote_storage));
-
-        let persistence = PersistenceManager::new(op.clone(), &coll_wal_dir);
         let dim = dim_hint.unwrap_or(self.config.default_dim);
 
-        const DEFAULT_CENTRIODS: usize = 16;
-        const DEFAULT_TRAINING_SAMPLES: usize = 1000;
+        // --- COMPONENTS ---
+        let manifest = Arc::new(ServerManifestManager::new(&coll_root, dim as u32)?);
+        let staging = Arc::new(LocalStagingManager::new(&staging_dir)?);
 
-        // const DEFAULT_CENTRIODS: usize = 512;
-        // const DEFAULT_TRAINING_SAMPLES: usize = 10_000;
+        let remote_op = StorageFactory::build(&self.config.storage, name)?;
+        let persistence = Arc::new(PersistenceManager::new(remote_op.clone()));
+        let local_op = Self::create_local_operator(&staging_dir)?;
 
-        let options = IndexOptions {
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let bucket_manager = Arc::new(BucketManager::new(
+            local_op,
+            remote_op,
+            16,
+            coordinator.clone(),
+        ));
+
+        // --- RECOVERY (Step 1: Router) ---
+        // ⚡ This .await is why we needed tokio::sync::RwLock!
+        let recovery = RecoveryManager::new(&coll_root, manifest.clone());
+        let (router, replay_data) = recovery.recover(&bucket_manager, dim, &wal_dir).await?;
+
+        // --- INDEX ---
+        let wal = Arc::new(Mutex::new(WalManager::new(&wal_dir)?));
+        let kv = Arc::new(BitStore::new(&kv_dir).map_err(std::io::Error::other)?);
+
+        let index = Arc::new(VectorIndex::new(
             dim,
-            num_centroids: DEFAULT_CENTRIODS,
-            training_sample_size: DEFAULT_TRAINING_SAMPLES,
-            max_bucket_capacity: self.config.max_bucket_capacity,
-            ef_construction: self.config.ef_construction,
-            ef_search: self.config.ef_search,
-        };
+            self.config.max_bucket_capacity,
+            router,
+            wal,
+            bucket_manager.clone(),
+            kv.clone(),
+        ));
 
-        let index = Arc::new(VectorIndex::new(options, &wal_path, storage)?);
-
-        // Hydrate
-        persistence.hydrate_index(&index).await?;
-
-        // NEW: Hydrate Tombstones
-        let deleted_ids = persistence.load_all_tombstones().await?;
-        if !deleted_ids.is_empty() {
+        // --- RECOVERY (Step 2: Hydrate S3 Tombstones) ---
+        let persisted_deletes = persistence.load_all_tombstones().await?;
+        if !persisted_deletes.is_empty() {
             info!(
-                "Manager: Restored {} deleted IDs for collection '{}'",
-                deleted_ids.len(),
-                name
+                "Manager: Hydrating {} deletions from persistence...",
+                persisted_deletes.len()
             );
-            index.deleted_ids.write().extend(deleted_ids);
+            // L0
+            {
+                let mut guard = index.get_deleted_ids_inner().write();
+                let mut set = (**guard).clone();
+                set.extend(persisted_deletes.iter());
+                *guard = Arc::new(set);
+            }
+            // L1
+            for &id in &persisted_deletes {
+                let id_bytes = id.to_le_bytes();
+                if let Ok(Some(val)) = kv.get(&id_bytes)
+                    && let Ok(bucket_id) = val.try_into().map(u32::from_le_bytes)
+                {
+                    let _ = bucket_manager.mark_delete(bucket_id, id);
+                }
+            }
         }
 
-        // Start Janitor
-        let j_idx = index.clone();
-        let j_persist = persistence.clone();
-        let flush_threshold = self.config.max_bucket_capacity;
-        let refresh_rate = 100;
-
-        let compactor = SegmentCompactor::new(index.clone(), op.clone());
-
-        let cloned_name = name.to_string();
-        tokio::spawn(async move {
-            let janitor = Janitor::new(
-                j_idx,
-                j_persist,
-                flush_threshold,
-                Duration::from_millis(refresh_rate),
-                Some(compactor),
+        // --- RECOVERY (Step 3: Replay WAL) ---
+        if !replay_data.inserts.is_empty() {
+            info!(
+                "Manager: Replaying {} inserts from WAL...",
+                replay_data.inserts.len()
             );
-            janitor.run().await;
+            index.insert_batch(&replay_data.inserts)?;
+        }
+        if !replay_data.deletes.is_empty() {
+            info!(
+                "Manager: Replaying {} deletes from WAL...",
+                replay_data.deletes.len()
+            );
+            for id in replay_data.deletes {
+                index.delete(id)?;
+            }
+        }
 
-            // If we reach here, the Janitor loop exited (unexpectedly)
-            tracing::error!("🚨 JANITOR DIED for collection '{}'", cloned_name);
-            println!("🚨 JANITOR DIED for collection '{}'", cloned_name); // Force stdout
+        let max_bucket_capacity = max_bucket_capacity.unwrap_or(self.config.max_bucket_capacity);
+
+        // --- JANITOR ---
+        let janitor_config = JanitorConfig {
+            index: index.clone(),
+            manifest: manifest.clone(),
+            staging,
+            persistence,
+            bucket_manager: bucket_manager.clone(),
+            coordinator,
+            vars: JanitorVars {
+                promotion_threshold_bytes: 16 * 1024 * 1024,
+                check_interval: Duration::from_millis(100),
+                max_bucket_capacity,
+                split_threshold: 0.8,
+                drift_threshold: 0.15,
+                temperature_cool_factor: 0.98,
+                urgency_threshold: 1.5,
+            },
+        };
+
+        let janitor = Janitor::new(janitor_config);
+        let task_name = name.to_string();
+        let janitor_task = tokio::spawn(async move {
+            info!("Janitor started for '{}'", task_name);
+            janitor.run().await;
+            error!("Janitor stopped for '{}'", task_name);
         });
 
         let collection = Arc::new(Collection {
             index,
             name: name.to_string(),
+            janitor_task,
         });
 
         map.insert(name.to_string(), collection.clone());
-        info!("Manager: Collection '{}' ready (dim: {})", name, dim);
+        info!("Manager: Collection '{}' ready.", name);
         Ok(collection)
     }
 
     pub async fn list_collections(&self) -> Vec<String> {
-        let map = self.collections.read().await;
-        map.keys().cloned().collect()
+        self.collections.read().await.keys().cloned().collect()
     }
 }

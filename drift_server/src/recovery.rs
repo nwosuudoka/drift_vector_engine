@@ -1,7 +1,7 @@
 use crate::manifest::ServerManifestManager;
 use drift_core::math::Metric;
 use drift_core::router::Router;
-use drift_core::wal_v2::{WalEntry, WalReader};
+use drift_core::wal::{WalEntry, WalReader};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
 use parking_lot::RwLock;
 use std::collections::HashMap;
