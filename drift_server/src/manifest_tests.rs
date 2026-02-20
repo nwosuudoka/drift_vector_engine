@@ -64,4 +64,30 @@ mod tests {
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), b"not_a_valid_protobuf");
     }
+
+    #[test]
+    fn test_manifest_rejects_invalid_metric() {
+        let dir = tempdir().unwrap();
+        let manager = ServerManifestManager::new(dir.path(), 128).unwrap();
+        let result = manager.apply_atomic(|m| {
+            m.inner.metric = "NOT_A_METRIC".to_string();
+        });
+        assert!(
+            result.is_err(),
+            "Should reject unknown metric in apply_atomic"
+        );
+    }
+
+    #[test]
+    fn test_manifest_rejects_cosine_metric_for_server_execution() {
+        let dir = tempdir().unwrap();
+        let manager = ServerManifestManager::new(dir.path(), 128).unwrap();
+        let result = manager.apply_atomic(|m| {
+            m.inner.metric = "COSINE".to_string();
+        });
+        assert!(
+            result.is_err(),
+            "Server should reject COSINE until scan path supports it"
+        );
+    }
 }

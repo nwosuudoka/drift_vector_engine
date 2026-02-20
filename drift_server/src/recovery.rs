@@ -1,5 +1,4 @@
 use crate::manifest::ServerManifestManager;
-use drift_core::math::Metric;
 use drift_core::router::Router;
 use drift_core::wal::{WalEntry, WalReader};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
@@ -40,6 +39,9 @@ impl RecoveryManager {
 
         // 1. Get Snapshot of Manifest
         let wrapper = self.manifest.get_state();
+        let metric = wrapper
+            .metric()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         // --- STEP A: REBUILD ROUTER ---
         let bucket_stats: HashMap<u32, u64> = wrapper
@@ -62,9 +64,9 @@ impl RecoveryManager {
 
         let router = if pb_centroids.is_empty() {
             info!("Recovery: No existing state found (Day 0). Bootstrapping empty router.");
-            Arc::new(RwLock::new(Router::empty(dim, Metric::L2)))
+            Arc::new(RwLock::new(Router::empty(dim, metric.clone())))
         } else {
-            let r = Router::new(&pb_centroids, &counts, dim, Metric::L2)
+            let r = Router::new(&pb_centroids, &counts, dim, metric)
                 .ok_or_else(|| io::Error::other("Failed to rebuild router from non-empty state"))?;
             info!(
                 "Recovery: Router rebuilt with {} buckets.",

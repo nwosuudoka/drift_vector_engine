@@ -26,6 +26,18 @@ impl ServerManifestManager {
             let bytes = fs::read(&path).context("Failed to read manifest file")?;
             let wrapper = ManifestWrapper::from_bytes(&bytes)
                 .map_err(|e| io::Error::other(format!("Protobuf decode error: {}", e)))?;
+            let metric = wrapper
+                .metric()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if metric != Metric::L2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Unsupported manifest metric '{}': server execution currently supports only L2",
+                        wrapper.inner.metric
+                    ),
+                ));
+            }
             Ok(Self {
                 base_path: base,
                 manifest_path: path,
@@ -62,6 +74,15 @@ impl ServerManifestManager {
 
         // 1. Apply Changes In-Memory
         op(&mut guard);
+        let metric = guard
+            .metric()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if metric != Metric::L2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unsupported manifest metric: server execution currently supports only L2",
+            ));
+        }
 
         // 2. Bump Version & Persist
         guard.bump_version();

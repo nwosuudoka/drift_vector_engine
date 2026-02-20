@@ -67,11 +67,35 @@ pub enum Metric {
     COSINE,
 }
 
+impl Metric {
+    pub fn from_manifest_str(raw: &str) -> Result<Self, String> {
+        let normalized = raw.trim();
+        if normalized.is_empty() {
+            // Backward-compat fallback for older manifests without metric populated.
+            return Ok(Self::L2);
+        }
+
+        normalized.parse()
+    }
+}
+
 impl std::fmt::Display for Metric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Metric::COSINE => write!(f, "COSINE"),
             Metric::L2 => write!(f, "L2"),
+        }
+    }
+}
+
+impl std::str::FromStr for Metric {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_uppercase().as_str() {
+            "L2" => Ok(Self::L2),
+            "COSINE" => Ok(Self::COSINE),
+            _ => Err(format!("unsupported metric '{}'", raw)),
         }
     }
 }

@@ -169,4 +169,20 @@ mod tests {
         assert_eq!(bucket.object_path, "remote/custom/path_42.drift");
         assert_eq!(bucket.object_fingerprint, "len=123|etag=abc");
     }
+
+    #[test]
+    fn test_manifest_metric_parser() {
+        let mut manifest = ManifestWrapper::new(16, Metric::L2);
+        assert_eq!(manifest.metric().unwrap(), Metric::L2);
+
+        manifest.inner.metric = "COSINE".to_string();
+        assert_eq!(manifest.metric().unwrap(), Metric::COSINE);
+
+        // Backward compatibility for older manifests where metric was not set.
+        manifest.inner.metric.clear();
+        assert_eq!(manifest.metric().unwrap(), Metric::L2);
+
+        manifest.inner.metric = "invalid".to_string();
+        assert!(manifest.metric().is_err());
+    }
 }

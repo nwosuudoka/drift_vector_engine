@@ -116,6 +116,10 @@ impl ManifestWrapper {
         self.inner.dim
     }
 
+    pub fn metric(&self) -> Result<Metric, String> {
+        Metric::from_manifest_str(&self.inner.metric)
+    }
+
     pub fn update_bucket_run_id(&mut self, id: u32, new_run_id: String) {
         if let Some(b) = self.inner.buckets.iter_mut().find(|b| b.id == id) {
             b.run_id = new_run_id;
