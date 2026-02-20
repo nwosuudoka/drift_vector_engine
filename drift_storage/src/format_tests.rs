@@ -13,7 +13,7 @@ mod tests {
         assert_eq!(bytes.len(), HEADER_SIZE);
 
         // Verify Magic (Little Endian)
-        let magic_bytes = MAGIC_V2.to_le_bytes();
+        let magic_bytes = MAGIC_CURRENT.to_le_bytes();
         assert_eq!(&bytes[0..8], &magic_bytes);
 
         // Zero-Copy deserialization
@@ -51,7 +51,7 @@ mod tests {
         let bytes = footer.as_bytes();
 
         // Magic must be at the very end (120..128)
-        let magic_bytes = MAGIC_V2.to_le_bytes();
+        let magic_bytes = MAGIC_CURRENT.to_le_bytes();
         assert_eq!(&bytes[120..128], &magic_bytes);
 
         let decoded = DriftFooter::read_from_bytes(bytes).unwrap();

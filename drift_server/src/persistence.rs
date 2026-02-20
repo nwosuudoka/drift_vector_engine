@@ -1,9 +1,10 @@
 use drift_core::{quantizer::Quantizer, tombstone::TombstoneFile};
 use drift_storage::bucket_file_reader::BucketFileReader;
 use drift_storage::bucket_file_writer::BucketFileWriter;
+use drift_storage::disk_manager::DiskManager;
 use opendal::Operator;
 use std::io::{self, Cursor};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct PersistenceManager {
@@ -75,7 +76,14 @@ impl PersistenceManager {
     }
 
     pub async fn delete_file(&self, path: &str) -> std::io::Result<()> {
-        self.op.delete(path).await.map_err(std::io::Error::other)
+        self.op.delete(path).await.map_err(std::io::Error::other)?;
+        if let Err(e) = DiskManager::invalidate_nvme_cache_for_object(&self.op, path).await {
+            warn!(
+                "Persistence: failed to invalidate NVMe cache for {}: {}",
+                path, e
+            );
+        }
+        Ok(())
     }
 
     pub async fn flush_tombstones(&self, ids: &[u64], run_id: &str) -> std::io::Result<String> {

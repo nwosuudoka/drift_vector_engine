@@ -29,9 +29,7 @@ mod tests {
 
         // WRITE
         let vectors_flat: Vec<f32> = vectors.clone().into_iter().flatten().collect();
-        let header = writer
-            .write_group(&ids, &vectors_flat, None, &q, dim)
-            .unwrap();
+        let header = writer.write_group(&ids, &vectors_flat, &q, dim).unwrap();
 
         // ASSERTIONS
         // 1. Check Counts
@@ -71,22 +69,21 @@ mod tests {
         // We need N*8 + N*dim + 4 = K * 64.
 
         // Let's try dim = 60.
-        // Hot = N*8 + N*60 + 4 = N*68 + 4.
-        // If N=15: 15*68 + 4 = 1020 + 4 = 1024.
-        // 1024 % 64 == 0. PERFECT ALIGNMENT.
+        // Hot = N*8 + N*60 = N*68.
+        // If N=15: 15*68 = 1020.
 
         let (ids, vecs, q) = mock_data(15, 60);
 
         let mut buffer = Cursor::new(Vec::new());
         let mut writer = RowGroupWriter::new(&mut buffer, 0);
         let vecs_flat: Vec<f32> = vecs.clone().into_iter().flatten().collect();
-        let header = writer.write_group(&ids, &vecs_flat, None, &q, 60).unwrap();
+        let header = writer.write_group(&ids, &vecs_flat, &q, 60).unwrap();
 
         // Check alignment
         // Hot Offset = 64.
-        // Hot Length = 1024.
-        // Cold Offset should be 64 + 1024 = 1088.
-        assert_eq!(header.hot_length, 1024);
+        // Hot Length = 1020.
+        // Cold Offset should be 64 + 1020 + 4 padding = 1088.
+        assert_eq!(header.hot_length, 1020);
         assert_eq!(header.cold_offset, 1088);
 
         // Padding should be 0
@@ -97,26 +94,19 @@ mod tests {
 
     #[test]
     fn test_edge_case_worst_misalignment() {
-        // Force 1 byte of misalignment.
-        // Hot Size % 64 == 1.
-        // Hot = N*8 + N*dim + 4.
-        // Let dim = 1.
-        // Hot = N*9 + 4.
-        // If N=7: 63 + 4 = 67. 67 % 64 = 3.
-        // If N=14: 126 + 4 = 130.
-        // Let's brute force a tiny config.
-        // dim=1. N=1 -> 8+1+4 = 13.
-        // Padding needed = 64 - 13 = 51.
+        // Hot = N*8 + N*dim.
+        // Let dim=1 and N=1 -> hot=9.
+        // With header(64), current_pos=73 so padding needed = 55.
 
         let (ids, vecs, q) = mock_data(1, 1);
 
         let mut buffer = Cursor::new(Vec::new());
         let mut writer = RowGroupWriter::new(&mut buffer, 0);
         let vecs_flat: Vec<f32> = vecs.clone().into_iter().flatten().collect();
-        let header = writer.write_group(&ids, &vecs_flat, None, &q, 1).unwrap();
+        let header = writer.write_group(&ids, &vecs_flat, &q, 1).unwrap();
 
-        // Hot Length = 13
-        assert_eq!(header.hot_length, 13);
+        // Hot Length = 9
+        assert_eq!(header.hot_length, 9);
 
         // Cold Offset must be aligned (Multiple of 64)
         assert_eq!(header.cold_offset % 64, 0);
@@ -124,7 +114,7 @@ mod tests {
         // Verify we added padding
         assert!(header.cold_offset > header.hot_offset + header.hot_length as u64);
         let padding_len = header.cold_offset - (header.hot_offset + header.hot_length as u64);
-        assert_eq!(padding_len, 51);
+        assert_eq!(padding_len, 55);
     }
 
     #[test]
@@ -133,7 +123,7 @@ mod tests {
         let mut writer = RowGroupWriter::new(&mut buffer, 0);
         let q = Quantizer::train(&[1.0], 1);
 
-        let res = writer.write_group(&[], &[], None, &q, 1);
+        let res = writer.write_group(&[], &[], &q, 1);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -147,7 +137,7 @@ mod tests {
         let ids = vec![1];
         let vecs = vec![]; // Mismatch
 
-        let res = writer.write_group(&ids, &vecs, None, &q, 1);
+        let res = writer.write_group(&ids, &vecs, &q, 1);
         assert!(res.is_err());
     }
 
@@ -160,7 +150,7 @@ mod tests {
 
         let (ids, vecs, q) = mock_data(10, 4);
         let vecs_flat: Vec<f32> = vecs.clone().into_iter().flatten().collect();
-        let header = writer.write_group(&ids, &vecs_flat, None, &q, 4).unwrap();
+        let header = writer.write_group(&ids, &vecs_flat, &q, 4).unwrap();
 
         // The header written to "disk" (buffer) should contain the huge offset
         assert_eq!(header.hot_offset, start_offset + 64);

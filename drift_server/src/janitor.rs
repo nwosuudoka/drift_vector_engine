@@ -1,3 +1,4 @@
+use crate::cleanup::CleanupApi;
 use crate::local_staging::LocalStagingManager;
 use crate::manifest::ServerManifestManager;
 use crate::persistence::PersistenceManager;
@@ -52,6 +53,7 @@ pub struct Janitor {
     manifest: Arc<ServerManifestManager>,
     staging: Arc<LocalStagingManager>,
     persistence: Arc<PersistenceManager>,
+    cleanup: CleanupApi,
     bucket_manager: Arc<BucketManager>,
     reaper: Mutex<Reaper>,
     coordinator: Arc<BucketCoordinator>,
@@ -60,6 +62,7 @@ pub struct Janitor {
 
 impl Janitor {
     pub fn new(config: JanitorConfig) -> Self {
+        let cleanup = CleanupApi::new(config.staging.clone(), config.persistence.clone());
         let reaper = Mutex::new(Reaper::new(
             config.staging.clone(),
             config.persistence.clone(),
@@ -69,6 +72,7 @@ impl Janitor {
             manifest: config.manifest,
             staging: config.staging,
             persistence: config.persistence,
+            cleanup,
             bucket_manager: config.bucket_manager,
             reaper,
             coordinator: config.coordinator,
@@ -423,7 +427,9 @@ impl Janitor {
             let (mut merged_ids, mut merged_vecs) =
                 self.staging.read_file_content(&staging_filename).await?;
             if merged_ids.is_empty() {
-                let _ = self.staging.delete_file(&staging_filename).await;
+                self.cleanup
+                    .delete_local_best_effort(&staging_filename, "promotion-empty-staging")
+                    .await;
                 continue;
             }
 
@@ -497,9 +503,13 @@ impl Janitor {
             }
 
             // 6. Cleanup
-            let _ = self.staging.delete_file(&staging_filename).await;
+            self.cleanup
+                .delete_local_best_effort(&staging_filename, "promotion-rotated-staging")
+                .await;
             if let Some(old_path) = remote_path_opt {
-                let _ = self.persistence.delete_file(&old_path).await;
+                self.cleanup
+                    .delete_remote_best_effort(&old_path, "promotion-old-remote")
+                    .await;
             }
         }
         Ok(())
@@ -607,7 +617,9 @@ impl Janitor {
         // We delete the STAGING file for the old bucket immediately if it exists.
         // Remote files are handled by Reaper later.
         let old_staging = self.staging.get_active_filename(bucket_id);
-        let _ = self.staging.delete_file(&old_staging).await;
+        self.cleanup
+            .delete_local_best_effort(&old_staging, "split-old-staging")
+            .await;
 
         info!(
             "Janitor: Split Complete. {} -> {}, {}",
@@ -640,12 +652,9 @@ impl Janitor {
 
             // 2. ⚡ NEW: Delete Physical File
             let zombie_file = self.staging.get_active_filename(zombie_id);
-            if let Err(e) = self.staging.delete_file(&zombie_file).await {
-                error!(
-                    "Janitor: Failed to delete zombie file {}: {}",
-                    zombie_file, e
-                );
-            }
+            self.cleanup
+                .delete_local_best_effort(&zombie_file, "merge-empty-zombie")
+                .await;
 
             return Ok(());
         }
@@ -755,11 +764,15 @@ impl Janitor {
 
         // 6. Cleanup
         let zombie_file = self.staging.get_active_filename(zombie_id);
-        let _ = self.staging.delete_file(&zombie_file).await;
+        self.cleanup
+            .delete_local_best_effort(&zombie_file, "merge-zombie-old")
+            .await;
 
         for f in files_to_delete {
             if !manifest_updates.iter().any(|(_, _, _, _, new)| *new == f) {
-                let _ = self.staging.delete_file(&f).await;
+                self.cleanup
+                    .delete_local_best_effort(&f, "merge-neighbor-old")
+                    .await;
             }
         }
 

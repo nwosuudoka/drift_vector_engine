@@ -1,3 +1,4 @@
+pub mod cleanup;
 pub mod config;
 pub mod janitor;
 pub mod local_staging;

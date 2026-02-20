@@ -272,8 +272,7 @@
 // }
 
 use crate::format::{
-    DriftFooter, DriftHeader, FOOTER_SIZE, HEADER_SIZE, MAGIC_V2, ROW_GROUP_HEADER_SIZE,
-    RowGroupHeader,
+    DriftFooter, DriftHeader, FOOTER_SIZE, HEADER_SIZE, ROW_GROUP_HEADER_SIZE, RowGroupHeader,
 };
 use crate::row_group_writer::RowGroupWriter;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -388,8 +387,7 @@ impl<W: Write + Truncatable> BucketFileWriter<W> {
 
     pub fn write_batch(&mut self, ids: &[u64], flat_vectors: &[f32]) -> io::Result<()> {
         let mut rg_writer = RowGroupWriter::new(&mut self.writer, self.current_offset);
-        let rg_header =
-            rg_writer.write_group(ids, flat_vectors, None, &self.quantizer, self.dim)?;
+        let rg_header = rg_writer.write_group(ids, flat_vectors, &self.quantizer, self.dim)?;
 
         let next_offset = rg_header.cold_offset + rg_header.cold_length as u64;
         self.current_offset = next_offset;
@@ -477,7 +475,7 @@ impl<W: Write + Seek + Read + Truncatable> BucketFileWriter<W> {
         let footer = DriftFooter::read_from_bytes(&footer_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid Footer"))?;
 
-        if footer.magic != MAGIC_V2 {
+        if !DriftFooter::is_supported_magic(footer.magic) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad Magic"));
         }
 
