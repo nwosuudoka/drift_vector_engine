@@ -15,6 +15,14 @@ pub struct ManifestWrapper {
 }
 
 impl ManifestWrapper {
+    fn default_object_path(id: u32, run_id: &str) -> String {
+        if run_id.is_empty() {
+            String::new()
+        } else {
+            format!("bucket_{}_{}.drift", id, run_id)
+        }
+    }
+
     pub fn new(dim: u32, metric: Metric) -> Self {
         Self {
             inner: Manifest {
@@ -62,12 +70,15 @@ impl ManifestWrapper {
             self.inner.buckets.remove(pos);
         }
 
+        let object_path = Self::default_object_path(id, &run_id);
         self.inner.buckets.push(pb::Bucket {
             id,
             run_id,
             vector_count: 0, // Reset count on new run? Or pass it in. Usually 0 start.
             tombstone_count: 0,
             radius: 0.0,
+            object_path,
+            object_fingerprint: String::new(),
         });
 
         // 2. Update Routing Table (if centroid provided)
@@ -108,6 +119,22 @@ impl ManifestWrapper {
     pub fn update_bucket_run_id(&mut self, id: u32, new_run_id: String) {
         if let Some(b) = self.inner.buckets.iter_mut().find(|b| b.id == id) {
             b.run_id = new_run_id;
+            b.object_path = Self::default_object_path(id, &b.run_id);
+            b.object_fingerprint.clear();
+        }
+    }
+
+    pub fn update_bucket_remote_meta(
+        &mut self,
+        id: u32,
+        run_id: String,
+        object_path: String,
+        object_fingerprint: String,
+    ) {
+        if let Some(b) = self.inner.buckets.iter_mut().find(|b| b.id == id) {
+            b.run_id = run_id;
+            b.object_path = object_path;
+            b.object_fingerprint = object_fingerprint;
         }
     }
 }

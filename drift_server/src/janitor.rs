@@ -475,13 +475,28 @@ impl Janitor {
 
             // 3. Finalize Registry (Tiered)
             let new_remote_path = format!("bucket_{}_{}.drift", bucket_id, new_run_id);
+            let new_remote_fingerprint = match self
+                .persistence
+                .object_fingerprint_for_path(&new_remote_path)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "Janitor: failed to read remote fingerprint for {}: {}",
+                        new_remote_path,
+                        e
+                    );
+                    String::new()
+                }
+            };
             let tiered_class = StorageClass::Tiered {
                 remote_path: new_remote_path.clone(),
                 local_path: new_filename.clone(),
             };
             self.bucket_manager.register_bucket_with_count(
                 bucket_id,
-                new_remote_path,
+                new_remote_path.clone(),
                 tiered_class,
                 final_count,
             );
@@ -497,7 +512,12 @@ impl Janitor {
             // Get fresh stats for atomic update (retains any NEW tombstones that arrived during upload)
             if let Some(stats) = self.bucket_manager.get_bucket_stats(bucket_id) {
                 self.manifest.apply_atomic(|m| {
-                    m.update_bucket_run_id(bucket_id, new_run_id.clone());
+                    m.update_bucket_remote_meta(
+                        bucket_id,
+                        new_run_id.clone(),
+                        new_remote_path.clone(),
+                        new_remote_fingerprint.clone(),
+                    );
                     m.update_bucket_stats(bucket_id, final_count as u64, stats.tombstone_count);
                 })?;
             }

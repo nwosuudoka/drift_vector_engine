@@ -23,6 +23,9 @@ This document captures the V3 direction aligned with current implementation and 
   - Local NVMe full-object files: hashed files under the configured cache directory.
   - Reads are served by local range slicing from the cached object file.
   - Remote/object storage is used as fallback on miss.
+- Runtime has singleflight protection so concurrent misses for the same object wait on one downloader.
+- Runtime tracks in-memory cache metadata (`size`, `last-access`, `access-count`, fingerprint) and rebuilds it by scanning cache files on restart.
+- Eviction is S3FIFO-inspired for disk objects: one-hit entries are evicted before recurring entries when budgets are exceeded.
 - No in-memory byte payload cache is used in the read path.
 - Intended usage: remote/object-store backed reads (S3-like operators).
 
@@ -40,13 +43,18 @@ This document captures the V3 direction aligned with current implementation and 
 - V3 hot layout cleanup (no tombstone placeholder bytes).
 - Remote read cache with local NVMe full-object files (no RAM payload cache).
 - Delete/cleanup calls routed through `CleanupApi` and `PersistenceManager::delete_file` for consistent remote cache invalidation.
+- Cache metrics are exposed via `DiskManager::global_nvme_cache_metrics()`.
+- Provider-agnostic object fingerprints are stored in manifest bucket metadata.
 
 ## Cache Configuration
 
 Set the following env vars to enable local NVMe object-file caching for remote operators:
 
 - `DRIFT_NVME_CACHE_DIR` (required to enable)
+- `DRIFT_NVME_CACHE_MAX_BYTES` (optional global disk budget by bytes)
+- `DRIFT_NVME_CACHE_MAX_FILES` (optional global disk budget by object-file count)
 - `DRIFT_NVME_CACHE_MAX_FILE_BYTES` (optional; if set, larger objects bypass full-file cache and use direct range reads)
+- `DRIFT_NVME_FINGERPRINT_VERIFY_INTERVAL_MS` (optional; how often cached objects are re-verified against remote metadata)
 
 If `DRIFT_NVME_CACHE_DIR` is not set, behavior stays unchanged (no local object-file cache).
 
@@ -55,8 +63,8 @@ If `DRIFT_NVME_CACHE_DIR` is not set, behavior stays unchanged (no local object-
 - On remote object delete via `PersistenceManager::delete_file`, the matching NVMe cache directory for that object is invalidated.
 - Janitor/Reaper cleanup paths route delete calls through `CleanupApi`, which delegates remote deletion to `PersistenceManager`.
 - In normal segment lifecycle, file names are immutable (`bucket_{id}_{run_id}.drift`) so stale-read risk is low because replaced state uses a new object key.
-- If any workflow reuses the same object key for overwrite-in-place, explicit invalidation must happen on write/replace as well.
-- Disk cache is currently best-effort and not yet budgeted by size.
+- If any workflow reuses the same object key for overwrite-in-place, fingerprint mismatch detection invalidates stale local cache before refresh.
+- Disk cache enforces optional byte/count budgets when configured.
 
 ## Migration Plan (incremental)
 
@@ -71,9 +79,9 @@ If `DRIFT_NVME_CACHE_DIR` is not set, behavior stays unchanged (no local object-
 3. Query/runtime upgrades
 - Use bloom as actual scan pre-filter in query path.
 - Add optional per-row-group checksum verification mode during refine/debug.
-- Add cache metrics emission (disk cache hit/miss, remote fetch ratio).
-- Add disk cache budget + sweeper (size-based eviction of stale object cache files).
-- Add object-version guard (etag/version marker) for overwrite-in-place safety.
+- Expand cache metrics export to external observability sinks (Prometheus/OpenTelemetry).
+- Tune eviction policy for workload-specific hot/cold behavior.
+- Add manifest/runtime cross-check path for fingerprint mismatch observability.
 
 4. Payload/index expansion (next major step)
 - Add sidecar payload store and secondary indexes (metadata/text/range).

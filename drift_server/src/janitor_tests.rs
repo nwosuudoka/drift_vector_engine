@@ -1201,6 +1201,18 @@ mod janitor_promotion_test {
             "Manifest count should match merged & purged data"
         );
         assert_ne!(b1.run_id, "run_OLD", "Run ID should update");
+        assert!(
+            !b1.object_path.is_empty(),
+            "Object path should be recorded in manifest"
+        );
+        assert!(
+            !b1.object_fingerprint.is_empty(),
+            "Object fingerprint should be recorded in manifest"
+        );
+        assert_eq!(
+            b1.object_path,
+            format!("bucket_{}_{}.drift", bucket_id, b1.run_id)
+        );
 
         // 2. Check S3 File Content
         let new_key = format!("bucket_1_{}.drift", b1.run_id);

@@ -63,6 +63,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recover_prefers_manifest_object_path_for_remote() {
+        let dir = tempdir().unwrap();
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 8).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(7, "run_remote".into(), Some(vec![0.0; 8]));
+                m.update_bucket_remote_meta(
+                    7,
+                    "run_remote".into(),
+                    "custom/provider/object-7.drift".into(),
+                    "len=64|etag=test".into(),
+                );
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new(dir.path(), manifest);
+        let bucket_mgr = create_noop_manager();
+        let wal_dir = dir.path().join("wal");
+
+        mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
+
+        let (path, class) = bucket_mgr.get_location(7).unwrap();
+        assert_eq!(path, "custom/provider/object-7.drift");
+        assert_eq!(class, StorageClass::Remote);
+    }
+
+    #[tokio::test]
     async fn test_recover_scans_wal() {
         let dir = tempdir().unwrap();
         let wal_dir = dir.path().join("wal");

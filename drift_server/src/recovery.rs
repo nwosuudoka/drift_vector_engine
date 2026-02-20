@@ -82,7 +82,11 @@ impl RecoveryManager {
             if local_full_path.exists() {
                 bucket_manager.register_bucket(b.id, local_filename, StorageClass::Local);
             } else if !b.run_id.is_empty() {
-                let remote_filename = format!("bucket_{}_{}.drift", b.id, b.run_id);
+                let remote_filename = if !b.object_path.is_empty() {
+                    b.object_path.clone()
+                } else {
+                    format!("bucket_{}_{}.drift", b.id, b.run_id)
+                };
                 bucket_manager.register_bucket(b.id, remote_filename, StorageClass::Remote);
             } else {
                 warn!("Recovery: Bucket {} is registered but has no file!", b.id);
