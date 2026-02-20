@@ -1,5 +1,31 @@
 # Changelog
 
+## [Unreleased] - v3.0.0 (V3 Foundation and Hardening)
+
+### Added
+
+- **Collection metric contract:** metric is now part of collection creation semantics and validated across reopen/reuse.
+- **Cosine clustering path:** spherical K-Means support for cosine-based collection workflows.
+- **NVMe cache metrics in API:** `HealthResponse` now includes `NvmeCacheMetrics` sourced from runtime cache counters.
+- **Cache hardening tests:**
+  - byte-budget eviction coverage,
+  - cleanup/delete-driven invalidation coverage,
+  - expanded singleflight/fingerprint/eviction validation.
+- **Durability test hardening:** chaos kill/restart test now has strict health gating, epoch-specific recovery checks, and bounded retry verification.
+
+### Changed
+
+- **Storage format policy:** reader/writer behavior is now strict V3-only.
+- **Hot row-group layout:** hot blob is now `[ids][sq8_codes]` without serialized tombstone placeholders.
+- **Reader validation:** open path now strictly validates footer/index/row-group/quantizer/bloom structural ranges.
+- **NVMe cache path:** remote reads use local full-object cache files with local range slicing (no RAM byte-range cache layer).
+- **Cleanup path unification:** remote deletes route through `CleanupApi` + `PersistenceManager::delete_file` and invalidate matching cache entries.
+
+### Fixed
+
+- **Chaos startup flake:** stale binary startup in chaos tests now prevented by building/resolving the current `drift_server` binary before spawn.
+- **False-positive recovery checks:** chaos verification now validates recovery against writes confirmed in the same epoch.
+
 ## [v2.0.0-beta] - The LBR Architecture Complete
 
 ### Hardening & Safety

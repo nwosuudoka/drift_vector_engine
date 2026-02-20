@@ -15,6 +15,15 @@ System is organized around **Logical Buckets** that can live in multiple physica
 Search and maintenance operate on this logical view, while the Janitor keeps metadata
 and files consistent.
 
+## V3 status
+
+- **Storage format is strict V3-only** for read/write paths.
+- **Hot row-group layout** is `[ids][sq8_codes]` (no serialized tombstone trailer bytes).
+- **Collection metric is explicit at create time** and enforced across reopen/reuse.
+- **Remote reads use a local NVMe full-object cache** with local range slicing, singleflight
+  miss coordination, and budget-based eviction.
+- **Health RPC includes NVMe cache runtime metrics** to expose cache behavior in production.
+
 ## Architecture
 
 ### Core components
@@ -27,6 +36,8 @@ and files consistent.
   tau, plus a distance guardrail.
 - **BucketManager**: tracks bucket state (Local/Remote/Tiered/Promoting), tombstones,
   and provides unified search across local/remote tiers.
+- **NVMe object cache**: `DiskManager` caches full remote objects locally, serves sub-ranges
+  from disk, verifies provider-agnostic fingerprints, and invalidates stale entries.
 - **BitStore (KV)**: persistent `VectorID -> BucketID` mapping used for L1 tombstones.
 - **Janitor**: background loop for flush, promotion, split, scatter merge, tombstone
   persistence, and reaper cleanup.
@@ -129,6 +140,15 @@ Storage:
 - S3 backend: `DRIFT_S3_BUCKET`, `DRIFT_S3_REGION`, `DRIFT_S3_ENDPOINT`,
   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
 
+NVMe remote-read cache:
+
+- `DRIFT_NVME_CACHE_DIR` (required to enable local object cache)
+- `DRIFT_NVME_CACHE_MAX_BYTES` (optional global byte budget)
+- `DRIFT_NVME_CACHE_MAX_FILES` (optional global file-count budget)
+- `DRIFT_NVME_CACHE_MAX_FILE_BYTES` (optional per-object max size; larger objects bypass full-file cache)
+- `DRIFT_NVME_FINGERPRINT_VERIFY_INTERVAL_MS` (optional fingerprint re-verify interval)
+- `DRIFT_NVME_CACHE_FORCE_ALL_SCHEMES=1` (test-only override; enables cache even for `fs` backend)
+
 ## How to use
 
 ### Run the server
@@ -178,5 +198,7 @@ scripts/bench_rw.sh -- --total-vectors 50000 --query-count 500
   - Reason for this is that inserts were slow for high throughput writes (this can be changed in the future if the parallel scans in your system becomes a bottle neck).
 - maintenance includes split with defector loopback and scatter merge.
 - Promotion supports Local/Remote/Tiered/Promoting states.
+- Health endpoint reports readiness/version and includes NVMe cache metrics payload.
+- Chaos durability test is hardened with health-gated warmup/restart and epoch-specific recovery checks.
 
 Reference #[System View](./SYSTEM_VIEW.md) for a vector lifecycle

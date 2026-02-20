@@ -7,14 +7,14 @@ This document captures the V3 direction aligned with current implementation and 
 1. Row-group tombstones are not serialized in V3 hot blobs.
 - Rationale: deletes are already applied before persistence (promotion/merge path) and query-time tombstones are tracked separately in memory + persisted tombstone files.
 - Result: V3 hot layout is now `[ids][sq8 codes]`.
-- Backward compatibility: reader still accepts legacy V2 trailing bytes in hot blobs.
+- Reader behavior: strict V3 layout is enforced (no legacy trailer bytes accepted).
 
 2. L0 remains MemTable + parallel scans (no HNSW in hot ingest path).
 - Rationale: high-throughput inserts are prioritized over graph maintenance cost.
 - Next improvement path: SIMD/LUT acceleration in L0 scan, adaptive chunking, and optional lightweight coarse routing for very large L0.
 
 3. Validation is now first-class in file open path.
-- Footer magic/version support: V2 and V3.
+- Footer magic/version support: V3 only.
 - Structural checks: index bounds, row-group count consistency, quantizer bounds, bloom bounds, row-group range layout validation.
 - Header validation: strict magic/version pair validation.
 
@@ -32,13 +32,13 @@ This document captures the V3 direction aligned with current implementation and 
 ## Format Versioning
 
 - V3 magic/version are now the write default.
-- Reader remains compatible with both V2 and V3 files.
-- Existing V2 files are readable without migration.
+- Reader accepts V3 only.
+- Non-V3 files are rejected by strict header/footer validation.
 
 ## Current V3 Foundation Delivered
 
 - V3 default write path in format header/footer.
-- V2+V3 read compatibility.
+- V3-only read compatibility (no legacy V2 fallback).
 - Stronger reader-side structural validation.
 - V3 hot layout cleanup (no tombstone placeholder bytes).
 - Remote read cache with local NVMe full-object files (no RAM payload cache).
@@ -69,12 +69,12 @@ If `DRIFT_NVME_CACHE_DIR` is not set, behavior stays unchanged (no local object-
 ## Migration Plan (incremental)
 
 1. V3 rollout (now)
-- Write V3, read V2/V3.
-- Keep all existing segment files valid.
+- Write/read V3 only.
+- No legacy V2 compatibility path is maintained.
 
 2. Hardening
 - Add corruption tests for each validation check (bad offsets, bad counts, overlapping ranges).
-- Add mixed V2/V3 integration tests in promotion/search/recovery loops.
+- Add strict V3 lifecycle integration tests in promotion/search/recovery loops.
 
 3. Query/runtime upgrades
 - Use bloom as actual scan pre-filter in query path.

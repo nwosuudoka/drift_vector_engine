@@ -1,97 +1,50 @@
-# **Global Master Plan: Drift-Aware Vector Engine (V2 LBR)**
+# Global Master Plan: Drift Vector Engine (V3)
 
-#### **Phase 1: The Unified Storage Format (`drift_storage`)**
+## Recently Completed
 
-**Status:** ✅ **Complete**
+- [x] V3-only storage format enforcement in `drift_storage` (legacy V2 read path removed).
+- [x] Hot row-group layout simplified to `[ids][sq8_codes]` with no serialized tombstone trailer bytes.
+- [x] Reader validation hardening:
+  - [x] Header/footer strict magic+version checks.
+  - [x] Row-group count/offset/range consistency checks.
+  - [x] Quantizer and bloom range bounds checks.
+  - [x] Corruption matrix tests for malformed files.
+- [x] Metric strategy and collection contract:
+  - [x] Metric chosen at collection creation.
+  - [x] Metric mismatch rejected on reopen/use.
+  - [x] Spherical K-Means path added for cosine workflows.
+- [x] NVMe full-object cache for remote reads:
+  - [x] Cache full object file on local disk.
+  - [x] Serve request ranges by local slicing.
+  - [x] Singleflight download guard for concurrent misses.
+  - [x] S3FIFO-inspired eviction with count and byte budgets.
+  - [x] Fingerprint verification/invalidation path.
+  - [x] Runtime metadata recovery after restart.
+- [x] Unified delete/cleanup path through `CleanupApi` and `PersistenceManager::delete_file`.
+- [x] Remote delete invalidates matching NVMe cache entries.
+- [x] Health endpoint now exports NVMe cache metrics payload.
+- [x] Chaos durability test hardening:
+  - [x] Health-gated startup/restart checks.
+  - [x] Epoch-specific recovery assertions.
+  - [x] Bounded retry verification loop.
+  - [x] Stale binary prevention in test spawn flow.
 
-- [x] **Physical Layout:** `DriftHeader`, `RowGroupHeader`, `DriftFooter`.
-- [x] **RowGroupWriter:** Transpose -> Compress (ALP) -> Quantize (SQ8) -> Serialize.
-- [x] **BucketFileWriter:** Supports `Append Mode` (Local) and `Stream Mode` (S3).
-- [x] **BucketFileReader:** Stream-first scan with footer validation.
+## In Progress
 
-#### **Phase 2: The Control Plane (Durability & Metadata)**
+- [ ] Startup guard: manifest fingerprint vs local cache metadata cross-check.
+- [ ] Configurable startup policy on fingerprint mismatches (invalidate-and-continue vs fail-fast).
+- [ ] Remove stale V2 naming from remaining logs/tests/docs.
 
-**Status:** ✅ **Complete**
+## Next Major Step: Payload and Secondary Index Expansion
 
-- [x] **Manifest V2:** Atomic `apply_atomic` updates for Buckets and Centroids.
-- [x] **WAL V2:** Transactional WAL (Begin/Commit/Rollback) with CRC checksums.
-- [x] **Recovery Manager:**
-  - [x] Rebuild Router from Manifest.
-  - [x] Re-register Local Staging files.
-  - [x] Replay WAL for MemTable restoration.
+- [ ] Sidecar payload format for metadata and full text values.
+- [ ] Query planner for hybrid vector + filter execution.
+- [ ] Pluggable index trait for metadata/text/range fields.
+- [ ] First production secondary index implementation (exact match + range baseline).
 
-#### **Phase 3: Core Logic Pivot (Incrementalism)**
+## Future: Distributed Drift Cluster
 
-**Status:** ✅ **Complete**
-
-- [x] **Static Router:** Router is now stable; points don't move until explicit Split/Merge.
-- [x] **BucketManager:** The new "Source of Truth" for where data lives (Local vs Remote vs Tiered).
-- [x] **VectorIndex V2:**
-  - [x] Decoupled Storage (`StorageEngine` trait).
-  - [x] Atomic ID Allocation (`AtomicU32`).
-  - [x] `insert_batch` with internal Rotation.
-
-#### **Phase 4: The Local-Buffered Write Path (LBR)**
-
-**Status:** ✅ **Complete**
-
-- [x] **Local Staging Manager:** Manages `bucket_{id}.drift` files in `data/staging/`.
-- [x] **Append Logic:** `append_batch` detects existing file, reads footer, appends RG, rewrites footer.
-- [x] **Janitor Flush:**
-  - [x] `rotate_and_freeze` MemTable.
-  - [x] Partition data by Router.
-  - [x] Append to Local Staging files.
-  - [x] Update Drift Stats (`vector_sum`).
-
-#### **Phase 5: Maintenance & Self-Healing**
-
-**Status:** ✅ **Complete**
-
-- [x] **Drift Tracking:** Real-time `calculate_drift()` based on `vector_sum`.
-- [x] **Smart Split:**
-  - [x] `calculate_split`: K-Means (K=2) + Defector Loopback.
-  - [x] **Singularity Guard:** Abort if variance is too low.
-  - [x] **Atomic Execution:** Write 2 new buckets -> Swap Manifest -> Update Router.
-- [x] **Promotion (Tiering):**
-  - [x] `promote_to_s3`: Merge Local + Remote -> New S3 Segment.
-  - [x] **Reaper:** Background deletion of obsolete files.
-- [x] **Scatter-Merge (Zombie Healing):**
-  - [x] **Detection:** Identify buckets with `Urgency > 1.5`.
-  - [x] **Calculation:** `calculate_merge` routes orphans to nearest neighbors.
-  - [x] **Execution:** Delta-CoW to Neighbor Staging Files.
-  - [x] **Cleanup:** Atomic Manifest Update + Physical Deletion.
-
-#### Phase 6: Unified Search & Operations
-
-**Status:** ✅ **Complete**
-
-- [x] **Unified Searcher:**
-  - [x] `search_async` scans MemTable (L0).
-  - [x] `BucketManager` scans Local + Remote files (L1).
-  - [x] `Refine`: Loads High-Fidelity data (ALP) for top candidates.
-- [x] **Tombstone Handling V2 (Hardening):**
-  - [x] `mark_delete` updates in-memory bitsets.
-  - [x] **Persistent Deletes:** Verified tombstone propagation during Promotion/Compaction cycles.
-  - [x] **Global Filter:** Optimize global tombstone filter for large-scale deletes.
-
-#### Phase 7: Cleanup & Hardening
-
-**Status:** ✅ **Complete**
-
-- [x] **Reaper Verification:** Integration test to ensure physical file deletion (Local + S3) after compaction/promotion.
-- [x] **Chaos Testing:** Validated durability via `chaos_test` (kill -9 loops).
-- [x] **Split Safety:** Implemented parent-child consistency checks to prevent data loss during splits.
-- [x] **Simulation Harness:** Updated `billion_scale`, `churn_sim`, and `drift_sim` for V2.
-
----
-
-# **Global Master Plan: Drift Cluster (Phase 8)**
-
-#### Phase 8: Distributed Consensus (The "Stateless Worker" Model)
-
-**Status:** 🚧 **Planning**
-
-- [ ] **Consensus Layer:** Integrate `openraft` or Etcd to manage the "Shard Map" (Which node owns which bucket?).
-- [ ] **Remote WAL:** Abstract `WalManager` to support Kafka/Redpanda or S3-Append, allowing any node to replay another's log.
-- [ ] **Stateless Worker:** Refactor `DriftService` to mount any collection by pulling state from S3, rather than relying on local disk affinity.
-- [ ] **Gateway Node:** Create a gRPC proxy that hashes vector IDs and routes requests to the correct Worker node.
+- [ ] Consensus layer for shard ownership (OpenRaft or etcd-backed).
+- [ ] Remote WAL abstraction (Kafka/Redpanda/S3-append compatible).
+- [ ] Stateless workers loading collections from object storage.
+- [ ] Gateway/router node for request routing by collection and vector id.

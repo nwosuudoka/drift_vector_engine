@@ -3,10 +3,11 @@ use crate::drift_proto::{
     MetricType, SearchRequest, SearchResponse, SearchResult, drift_server::Drift,
 };
 use crate::drift_proto::{
-    HealthRequest, HealthResponse, InsertResponse, TrainRequest, TrainResponse,
+    HealthRequest, HealthResponse, InsertResponse, NvmeCacheMetrics, TrainRequest, TrainResponse,
 };
 use crate::manager::CollectionManager;
 use drift_core::math::Metric;
+use drift_storage::disk_manager::DiskManager;
 use std::io;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -40,9 +41,27 @@ impl Drift for DriftService {
         &self,
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
+        let (cache_enabled, cache_snapshot) = match DiskManager::global_nvme_cache_metrics() {
+            Some(snapshot) => (true, snapshot),
+            None => (false, Default::default()),
+        };
+
         Ok(Response::new(HealthResponse {
             ready: true,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            nvme_cache: Some(NvmeCacheMetrics {
+                enabled: cache_enabled,
+                hits: cache_snapshot.hits,
+                misses: cache_snapshot.misses,
+                remote_fetches: cache_snapshot.remote_fetches,
+                singleflight_waits: cache_snapshot.singleflight_waits,
+                evictions: cache_snapshot.evictions,
+                bytes_cached: cache_snapshot.bytes_cached,
+                bytes_evicted: cache_snapshot.bytes_evicted,
+                invalidations: cache_snapshot.invalidations,
+                fingerprint_mismatches: cache_snapshot.fingerprint_mismatches,
+                recovered_entries: cache_snapshot.recovered_entries,
+            }),
         }))
     }
 

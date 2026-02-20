@@ -1157,6 +1157,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_budget_eviction_by_total_bytes() {
+        DiskManager::reset_cache_runtime_registry_for_tests();
+
+        let remote_root = tempdir().unwrap();
+        let cache_root = tempdir().unwrap();
+        let op = fs_op(remote_root.path());
+
+        op.write("obj1.bin", vec![1u8; 64]).await.unwrap();
+        op.write("obj2.bin", vec![2u8; 64]).await.unwrap();
+
+        let m1 = DiskManager::new_with_cache_for_test(
+            op.clone(),
+            "obj1.bin".to_string(),
+            cache_root.path().to_path_buf(),
+            config(Some(100), None, None, 0),
+        );
+        let m2 = DiskManager::new_with_cache_for_test(
+            op.clone(),
+            "obj2.bin".to_string(),
+            cache_root.path().to_path_buf(),
+            config(Some(100), None, None, 0),
+        );
+
+        let _ = m1.read_at(0, 8).await.unwrap();
+        let _ = m2.read_at(0, 8).await.unwrap();
+
+        let rt = m2.cache.as_ref().unwrap().runtime.clone();
+        let state = rt.state.lock().unwrap();
+
+        assert_eq!(state.entries.len(), 1);
+        assert!(state.total_bytes <= 100);
+        let ns = &m2.cache.as_ref().unwrap().namespace;
+        let key2 = DiskManager::object_cache_key(ns, "obj2.bin");
+        assert!(state.entries.contains_key(&key2));
+    }
+
+    #[tokio::test]
     async fn test_fingerprint_mismatch_invalidates_and_refreshes() {
         DiskManager::reset_cache_runtime_registry_for_tests();
 

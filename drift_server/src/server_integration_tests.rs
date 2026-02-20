@@ -73,6 +73,10 @@ mod tests {
             !health.version.trim().is_empty(),
             "health endpoint should return a non-empty version"
         );
+        assert!(
+            health.nvme_cache.is_some(),
+            "health endpoint should always return nvme cache metrics payload"
+        );
     }
 
     #[tokio::test]

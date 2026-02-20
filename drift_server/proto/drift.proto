@@ -26,9 +26,24 @@ service Drift {
 
 message HealthRequest {}
 
+message NvmeCacheMetrics {
+  bool enabled = 1;
+  uint64 hits = 2;
+  uint64 misses = 3;
+  uint64 remote_fetches = 4;
+  uint64 singleflight_waits = 5;
+  uint64 evictions = 6;
+  uint64 bytes_cached = 7;
+  uint64 bytes_evicted = 8;
+  uint64 invalidations = 9;
+  uint64 fingerprint_mismatches = 10;
+  uint64 recovered_entries = 11;
+}
+
 message HealthResponse {
   bool ready = 1;
   string version = 2;
+  NvmeCacheMetrics nvme_cache = 3;
 }
 
 enum MetricType {

@@ -136,7 +136,7 @@ impl CollectionManager {
             return Ok(coll.clone());
         }
 
-        info!("Manager: Initializing collection '{}' (v2)", name);
+        info!("Manager: Initializing collection '{}' (v3)", name);
 
         // --- PATH RESOLUTION ---
         let wal_dir = self.config.wal_dir.join(name);

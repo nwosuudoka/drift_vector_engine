@@ -3,10 +3,8 @@
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 // --- CONSTANTS ---
-pub const MAGIC_V2: u64 = 0x32565F5446495244;
 pub const MAGIC_V3: u64 = 0x33565F5446495244;
 pub const MAGIC_CURRENT: u64 = MAGIC_V3;
-pub const VERSION_2: u16 = 2;
 pub const VERSION_3: u16 = 3;
 pub const VERSION_CURRENT: u16 = VERSION_3;
 pub const HEADER_SIZE: usize = 128;
@@ -39,43 +37,9 @@ impl DriftHeader {
         quantizer_offset: u64,
         quantizer_length: u32,
     ) -> Self {
-        Self::new_with_layout(
-            total_vectors,
-            run_id,
-            quantizer_offset,
-            quantizer_length,
-            MAGIC_CURRENT,
-            VERSION_CURRENT,
-        )
-    }
-
-    pub fn new_v2(
-        total_vectors: u64,
-        run_id: [u8; 16],
-        quantizer_offset: u64,
-        quantizer_length: u32,
-    ) -> Self {
-        Self::new_with_layout(
-            total_vectors,
-            run_id,
-            quantizer_offset,
-            quantizer_length,
-            MAGIC_V2,
-            VERSION_2,
-        )
-    }
-
-    fn new_with_layout(
-        total_vectors: u64,
-        run_id: [u8; 16],
-        quantizer_offset: u64,
-        quantizer_length: u32,
-        magic: u64,
-        version: u16,
-    ) -> Self {
         Self {
-            magic,
-            version,
+            magic: MAGIC_CURRENT,
+            version: VERSION_CURRENT,
             flags: 0,
             _reserved: 0, // Must initialize explicit padding
             total_vectors,
@@ -101,20 +65,15 @@ impl DriftHeader {
     }
 
     pub fn is_supported_magic(magic: u64) -> bool {
-        matches!(magic, MAGIC_V2 | MAGIC_V3)
+        magic == MAGIC_CURRENT
     }
 
     pub fn is_supported_version(version: u16) -> bool {
-        matches!(version, VERSION_2 | VERSION_3)
+        version == VERSION_CURRENT
     }
 
     pub fn validate(&self) -> bool {
-        Self::is_supported_magic(self.magic)
-            && Self::is_supported_version(self.version)
-            && matches!(
-                (self.magic, self.version),
-                (MAGIC_V2, VERSION_2) | (MAGIC_V3, VERSION_3)
-            )
+        Self::is_supported_magic(self.magic) && Self::is_supported_version(self.version)
     }
 }
 
@@ -188,6 +147,6 @@ impl DriftFooter {
     }
 
     pub fn is_supported_magic(magic: u64) -> bool {
-        matches!(magic, MAGIC_V2 | MAGIC_V3)
+        magic == MAGIC_CURRENT
     }
 }

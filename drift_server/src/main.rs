@@ -22,7 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Banner
     println!("========================================");
-    println!("   🚀 DRIFT VECTOR ENGINE v2.0.0 (LBR)");
+    println!("   🚀 DRIFT VECTOR ENGINE v3.0.0 (LBR)");
     println!("========================================");
     println!("Config Loaded:");
     println!("  • Port:            {}", config.port);
@@ -32,8 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  • Max Bucket Cap:  {}", config.max_bucket_capacity);
     println!("----------------------------------------");
 
-    // 2. Initialize Manager (V2)
-    // This spins up the RecoveryManager, JanitorV2, and Reaper automatically.
+    // 2. Initialize Manager
+    // This spins up the RecoveryManager, Janitor, and Reaper automatically.
     let manager = Arc::new(CollectionManager::new(config.clone()));
 
     // 3. Start gRPC Service

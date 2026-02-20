@@ -57,4 +57,22 @@ mod tests {
         let decoded = DriftFooter::read_from_bytes(bytes).unwrap();
         assert_eq!(decoded, footer);
     }
+
+    #[test]
+    fn test_strict_v3_validation_rejects_legacy_layout_ids() {
+        let run_id = [9u8; 16];
+        let mut header = DriftHeader::new(1, run_id, 128, 64);
+        assert!(header.validate(), "fresh header should validate");
+
+        // Legacy V2-style identifiers should now be rejected.
+        header.magic = 0x32565F5446495244;
+        assert!(!header.validate(), "legacy magic should be rejected");
+
+        header.magic = MAGIC_CURRENT;
+        header.version = 2;
+        assert!(!header.validate(), "legacy version should be rejected");
+
+        assert!(!DriftFooter::is_supported_magic(0x32565F5446495244));
+        assert!(DriftFooter::is_supported_magic(MAGIC_CURRENT));
+    }
 }

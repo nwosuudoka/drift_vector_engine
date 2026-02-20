@@ -302,13 +302,20 @@ impl BucketFileReader {
         let mut total_vectors = 0usize;
         let mut total_hot_bytes = 0usize;
         for rg in &self.row_groups {
-            // Read Hot Index Blob
             // Hot Layout (V3): [IDs: u64 * N] [Codes: u8 * N * D]
-            // Legacy V2 may contain trailing bytes after codes; those are ignored.
-            // ID Size: N * 8
-            // Code Size: N * D
             let count = rg.vector_count as usize;
-            let _hot_size = (count * 8) + (count * dim);
+            let expected_hot_size = (count * 8) + (count * dim);
+            if rg.hot_length as usize != expected_hot_size {
+                tracing::warn!(
+                    "⚠️ Scan RG: hot_length mismatch for strict V3 layout path={} expected={} actual={} cold_offset={} cold_len={}",
+                    self.manager.path,
+                    expected_hot_size,
+                    rg.hot_length,
+                    rg.cold_offset,
+                    rg.cold_length
+                );
+                continue;
+            }
 
             let hot_blob = self
                 .manager
@@ -379,11 +386,12 @@ impl BucketFileReader {
         let codes = &hot_blob[ids_size..ids_size + code_bytes_len];
         let trailer_len = hot_blob.len() - (ids_size + code_bytes_len);
         if trailer_len > 0 {
-            tracing::debug!(
-                "Scan RG: detected {} trailer bytes (compatible with legacy V2 hot layout) path={}",
+            tracing::warn!(
+                "⚠️ Scan RG: detected {} unexpected trailer bytes in strict V3 layout path={}",
                 trailer_len,
                 self.manager.path
             );
+            return;
         }
 
         let codes_ptr = codes.as_ptr();
