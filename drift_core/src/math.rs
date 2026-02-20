@@ -5,6 +5,82 @@ pub fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
 }
 
+/// SIMD-friendly (unrolled) squared L2 distance.
+/// Uses plain arithmetic in a tight loop so LLVM can auto-vectorize.
+#[inline(always)]
+pub fn l2_sq_simd_friendly(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let mut sum = 0.0f32;
+    let mut i = 0usize;
+
+    while i + 4 <= len {
+        let d0 = a[i] - b[i];
+        let d1 = a[i + 1] - b[i + 1];
+        let d2 = a[i + 2] - b[i + 2];
+        let d3 = a[i + 3] - b[i + 3];
+        sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+        i += 4;
+    }
+
+    while i < len {
+        let d = a[i] - b[i];
+        sum += d * d;
+        i += 1;
+    }
+
+    sum
+}
+
+/// SIMD-friendly (unrolled) cosine similarity.
+/// Returns 0.0 if either vector has zero norm.
+#[inline(always)]
+pub fn cosine_similarity_simd_friendly(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len().min(b.len());
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    let mut i = 0usize;
+
+    while i + 4 <= len {
+        let a0 = a[i];
+        let a1 = a[i + 1];
+        let a2 = a[i + 2];
+        let a3 = a[i + 3];
+
+        let b0 = b[i];
+        let b1 = b[i + 1];
+        let b2 = b[i + 2];
+        let b3 = b[i + 3];
+
+        dot += a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3;
+        norm_a += a0 * a0 + a1 * a1 + a2 * a2 + a3 * a3;
+        norm_b += b0 * b0 + b1 * b1 + b2 * b2 + b3 * b3;
+        i += 4;
+    }
+
+    while i < len {
+        let av = a[i];
+        let bv = b[i];
+        dot += av * bv;
+        norm_a += av * av;
+        norm_b += bv * bv;
+        i += 1;
+    }
+
+    if norm_a <= f32::EPSILON || norm_b <= f32::EPSILON {
+        0.0
+    } else {
+        dot / (norm_a.sqrt() * norm_b.sqrt())
+    }
+}
+
+/// Cosine distance in [0, 2] for non-degenerate vectors, lower is better.
+#[inline(always)]
+pub fn cosine_distance_simd_friendly(a: &[f32], b: &[f32]) -> f32 {
+    let sim = cosine_similarity_simd_friendly(a, b).clamp(-1.0, 1.0);
+    1.0 - sim
+}
+
 pub fn mean_columns(data: &[f32], dim: usize) -> Vec<f32> {
     debug_assert!(dim > 0);
     debug_assert!(data.len().is_multiple_of(dim));
@@ -61,7 +137,7 @@ pub fn calculate_drift(data: &[f32], target_centroid: &[f32], dim: usize) -> f32
     l2_sq(&current_mean, target_centroid).sqrt()
 }
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum Metric {
     L2,
     COSINE,

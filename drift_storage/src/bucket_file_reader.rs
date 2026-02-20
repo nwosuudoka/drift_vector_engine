@@ -6,6 +6,8 @@ use crate::format::{
     DriftFooter, DriftHeader, FOOTER_SIZE, HEADER_SIZE, ROW_GROUP_HEADER_SIZE, RowGroupHeader,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
+use drift_core::math::Metric;
+use drift_core::metric_strategy::strategy_for;
 use drift_core::quantizer::Quantizer;
 use drift_traits::{IoContext, SearchCandidate, TombstoneView};
 use fastbloom::BloomFilter;
@@ -21,9 +23,13 @@ use zerocopy::FromBytes;
 struct CandidateWrapper(SearchCandidate);
 
 struct ScanParams<'a> {
-    lut: &'a [f32],
+    metric: Metric,
+    lut: Option<&'a [f32]>,
     dim: usize,
     k: usize,
+    query: &'a [f32],
+    query_norm: f32,
+    quantizer: &'a Quantizer,
     tombstones: &'a dyn TombstoneView,
 }
 
@@ -242,15 +248,25 @@ impl BucketFileReader {
         &mut self,
         query: &[f32],
         k: usize,
+        metric: Metric,
         tombstones: &dyn TombstoneView,
     ) -> io::Result<Vec<SearchCandidate>> {
         if self.quantizer.is_none() {
             self.load_quantizer().await?;
         }
         let q = self.quantizer.as_ref().unwrap();
-        let lut = q.precompute_lut(query);
+        let lut = if metric == Metric::L2 {
+            Some(q.precompute_lut(query))
+        } else {
+            None
+        };
         let dim = query.len();
         let q_dim = q.min.len();
+        let query_norm = if metric == Metric::COSINE {
+            query.iter().map(|v| v * v).sum::<f32>().sqrt()
+        } else {
+            0.0
+        };
 
         if q_dim != dim {
             tracing::warn!(
@@ -272,9 +288,13 @@ impl BucketFileReader {
         let mut heap: BinaryHeap<CandidateWrapper> = BinaryHeap::with_capacity(k + 1);
 
         let params = ScanParams {
-            lut: &lut,
+            metric,
+            lut: lut.as_deref(),
             dim,
             k,
+            query,
+            query_norm,
+            quantizer: q,
             tombstones,
         };
 
@@ -366,7 +386,6 @@ impl BucketFileReader {
             );
         }
 
-        let lut_ptr = params.lut.as_ptr();
         let codes_ptr = codes.as_ptr();
 
         let mut considered = 0usize;
@@ -385,7 +404,23 @@ impl BucketFileReader {
                 break;
             }
 
-            let dist = unsafe { compute_distance_lut(codes_ptr.add(offset), lut_ptr, params.dim) };
+            let dist = match params.metric {
+                Metric::L2 => match params.lut {
+                    Some(lut) => unsafe {
+                        compute_distance_lut(codes_ptr.add(offset), lut.as_ptr(), params.dim)
+                    },
+                    None => continue,
+                },
+                Metric::COSINE => {
+                    let code = &codes[offset..offset + params.dim];
+                    cosine_distance_quantized(
+                        params.query,
+                        params.query_norm,
+                        code,
+                        params.quantizer,
+                    )
+                }
+            };
             considered += 1;
             if dist < min_dist {
                 min_dist = dist;
@@ -435,10 +470,12 @@ impl BucketFileReader {
         candidates: Vec<SearchCandidate>,
         query: &[f32],
         dim: usize,
+        metric: Metric,
     ) -> io::Result<Vec<(u64, f32)>> {
         let candidate_count = candidates.len();
         let mut results = Vec::with_capacity(candidate_count);
         let mut groups: BTreeMap<u64, (u32, u32, Vec<SearchCandidate>)> = BTreeMap::new();
+        let strategy = strategy_for(metric);
 
         for c in candidates {
             groups
@@ -488,7 +525,7 @@ impl BucketFileReader {
                 let start = idx * dim;
                 if start + dim <= vectors.len() {
                     let vec = &vectors[start..start + dim];
-                    let exact_dist = drift_core::math::l2_sq(query, vec);
+                    let exact_dist = strategy.score(query, vec);
                     results.push((c.id, exact_dist));
                 }
             }
@@ -646,4 +683,50 @@ pub unsafe fn compute_distance_lut(
         i += 1;
     }
     sum
+}
+
+#[inline(always)]
+fn cosine_distance_quantized(
+    query: &[f32],
+    query_norm: f32,
+    code: &[u8],
+    quantizer: &Quantizer,
+) -> f32 {
+    if query_norm <= f32::EPSILON {
+        return 1.0;
+    }
+
+    let dim = query
+        .len()
+        .min(code.len())
+        .min(quantizer.min.len())
+        .min(quantizer.scale.len());
+    let mut dot = 0.0f32;
+    let mut norm_v = 0.0f32;
+    let mut i = 0usize;
+
+    while i + 4 <= dim {
+        let r0 = quantizer.min[i] + (code[i] as f32 * quantizer.scale[i]);
+        let r1 = quantizer.min[i + 1] + (code[i + 1] as f32 * quantizer.scale[i + 1]);
+        let r2 = quantizer.min[i + 2] + (code[i + 2] as f32 * quantizer.scale[i + 2]);
+        let r3 = quantizer.min[i + 3] + (code[i + 3] as f32 * quantizer.scale[i + 3]);
+
+        dot += query[i] * r0 + query[i + 1] * r1 + query[i + 2] * r2 + query[i + 3] * r3;
+        norm_v += r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3;
+        i += 4;
+    }
+
+    while i < dim {
+        let reconstructed = quantizer.min[i] + (code[i] as f32 * quantizer.scale[i]);
+        dot += query[i] * reconstructed;
+        norm_v += reconstructed * reconstructed;
+        i += 1;
+    }
+
+    if norm_v <= f32::EPSILON {
+        return 1.0;
+    }
+
+    let sim = (dot / (query_norm * norm_v.sqrt())).clamp(-1.0, 1.0);
+    1.0 - sim
 }

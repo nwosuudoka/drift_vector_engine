@@ -1,4 +1,5 @@
 use clap::Parser;
+use drift_core::math::Metric;
 use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{InsertBatchRequest, SearchRequest, Vector};
@@ -105,6 +106,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager: manager.clone(),
     };
     let collection = "bench_rw";
+    manager
+        .get_or_create(
+            collection,
+            Some(args.dim),
+            Some(args.max_bucket_capacity),
+            Some(Metric::L2),
+        )
+        .await?;
 
     println!("🏁 Bench RW (v2)");
     println!(
@@ -171,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Flush wait (best-effort)
     let coll = manager
-        .get_or_create(collection, Some(args.dim), None)
+        .get_or_create(collection, Some(args.dim), None, Some(Metric::L2))
         .await
         .unwrap();
     let (mem_len, frozen) = wait_for_flush(

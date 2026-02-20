@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use drift_server::drift_proto::{
-    InsertRequest, SearchRequest, TrainRequest, Vector, drift_client::DriftClient,
+    CreateCollectionRequest, InsertRequest, MetricType, SearchRequest, TrainRequest, Vector,
+    drift_client::DriftClient,
 };
 use serde_json::from_str;
 use tracing::info;
@@ -19,6 +20,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Create a collection with explicit metric and dimension
+    Create {
+        /// Collection name
+        #[arg(short, long)]
+        collection: String,
+
+        /// Vector dimension
+        #[arg(long)]
+        dim: u32,
+
+        /// Metric: L2 or COSINE
+        #[arg(long, default_value = "L2")]
+        metric: String,
+    },
+
     /// Train a new collection with a batch of vectors
     Train {
         /// Collection name
@@ -85,6 +101,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to connect to {}: {}", cli.url, e))?;
 
     match &cli.command {
+        Commands::Create {
+            collection,
+            dim,
+            metric,
+        } => {
+            let metric = match metric.to_ascii_uppercase().as_str() {
+                "L2" => MetricType::L2 as i32,
+                "COSINE" => MetricType::Cosine as i32,
+                other => {
+                    return Err(
+                        format!("Unsupported metric '{}'. Use 'L2' or 'COSINE'", other).into(),
+                    );
+                }
+            };
+
+            let req = tonic::Request::new(CreateCollectionRequest {
+                collection_name: collection.clone(),
+                dim: *dim,
+                metric,
+                max_bucket_capacity: 0,
+            });
+            let response = client.create_collection(req).await?;
+            info!("Create Response: {:?}", response.into_inner());
+        }
         Commands::Train { collection, data } => {
             let raw_data: Vec<Vec<f32>> = from_str(data)
                 .map_err(|e| format!("Invalid JSON data. Expected [[f32; N], ...]: {}", e))?;

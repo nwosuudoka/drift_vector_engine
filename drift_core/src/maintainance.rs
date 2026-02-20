@@ -1,6 +1,6 @@
-use crate::kmeans::KMeansTrainer;
+use crate::kmeans::KMeansAlgorithm;
 use crate::manifest::pb::Centroid;
-use crate::math::{calculate_mean, l2_sq};
+use crate::math::{Metric, calculate_mean};
 
 pub struct SplitResult {
     pub left: Partition,
@@ -43,6 +43,16 @@ impl MaintenanceCalculator {
         dim: usize,
         neighbor_centroids: &[Vec<f32>], // Global Context
     ) -> Option<SplitResult> {
+        Self::split_with_loopback_metric(ids, flat_vectors, dim, neighbor_centroids, Metric::L2)
+    }
+
+    pub fn split_with_loopback_metric(
+        ids: &[u64],
+        flat_vectors: &[f32],
+        dim: usize,
+        neighbor_centroids: &[Vec<f32>], // Global Context
+        metric: Metric,
+    ) -> Option<SplitResult> {
         let count = ids.len();
         if count < 10 {
             return None;
@@ -52,8 +62,9 @@ impl MaintenanceCalculator {
         }
 
         // 1. Train K-Means (K=2)
-        let trainer = KMeansTrainer::new(2, dim, 10);
+        let trainer = KMeansAlgorithm::for_metric(metric, 2, dim, 10);
         let result = trainer.train(flat_vectors);
+        let strategy = crate::metric_strategy::strategy_for(metric);
 
         if result.centroids.len() < 2 {
             return None;
@@ -76,14 +87,14 @@ impl MaintenanceCalculator {
 
             // 1. Calculate Local Preference
             // Which child is closer?
-            let d1 = l2_sq(vec, c1);
-            let d2 = l2_sq(vec, c2);
+            let d1 = strategy.score(vec, c1);
+            let d2 = strategy.score(vec, c2);
             let (d_local, is_left) = if d1 < d2 { (d1, true) } else { (d2, false) };
 
             // 2. Calculate Neighbor Preference (Global Scan)
             let mut d_neighbor_min = f32::MAX;
             for n in neighbor_centroids {
-                let d = l2_sq(vec, n);
+                let d = strategy.score(vec, n);
                 if d < d_neighbor_min {
                     d_neighbor_min = d;
                 }

@@ -1,5 +1,6 @@
 use clap::Parser;
 use drift_core::index::VectorIndex;
+use drift_core::math::Metric;
 use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{SearchRequest, Vector};
@@ -360,7 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get collection reference early for monitoring
     // Pass explicit dim hint to avoid panics
     let coll_ref = manager
-        .get_or_create(collection, Some(args.dim), None)
+        .get_or_create(collection, Some(args.dim), None, Some(Metric::L2))
         .await
         .unwrap();
 

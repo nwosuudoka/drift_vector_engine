@@ -3,6 +3,7 @@ mod tests {
     use crate::manifest::ServerManifestManager;
     use crate::recovery::RecoveryManager;
     use drift_core::lock_manager::BucketCoordinator;
+    use drift_core::math::Metric;
     use drift_core::wal::WalWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
     use opendal::Operator;
@@ -13,7 +14,13 @@ mod tests {
     fn create_noop_manager() -> BucketManager {
         let builder = Fs::default().root("/tmp");
         let op = Operator::new(builder).unwrap().finish();
-        BucketManager::new(op.clone(), op, 1, Arc::new(BucketCoordinator::new()))
+        BucketManager::new(
+            op.clone(),
+            op,
+            1,
+            Arc::new(BucketCoordinator::new()),
+            Metric::L2,
+        )
     }
 
     #[tokio::test]
@@ -87,6 +94,30 @@ mod tests {
         let (path, class) = bucket_mgr.get_location(7).unwrap();
         assert_eq!(path, "custom/provider/object-7.drift");
         assert_eq!(class, StorageClass::Remote);
+    }
+
+    #[tokio::test]
+    async fn test_recover_uses_manifest_metric_for_router() {
+        let dir = tempdir().unwrap();
+        let manifest = Arc::new(
+            ServerManifestManager::new_with_metric(dir.path(), 2, Metric::COSINE).unwrap(),
+        );
+        manifest
+            .apply_atomic(|m| {
+                // This setup routes differently under L2 vs COSINE for query [1, 0]:
+                // L2 => bucket 2; COSINE => bucket 1.
+                m.add_bucket(1, "run_1".into(), Some(vec![2.0, 0.0]));
+                m.add_bucket(2, "run_2".into(), Some(vec![0.9, 0.9]));
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new(dir.path(), manifest);
+        let bucket_mgr = create_noop_manager();
+        let wal_dir = dir.path().join("wal");
+
+        let (router, _) = mgr.recover(&bucket_mgr, 2, &wal_dir).await.unwrap();
+        let selected = router.read().route(&[1.0, 0.0]);
+        assert_eq!(selected, 1, "Recovery should honor COSINE metric");
     }
 
     #[tokio::test]

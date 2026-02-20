@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::math::Metric;
     use crate::memtable::{MemTable, MemTableOptions};
     use drift_traits::TombstoneView;
     use std::collections::HashSet;
@@ -127,7 +128,7 @@ mod tests {
         table.insert(3, &[2.0, 2.0]);
 
         let view = TestView::default();
-        let results = table.search(&[0.0, 0.0], 3, &view);
+        let results = table.search(&[0.0, 0.0], 3, Metric::L2, &view);
         let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
 
         assert_eq!(ids, vec![1, 2, 3]);
@@ -142,7 +143,7 @@ mod tests {
         table.insert(2, &[1.0, 1.0]);
 
         let view = TestView::default();
-        let results = table.search(&[0.5, 0.5], 10, &view);
+        let results = table.search(&[0.5, 0.5], 10, Metric::L2, &view);
 
         assert_eq!(results.len(), 2);
     }
@@ -153,7 +154,7 @@ mod tests {
         let table = make_table(10, 2);
         table.insert(1, &[0.0, 0.0]);
         let view = TestView::default();
-        let _ = table.search(&[0.0, 0.0], 0, &view);
+        let _ = table.search(&[0.0, 0.0], 0, Metric::L2, &view);
     }
 
     #[test]
@@ -164,7 +165,7 @@ mod tests {
         table.insert(30, &[2.0, 2.0]);
 
         let view = TestView::with_ids(&[20]);
-        let results = table.search(&[0.0, 0.0], 3, &view);
+        let results = table.search(&[0.0, 0.0], 3, Metric::L2, &view);
         let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
 
         assert_eq!(ids, vec![10, 30]);
@@ -191,7 +192,7 @@ mod tests {
         barrier.wait();
         let view = TestView::default();
         let start = Instant::now();
-        let results = searcher.search(&[0.0, 0.0], 5, &view);
+        let results = searcher.search(&[0.0, 0.0], 5, Metric::L2, &view);
         let elapsed = start.elapsed();
 
         assert_eq!(results.len(), 5);

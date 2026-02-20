@@ -59,6 +59,7 @@ mod tests {
             op.clone(),
             4,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         let manifest = Arc::new(ServerManifestManager::new(&data_dir, dim as u32).unwrap());

@@ -4,6 +4,12 @@ package drift;
 
 // The Drift Vector Database Service
 service Drift {
+  // Lightweight server readiness endpoint.
+  rpc Health (HealthRequest) returns (HealthResponse);
+
+  // Creates (or validates) a collection with explicit metric and dimension.
+  rpc CreateCollection (CreateCollectionRequest) returns (CreateCollectionResponse);
+
   // Inserts a vector into an index.
   rpc Insert (InsertRequest) returns (InsertResponse);
 
@@ -17,6 +23,30 @@ service Drift {
 }
 
 // --- Messages ---
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready = 1;
+  string version = 2;
+}
+
+enum MetricType {
+  METRIC_TYPE_UNSPECIFIED = 0;
+  METRIC_TYPE_L2 = 1;
+  METRIC_TYPE_COSINE = 2;
+}
+
+message CreateCollectionRequest {
+  string collection_name = 1;
+  uint32 dim = 2;
+  MetricType metric = 3;
+  uint32 max_bucket_capacity = 4; // 0 => server default
+}
+
+message CreateCollectionResponse {
+  bool success = 1;
+}
 
 message Vector {
   uint64 id = 1;

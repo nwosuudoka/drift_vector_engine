@@ -40,6 +40,7 @@ mod tests {
             op.clone(),
             8,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         manifest
@@ -178,6 +179,7 @@ mod stress_tests {
             op.clone(),
             8,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         manifest
@@ -346,6 +348,7 @@ mod janitor_split_test {
             op.clone(),
             4,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         // 2. Setup Index & Router
@@ -491,6 +494,7 @@ mod edge_case_tests {
             op.clone(),
             4,
             Arc::new(BucketCoordinator::new()),
+            Metric::L2,
         ));
 
         let wal_dir = dir.join("wal");
@@ -784,6 +788,7 @@ mod janitor_scatter_merge_test {
             op.clone(),
             4,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         let wal_dir = dir.join("wal");
@@ -1086,6 +1091,7 @@ mod janitor_promotion_test {
             op.clone(), // Local (reused for test simplicity, usually staging)
             4,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         let wal = Arc::new(Mutex::new(WalManager::new(dir.path().join("wal")).unwrap()));

@@ -1,4 +1,7 @@
-use drift_server::drift_proto::{InsertRequest, SearchRequest, Vector, drift_client::DriftClient};
+use drift_server::drift_proto::{
+    CreateCollectionRequest, InsertRequest, MetricType, SearchRequest, Vector,
+    drift_client::DriftClient,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -7,6 +10,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dim = 128;
 
     println!("--- TEST 3: MULTI-COLLECTION ISOLATION ---");
+
+    // 0. Create collections explicitly (metric + dim)
+    client
+        .create_collection(tonic::Request::new(CreateCollectionRequest {
+            collection_name: "users".to_string(),
+            dim: dim as u32,
+            metric: MetricType::L2 as i32,
+            max_bucket_capacity: 0,
+        }))
+        .await?;
+
+    client
+        .create_collection(tonic::Request::new(CreateCollectionRequest {
+            collection_name: "products".to_string(),
+            dim: dim as u32,
+            metric: MetricType::L2 as i32,
+            max_bucket_capacity: 0,
+        }))
+        .await?;
 
     // 1. Insert into 'users'
     println!("Inserting ID 1 into 'users'...");

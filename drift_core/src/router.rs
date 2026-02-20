@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 
-use crate::{manifest::pb::Centroid, math::Metric};
+use crate::{manifest::pb::Centroid, math::Metric, metric_strategy::strategy_for};
 
 /// The Router determines which Bucket a vector belongs to.
 ///
@@ -87,6 +87,7 @@ impl Router {
         tau: f32,
     ) -> Vec<u32> {
         let count = self.bucket_ids.len();
+        let strategy = strategy_for(self.metric);
         let mut scores = Vec::with_capacity(count);
         let mut total_score = 0.0;
 
@@ -95,10 +96,14 @@ impl Router {
             let start = i * self.dim;
             let centroid = &self.flat_centroids[start..start + self.dim];
 
-            // Distance (Euclidean)
-            // Note: Paper uses L2 (Euclidean), not L2 Squared, for the exponential decay.
-            let dist_sq = l2_sq(query, centroid);
-            let dist = dist_sq.sqrt();
+            // Canonical metric score (lower is better).
+            let dist_score = strategy.score(query, centroid);
+            let dist = if self.metric == Metric::L2 {
+                // Preserve original routing calibration (Euclidean, not squared).
+                dist_score.sqrt()
+            } else {
+                dist_score
+            };
 
             // Term A: Geometric Probability P(b|q) ~ exp(-lambda * dist)
             let p_geom = (-lambda * dist).exp();
@@ -109,7 +114,7 @@ impl Router {
 
             let score = p_geom * reliability;
 
-            scores.push((i, score, dist_sq)); // Keep dist_sq for guardrail
+            scores.push((i, score, dist_score)); // Keep metric score for guardrail
             total_score += score;
         }
 
@@ -167,11 +172,9 @@ impl Router {
             panic!("Router route: Vector dim mismatch");
         }
 
+        let strategy = strategy_for(self.metric);
         let mut best_id = 0;
-        let mut min_dist = f32::MAX;
-        let mut max_sim = f32::MIN;
-
-        let is_l2 = self.metric == Metric::L2;
+        let mut min_score = f32::MAX;
         let count = self.bucket_ids.len();
 
         for i in 0..count {
@@ -180,23 +183,18 @@ impl Router {
             let centroid_vec = &self.flat_centroids[start..end];
             let id = self.bucket_ids[i];
 
-            if is_l2 {
-                let dist = l2_sq(vector, centroid_vec);
-                if dist < min_dist {
-                    min_dist = dist;
-                    best_id = id;
-                }
-            } else {
-                // Cosine Similarity
-                let sim = cosine_sim(vector, centroid_vec);
-                if sim > max_sim {
-                    max_sim = sim;
-                    best_id = id;
-                }
+            let score = strategy.score(vector, centroid_vec);
+            if score < min_score {
+                min_score = score;
+                best_id = id;
             }
         }
 
         best_id
+    }
+
+    pub fn metric(&self) -> Metric {
+        self.metric
     }
 
     pub fn dim(&self) -> usize {
@@ -272,34 +270,4 @@ impl Router {
             }
         }
     }
-}
-
-// --- Inline Math Helpers (Candidates for SIMD Optimization later) ---
-#[inline]
-fn l2_sq(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let diff = x - y;
-            diff * diff
-        })
-        .sum()
-}
-
-#[inline(always)]
-fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-    dot / (norm_a.sqrt() * norm_b.sqrt())
 }

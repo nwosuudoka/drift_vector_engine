@@ -5,6 +5,7 @@ mod tests {
     use crate::persistence::PersistenceManager;
     use crate::recovery::RecoveryManager;
     use drift_core::lock_manager::BucketCoordinator;
+    use drift_core::math::Metric;
     use drift_core::partitioner::PartitionGroup;
     use drift_core::quantizer::Quantizer;
     use drift_core::wal::WalWriter;
@@ -83,7 +84,8 @@ mod tests {
         let coordinator = Arc::new(BucketCoordinator::new());
 
         // C. Recover
-        let bucket_manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator.clone());
+        let bucket_manager =
+            BucketManager::new(op.clone(), op.clone(), 4, coordinator.clone(), Metric::L2);
         let recovery = RecoveryManager::new(&data_dir, manifest.clone());
 
         let (router_lock, _replay) = recovery
@@ -157,7 +159,8 @@ mod tests {
 
         // 4. Recover
         let coordinator = Arc::new(BucketCoordinator::new());
-        let bucket_manager = BucketManager::new(local_op, remote_op, 1, coordinator.clone());
+        let bucket_manager =
+            BucketManager::new(local_op, remote_op, 1, coordinator.clone(), Metric::L2);
 
         let recovery = RecoveryManager::new(&data_dir, manifest.clone());
         let wal_dir = data_dir.join("wal");
@@ -197,7 +200,8 @@ mod tests {
         let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
         let op = create_fs_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let bucket_manager = BucketManager::new(op.clone(), op.clone(), 1, coordinator.clone());
+        let bucket_manager =
+            BucketManager::new(op.clone(), op.clone(), 1, coordinator.clone(), Metric::L2);
 
         // 1. Write to WAL
         {
@@ -292,6 +296,7 @@ mod janitor_reaper_integration_tests {
             op.clone(),
             4,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         let wal_mgr = Arc::new(Mutex::new(WalManager::new(dir.path().join("wal")).unwrap()));

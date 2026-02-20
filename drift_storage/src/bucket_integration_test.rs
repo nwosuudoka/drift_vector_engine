@@ -2,6 +2,7 @@
 mod tests {
     use crate::bucket_file_reader::BucketFileReader;
     use crate::bucket_file_writer::BucketFileWriter;
+    use drift_core::math::Metric;
     use drift_core::quantizer::Quantizer;
     use drift_traits::TombstoneView;
     use opendal::{Operator, services};
@@ -191,7 +192,10 @@ mod tests {
         let query = vec![100.0f32; dim];
         let tombstones = NoTombstones;
 
-        let results = reader.scan(&query, 10, &tombstones).await.unwrap();
+        let results = reader
+            .scan(&query, 10, Metric::L2, &tombstones)
+            .await
+            .unwrap();
 
         // 4. Verify
         assert!(!results.is_empty(), "Results should not be empty");
@@ -210,5 +214,49 @@ mod tests {
         if results.len() > 1 {
             assert!(results[1].approx_dist > 100.0, "Distractors should be far");
         }
+    }
+
+    #[tokio::test]
+    async fn test_search_accuracy_cosine_metric() {
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path().to_owned();
+        let dim = 4;
+
+        let ids = vec![1u64, 2, 3];
+        let vectors = vec![
+            vec![2.0, 0.0, 0.0, 0.0], // Perfect cosine match with query [1,0,0,0]
+            vec![0.8, 0.6, 0.0, 0.0], // Similar but worse
+            vec![0.0, 2.0, 0.0, 0.0], // Orthogonal
+        ];
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let q = Quantizer::train(&flat, dim);
+
+        {
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            let mut writer = BucketFileWriter::new_streaming(file, [1u8; 16], q, dim).unwrap();
+            writer.write_batch(&ids, &flat).unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let root = path.parent().unwrap().to_str().unwrap();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        let op = create_fs_operator(root);
+
+        let mut reader = BucketFileReader::open(op, filename).await.unwrap();
+        let query = vec![1.0f32, 0.0, 0.0, 0.0];
+        let tombstones = NoTombstones;
+
+        let candidates = reader
+            .scan(&query, 3, Metric::COSINE, &tombstones)
+            .await
+            .unwrap();
+        let refined = reader
+            .refine(candidates, &query, dim, Metric::COSINE)
+            .await
+            .unwrap();
+
+        assert_eq!(refined[0].0, 1, "COSINE should rank vector 1 first");
+        assert!(refined[0].1 <= refined[1].1);
+        assert!(refined[1].1 <= refined[2].1);
     }
 }

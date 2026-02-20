@@ -7,6 +7,8 @@ use crate::recovery::RecoveryManager;
 use crate::storage_factory::StorageFactory;
 use drift_core::index::VectorIndex;
 use drift_core::lock_manager::BucketCoordinator;
+use drift_core::manifest::ManifestWrapper;
+use drift_core::math::Metric;
 use drift_core::wal::WalManager;
 use drift_kv::bitstore::BitStore;
 use drift_storage::bucket_manager::BucketManager;
@@ -42,6 +44,21 @@ impl CollectionManager {
         }
     }
 
+    fn load_manifest_meta(coll_root: &Path) -> std::io::Result<Option<(usize, Metric)>> {
+        let path = coll_root.join("manifest.pb");
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let bytes = std::fs::read(&path)?;
+        let wrapper = ManifestWrapper::from_bytes(&bytes)
+            .map_err(|e| std::io::Error::other(format!("Protobuf decode error: {}", e)))?;
+        let metric = wrapper
+            .metric()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some((wrapper.get_dim() as usize, metric)))
+    }
+
     fn create_local_operator(path: &Path) -> std::io::Result<Operator> {
         let builder = Fs::default().root(path.to_str().unwrap());
         Ok(Operator::new(builder)
@@ -54,6 +71,7 @@ impl CollectionManager {
         name: &str,
         dim_hint: Option<usize>,
         max_bucket_capacity: Option<usize>,
+        create_metric: Option<Metric>,
     ) -> std::io::Result<Arc<Collection>> {
         // 1. Fast Path
         {
@@ -72,6 +90,18 @@ impl CollectionManager {
                         ),
                     ));
                 }
+                if let Some(requested_metric) = create_metric
+                    && coll.index.metric() != requested_metric
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Metric mismatch: Existing={}, Requested={}",
+                            coll.index.metric(),
+                            requested_metric
+                        ),
+                    ));
+                }
                 return Ok(coll.clone());
             }
         }
@@ -79,6 +109,30 @@ impl CollectionManager {
         // 2. Slow Path
         let mut map = self.collections.write().await;
         if let Some(coll) = map.get(name) {
+            if let Some(d) = dim_hint
+                && coll.index.get_dim() != d
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Dimension mismatch: Existing={}, Requested={}",
+                        coll.index.get_dim(),
+                        d
+                    ),
+                ));
+            }
+            if let Some(requested_metric) = create_metric
+                && coll.index.metric() != requested_metric
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Metric mismatch: Existing={}, Requested={}",
+                        coll.index.metric(),
+                        requested_metric
+                    ),
+                ));
+            }
             return Ok(coll.clone());
         }
 
@@ -90,6 +144,52 @@ impl CollectionManager {
         let staging_dir = coll_root.join("staging");
         let kv_dir = coll_root.join("kv");
 
+        let existing_meta = Self::load_manifest_meta(&coll_root)?;
+        let metric = match (create_metric, existing_meta.map(|(_, m)| m)) {
+            (Some(requested), Some(existing)) if requested != existing => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Metric mismatch: Existing={}, Requested={}",
+                        existing, requested
+                    ),
+                ));
+            }
+            (Some(requested), _) => requested,
+            (None, Some(existing)) => existing,
+            (None, None) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "Collection '{}' does not exist. Create it first with CreateCollection",
+                        name
+                    ),
+                ));
+            }
+        };
+
+        let dim = if let Some((existing_dim, _)) = existing_meta {
+            if let Some(requested_dim) = dim_hint
+                && requested_dim != existing_dim
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Dimension mismatch: Existing={}, Requested={}",
+                        existing_dim, requested_dim
+                    ),
+                ));
+            }
+            existing_dim
+        } else {
+            dim_hint.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Dimension is required when creating a new collection",
+                )
+            })?
+        };
+
         // Note: fs::create_dir_all is blocking. In a high-throughput scenario,
         // we might wrap this in spawn_blocking, but for initialization it's usually acceptable.
         std::fs::create_dir_all(&wal_dir)?;
@@ -97,10 +197,10 @@ impl CollectionManager {
         std::fs::create_dir_all(&staging_dir)?;
         std::fs::create_dir_all(&kv_dir)?;
 
-        let dim = dim_hint.unwrap_or(self.config.default_dim);
-
         // --- COMPONENTS ---
-        let manifest = Arc::new(ServerManifestManager::new(&coll_root, dim as u32)?);
+        let manifest = Arc::new(ServerManifestManager::new_with_metric(
+            &coll_root, dim as u32, metric,
+        )?);
         let staging = Arc::new(LocalStagingManager::new(&staging_dir)?);
 
         let remote_op = StorageFactory::build(&self.config.storage, name)?;
@@ -113,6 +213,7 @@ impl CollectionManager {
             remote_op,
             16,
             coordinator.clone(),
+            metric,
         ));
 
         // --- RECOVERY (Step 1: Router) ---

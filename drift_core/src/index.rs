@@ -1,4 +1,5 @@
-use crate::kmeans::KMeansTrainer;
+use crate::kmeans::KMeansAlgorithm;
+use crate::math::Metric;
 use crate::memtable::{MemTable, MemTableOptions};
 use crate::partitioner::{IncrementalPartitioner, PartitionGroup, PartitionResult};
 use crate::router::Router;
@@ -280,6 +281,14 @@ impl VectorIndex {
         lambda: f32,
         tau: f32,
     ) -> io::Result<Vec<(u64, f32)>> {
+        let (bucket_ids, metric) = {
+            let router = self.router.read();
+            (
+                router.select_buckets(query, target, lambda, tau),
+                router.metric(),
+            )
+        };
+
         let (ram_tables, l0_view) = {
             let active = self.active.read();
             let frozen = self.frozen.read();
@@ -303,7 +312,7 @@ impl VectorIndex {
                 let mut results = Vec::new();
                 for table in ram_tables {
                     // Pass view down
-                    results.extend(table.search(&query, k, &view_struct));
+                    results.extend(table.search(&query, k, metric, &view_struct));
                 }
                 results
             }
@@ -312,10 +321,6 @@ impl VectorIndex {
         .map_err(io::Error::other)?;
 
         // B. Disk Search
-        let bucket_ids = self
-            .router
-            .read()
-            .select_buckets(query, target, lambda, tau);
         let oversample_factor = k * 3;
 
         let disk_results = self
@@ -347,6 +352,10 @@ impl VectorIndex {
             final_results.truncate(k);
         }
         Ok(final_results)
+    }
+
+    pub fn metric(&self) -> Metric {
+        self.router.read().metric()
     }
 
     pub fn flush_frozen(&self) -> Option<(PartitionResult, Vec<u64>)> {
@@ -439,17 +448,22 @@ impl VectorIndex {
 
         // 2. Snapshot Global Context (for Defector Check)
         // We capture the state of the world NOW.
-        let (global_centroids, global_ids) = self.router.read().get_snapshot();
+        let (global_centroids, global_ids, metric) = {
+            let router = self.router.read();
+            let (centroids, ids) = router.get_snapshot();
+            (centroids, ids, router.metric())
+        };
         let dim = self.dim;
 
         // 3. Offload Compute to Blocking Thread
         let proposal_result = task::spawn_blocking(move || {
+            let strategy = crate::metric_strategy::strategy_for(metric);
             // A. Train K-Means (K=2)
-            let trainer = KMeansTrainer::new(2, dim, 15);
+            let trainer = KMeansAlgorithm::for_metric(metric, 2, dim, 15);
             let result = trainer.train(&flat_vecs);
 
             // B. Singularity Check (Variance)
-            let dist_sq = crate::math::l2_sq(&result.centroids[0], &result.centroids[1]);
+            let dist_sq = strategy.score(&result.centroids[0], &result.centroids[1]);
             if dist_sq < SINGULARITY_THRESHOLD {
                 return Err(MaintenanceStatus::SkippedSingularity { variance: dist_sq });
             }
@@ -474,9 +488,9 @@ impl VectorIndex {
 
                 // 1. Distance to assigned Local Child
                 let dist_local = if assignment == 0 {
-                    crate::math::l2_sq(vec, c0)
+                    strategy.score(vec, c0)
                 } else {
-                    crate::math::l2_sq(vec, c1)
+                    strategy.score(vec, c1)
                 };
 
                 // 2. Global Defector Check
@@ -493,7 +507,7 @@ impl VectorIndex {
                     let g_start = g_idx * dim;
                     let g_vec = &global_centroids[g_start..g_start + dim];
 
-                    let d = crate::math::l2_sq(vec, g_vec);
+                    let d = strategy.score(vec, g_vec);
                     if d < best_global_dist {
                         best_global_dist = d;
                     }
@@ -601,11 +615,16 @@ impl VectorIndex {
 
         // 3. Snapshot Router (Global Context)
         // We need this to find neighbors.
-        let (centroids, bucket_ids) = self.router.read().get_snapshot();
+        let (centroids, bucket_ids, metric) = {
+            let router = self.router.read();
+            let (centroids, ids) = router.get_snapshot();
+            (centroids, ids, router.metric())
+        };
         let dim = self.dim;
 
         // 4. Offload Calculation (CPU Heavy)
         let proposal_result = task::spawn_blocking(move || {
+            let strategy = crate::metric_strategy::strategy_for(metric);
             let mut moves: HashMap<u32, PartitionGroup> = HashMap::new();
 
             for (i, &id) in ids.iter().enumerate() {
@@ -627,8 +646,7 @@ impl VectorIndex {
                     let c_start = c_idx * dim;
                     let centroid = &centroids[c_start..c_start + dim];
 
-                    // Optimization: Use L2 Squared (no sqrt needed for comparison)
-                    let dist = crate::math::l2_sq(vec, centroid);
+                    let dist = strategy.score(vec, centroid);
 
                     if dist < best_dist {
                         best_dist = dist;

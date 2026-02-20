@@ -2,6 +2,7 @@
 mod tests {
     use crate::config::{Config, FileConfig, StorageCommand};
     use crate::manager::CollectionManager;
+    use drift_core::math::Metric;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -33,7 +34,7 @@ mod tests {
 
         // 1. Initialize Collection
         let collection = manager
-            .get_or_create(collection_name, None, None)
+            .get_or_create(collection_name, Some(DIM), None, Some(Metric::L2))
             .await
             .expect("Failed to create collection");
 
@@ -74,14 +75,20 @@ mod tests {
 
         // 1. Create and Modify
         {
-            let coll = manager.get_or_create(name, None, None).await.unwrap();
+            let coll = manager
+                .get_or_create(name, Some(DIM), None, Some(Metric::L2))
+                .await
+                .unwrap();
             // Insert something to trigger WAL/KV creation
             coll.index.insert(1, &[0.0; DIM]).unwrap();
         } // Drop collection ref
 
         // 2. Re-Initialize (Simulate Restart)
         let manager2 = Arc::new(CollectionManager::new(config));
-        let _coll2 = manager2.get_or_create(name, None, None).await.unwrap();
+        let _coll2 = manager2
+            .get_or_create(name, Some(DIM), None, None)
+            .await
+            .unwrap();
 
         // 3. Verify Persistence
         // The KV/WAL should still exist on disk.
@@ -100,13 +107,13 @@ mod tests {
 
         // 1. Create with Dim 128
         let _ = manager
-            .get_or_create("dim_test", Some(128), Some(2000))
+            .get_or_create("dim_test", Some(128), Some(2000), Some(Metric::L2))
             .await
             .unwrap();
 
         // 2. Try to get with Dim 64 -> Should Fail
         let result = manager
-            .get_or_create("dim_test", Some(64), Some(2000))
+            .get_or_create("dim_test", Some(64), Some(2000), None)
             .await;
 
         assert!(result.is_err());
@@ -116,12 +123,40 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("Dimension mismatch")),
         }
     }
+
+    #[tokio::test]
+    async fn test_metric_enforced_across_reopen() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let manager = Arc::new(CollectionManager::new(config.clone()));
+        let coll = manager
+            .get_or_create("metric_test", Some(2), Some(100), Some(Metric::COSINE))
+            .await
+            .unwrap();
+        assert_eq!(coll.index.metric(), Metric::COSINE);
+
+        drop(manager);
+
+        let manager_l2 = Arc::new(CollectionManager::new(config));
+        let result = manager_l2
+            .get_or_create("metric_test", Some(2), Some(100), Some(Metric::L2))
+            .await;
+        assert!(result.is_err(), "Expected metric mismatch error");
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Metric mismatch")
+        );
+    }
 }
 
 #[cfg(test)]
 mod load_and_unload_collection_test {
     use crate::config::{Config, FileConfig, StorageCommand};
     use crate::manager::CollectionManager;
+    use drift_core::math::Metric;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -147,7 +182,10 @@ mod load_and_unload_collection_test {
         let manager = Arc::new(CollectionManager::new(config));
 
         let name = "test_struct";
-        manager.get_or_create(name, None, None).await.unwrap();
+        manager
+            .get_or_create(name, Some(128), None, Some(Metric::L2))
+            .await
+            .unwrap();
 
         // Verify Structure:
         // root/data/test_struct/
@@ -177,7 +215,10 @@ mod load_and_unload_collection_test {
         // 1. Initial Run
         {
             let manager = Arc::new(CollectionManager::new(config.clone()));
-            let coll = manager.get_or_create(name, None, None).await.unwrap();
+            let coll = manager
+                .get_or_create(name, Some(128), None, Some(Metric::L2))
+                .await
+                .unwrap();
 
             // Insert Data (Writes to WAL)
             coll.index.insert(1, &[0.0; 128]).unwrap();
@@ -192,7 +233,10 @@ mod load_and_unload_collection_test {
 
         // 2. Re-open (Simulate Restart)
         let manager2 = Arc::new(CollectionManager::new(config));
-        let coll2 = manager2.get_or_create(name, None, None).await.unwrap();
+        let coll2 = manager2
+            .get_or_create(name, Some(128), None, None)
+            .await
+            .unwrap();
 
         // 3. Verify data via search (WAL replay should have restored ID 1)
         let res = coll2
@@ -211,6 +255,7 @@ mod bucket_fetch_test {
     // use crate::bucket_file_writer::BucketFileWriter;
     // use crate::bucket_manager::{BucketManager, StorageClass};
     use drift_core::lock_manager::BucketCoordinator;
+    use drift_core::math::Metric;
     use drift_core::quantizer::Quantizer;
     use drift_storage::{
         bucket_file_writer::BucketFileWriter,
@@ -252,7 +297,7 @@ mod bucket_fetch_test {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         let dim = 2;
         let bucket_id = 100;
@@ -315,7 +360,7 @@ mod bucket_fetch_test {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
         let dim = 2;
         let bucket_id = 200;
 
@@ -356,7 +401,7 @@ mod bucket_fetch_test {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         // Register bucket pointing to non-existent file
         manager.register_bucket(999, "ghost.drift".to_string(), StorageClass::Local);

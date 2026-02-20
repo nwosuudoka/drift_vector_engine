@@ -1,4 +1,5 @@
 use clap::Parser;
+use drift_core::math::Metric;
 use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{InsertBatchRequest, SearchRequest, Vector};
@@ -60,6 +61,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager: manager.clone(),
     };
     let collection = "scale_test";
+    let coll = manager
+        .get_or_create(
+            collection,
+            Some(DIM),
+            Some(optimal_capacity),
+            Some(Metric::L2),
+        )
+        .await?;
 
     println!("🚀 Starting Test: {} Vectors (Dim: {})", args.count, DIM);
 
@@ -98,10 +107,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut inserted = 0;
     let mut next_id = 1000;
 
-    let coll = manager
-        .get_or_create(collection, Some(DIM), None)
-        .await
-        .unwrap();
     let mut batch_vecs = vec![vec![0.0; DIM]; BATCH_SIZE];
 
     while inserted < args.count {

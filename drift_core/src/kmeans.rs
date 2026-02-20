@@ -1,3 +1,4 @@
+use crate::math::{Metric, cosine_similarity_simd_friendly, l2_sq_simd_friendly};
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -205,14 +206,226 @@ impl KMeansTrainer {
         let mut min_dist = f32::MAX;
         let mut best_idx = 0;
         for (i, c) in centroids.iter().enumerate() {
-            // Using l2_sq from crate::math would be better, but implementing inline for self-containment in this refactor
-            let dist_sq: f32 = vec.iter().zip(c.iter()).map(|(a, b)| (a - b).powi(2)).sum();
+            let dist_sq = l2_sq_simd_friendly(vec, c);
             if dist_sq < min_dist {
                 min_dist = dist_sq;
                 best_idx = i;
             }
         }
         (best_idx, min_dist)
+    }
+}
+
+pub struct SphericalKMeansTrainer {
+    k: usize,
+    max_iter: usize,
+    tolerance: f32,
+    dim: usize,
+}
+
+impl SphericalKMeansTrainer {
+    pub fn new(k: usize, dim: usize, max_iter: usize) -> Self {
+        Self {
+            k,
+            dim,
+            max_iter,
+            tolerance: 1e-4,
+        }
+    }
+
+    pub fn train(&self, data: &[f32]) -> KMeansResult {
+        assert!(!data.is_empty(), "Cannot train on empty data");
+        assert_eq!(data.len() % self.dim, 0, "Dimension mismatch");
+        let num_samples = data.len() / self.dim;
+
+        let normalized_data = normalize_flat_rows(data, self.dim);
+        let mut centroids = self.init_spherical_kmeans_plus_plus(&normalized_data, num_samples);
+
+        for _iter in 0..self.max_iter {
+            let batch_results: Vec<(Vec<f32>, usize)> = (0..num_samples)
+                .into_par_iter()
+                .fold(
+                    || vec![(vec![0.0; self.dim], 0usize); self.k],
+                    |mut acc, idx| {
+                        let start = idx * self.dim;
+                        let vec = &normalized_data[start..start + self.dim];
+                        let (best_idx, _) = Self::nearest_centroid_cosine(vec, &centroids);
+                        let (sum_vec, count) = &mut acc[best_idx];
+                        for d in 0..self.dim {
+                            sum_vec[d] += vec[d];
+                        }
+                        *count += 1;
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![(vec![0.0; self.dim], 0usize); self.k],
+                    |mut a, b| {
+                        for i in 0..self.k {
+                            a[i].1 += b[i].1;
+                            for d in 0..self.dim {
+                                a[i].0[d] += b[i].0[d];
+                            }
+                        }
+                        a
+                    },
+                );
+
+            let mut max_shift = 0.0f32;
+            for (cluster_idx, (sum_vec, count)) in batch_results.into_iter().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+
+                let mut new_centroid = sum_vec;
+                normalize_in_place(&mut new_centroid);
+                let shift = l2_sq_simd_friendly(&centroids[cluster_idx], &new_centroid);
+                if shift > max_shift {
+                    max_shift = shift;
+                }
+                centroids[cluster_idx] = new_centroid;
+            }
+
+            if max_shift < self.tolerance {
+                break;
+            }
+        }
+
+        let final_assignments = (0..num_samples)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * self.dim;
+                let vec = &normalized_data[start..start + self.dim];
+                Self::nearest_centroid_cosine(vec, &centroids).0
+            })
+            .collect();
+
+        KMeansResult {
+            centroids,
+            assignments: final_assignments,
+        }
+    }
+
+    fn init_spherical_kmeans_plus_plus(&self, data: &[f32], num_samples: usize) -> Vec<Vec<f32>> {
+        let mut rng = rand::rng();
+        let mut centroids = Vec::with_capacity(self.k);
+        if num_samples == 0 {
+            return centroids;
+        }
+
+        let first_idx = rng.random_range(0..num_samples);
+        let start = first_idx * self.dim;
+        centroids.push(data[start..start + self.dim].to_vec());
+
+        for _ in 1..self.k {
+            let mut dists = vec![0.0f32; num_samples];
+            let mut total_dist = 0.0f32;
+
+            for sample_idx in 0..num_samples {
+                let start = sample_idx * self.dim;
+                let vec = &data[start..start + self.dim];
+                let (_, nearest_dist) = Self::nearest_centroid_cosine(vec, &centroids);
+                // Weighted by squared angular distance.
+                let weighted = nearest_dist * nearest_dist;
+                dists[sample_idx] = weighted;
+                total_dist += weighted;
+            }
+
+            if total_dist <= f32::EPSILON {
+                let idx = rng.random_range(0..num_samples);
+                let start = idx * self.dim;
+                centroids.push(data[start..start + self.dim].to_vec());
+                continue;
+            }
+
+            let target = rng.random_range(0.0..total_dist);
+            let mut cumulative = 0.0f32;
+            let mut picked = 0usize;
+            for (i, d) in dists.iter().enumerate() {
+                cumulative += *d;
+                if cumulative >= target {
+                    picked = i;
+                    break;
+                }
+            }
+
+            let start = picked * self.dim;
+            centroids.push(data[start..start + self.dim].to_vec());
+        }
+
+        centroids
+    }
+
+    #[inline(always)]
+    fn nearest_centroid_cosine(vec: &[f32], centroids: &[Vec<f32>]) -> (usize, f32) {
+        let mut best_idx = 0usize;
+        let mut best_sim = f32::MIN;
+        for (idx, centroid) in centroids.iter().enumerate() {
+            let sim = cosine_similarity_simd_friendly(vec, centroid);
+            if sim > best_sim {
+                best_sim = sim;
+                best_idx = idx;
+            }
+        }
+        let distance = (1.0 - best_sim).max(0.0);
+        (best_idx, distance)
+    }
+}
+
+pub trait KMeansClusteringStrategy: Send + Sync {
+    fn train(&self, data: &[f32]) -> KMeansResult;
+}
+
+impl KMeansClusteringStrategy for KMeansTrainer {
+    fn train(&self, data: &[f32]) -> KMeansResult {
+        KMeansTrainer::train(self, data)
+    }
+}
+
+impl KMeansClusteringStrategy for SphericalKMeansTrainer {
+    fn train(&self, data: &[f32]) -> KMeansResult {
+        SphericalKMeansTrainer::train(self, data)
+    }
+}
+
+pub enum KMeansAlgorithm {
+    L2(KMeansTrainer),
+    Spherical(SphericalKMeansTrainer),
+}
+
+impl KMeansAlgorithm {
+    pub fn for_metric(metric: Metric, k: usize, dim: usize, max_iter: usize) -> Self {
+        match metric {
+            Metric::L2 => Self::L2(KMeansTrainer::new(k, dim, max_iter)),
+            Metric::COSINE => Self::Spherical(SphericalKMeansTrainer::new(k, dim, max_iter)),
+        }
+    }
+
+    pub fn train(&self, data: &[f32]) -> KMeansResult {
+        match self {
+            Self::L2(t) => t.train(data),
+            Self::Spherical(t) => t.train(data),
+        }
+    }
+}
+
+fn normalize_flat_rows(data: &[f32], dim: usize) -> Vec<f32> {
+    let mut out = data.to_vec();
+    for row in out.chunks_exact_mut(dim) {
+        normalize_in_place(row);
+    }
+    out
+}
+
+fn normalize_in_place(vec: &mut [f32]) {
+    let norm_sq: f32 = vec.iter().map(|v| v * v).sum();
+    if norm_sq <= f32::EPSILON {
+        vec.fill(0.0);
+        return;
+    }
+    let inv = 1.0 / norm_sq.sqrt();
+    for v in vec.iter_mut() {
+        *v *= inv;
     }
 }
 
@@ -445,5 +658,47 @@ mod tests {
                 f
             );
         }
+    }
+
+    #[test]
+    fn test_spherical_kmeans_separates_by_direction() {
+        let dim = 2;
+        // Two directional clusters with different magnitudes.
+        let data = vec![
+            vec![10.0, 0.0],
+            vec![9.0, 0.0],
+            vec![8.0, 0.0],
+            vec![0.0, 10.0],
+            vec![0.0, 9.0],
+            vec![0.0, 8.0],
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<f32>>();
+
+        let trainer = SphericalKMeansTrainer::new(2, dim, 20);
+        let result = trainer.train(&data);
+
+        assert_eq!(result.centroids.len(), 2);
+        assert_eq!(result.assignments.len(), 6);
+
+        // Expect one centroid near X-axis and one near Y-axis.
+        let mut c = result.centroids.clone();
+        c.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+        // c[0] ~ [0,1], c[1] ~ [1,0]
+        assert!(c[0][1] > 0.8, "Expected Y-axis centroid, got {:?}", c[0]);
+        assert!(c[1][0] > 0.8, "Expected X-axis centroid, got {:?}", c[1]);
+    }
+
+    #[test]
+    fn test_kmeans_algorithm_strategy_for_metric() {
+        let dim = 2;
+        let data = vec![1.0, 0.0, 0.9, 0.1, 0.0, 1.0, 0.1, 0.9];
+
+        let l2 = KMeansAlgorithm::for_metric(Metric::L2, 2, dim, 10).train(&data);
+        let cosine = KMeansAlgorithm::for_metric(Metric::COSINE, 2, dim, 10).train(&data);
+
+        assert_eq!(l2.centroids.len(), 2);
+        assert_eq!(cosine.centroids.len(), 2);
     }
 }

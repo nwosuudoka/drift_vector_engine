@@ -18,6 +18,15 @@ pub struct ServerManifestManager {
 impl ServerManifestManager {
     /// Opens or creates a manifest in the given directory.
     pub fn new(base_path: impl AsRef<Path>, dim: u32) -> io::Result<Self> {
+        Self::new_with_metric(base_path, dim, Metric::L2)
+    }
+
+    /// Opens or creates a manifest and enforces the expected metric.
+    pub fn new_with_metric(
+        base_path: impl AsRef<Path>,
+        dim: u32,
+        expected_metric: Metric,
+    ) -> io::Result<Self> {
         let base = base_path.as_ref().to_path_buf();
         fs::create_dir_all(&base).context("Failed to create manifest dir")?;
         let path = base.join("manifest.pb");
@@ -29,12 +38,12 @@ impl ServerManifestManager {
             let metric = wrapper
                 .metric()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if metric != Metric::L2 {
+            if metric != expected_metric {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "Unsupported manifest metric '{}': server execution currently supports only L2",
-                        wrapper.inner.metric
+                        "Metric mismatch: manifest={}, requested={}",
+                        wrapper.inner.metric, expected_metric
                     ),
                 ));
             }
@@ -44,7 +53,7 @@ impl ServerManifestManager {
                 state: RwLock::new(wrapper),
             })
         } else {
-            let wrapper = ManifestWrapper::new(dim, Metric::L2);
+            let wrapper = ManifestWrapper::new(dim, expected_metric);
             let manager = Self {
                 base_path: base,
                 manifest_path: path,
@@ -74,15 +83,9 @@ impl ServerManifestManager {
 
         // 1. Apply Changes In-Memory
         op(&mut guard);
-        let metric = guard
+        guard
             .metric()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        if metric != Metric::L2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unsupported manifest metric: server execution currently supports only L2",
-            ));
-        }
 
         // 2. Bump Version & Persist
         guard.bump_version();
