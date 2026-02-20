@@ -7,11 +7,20 @@ mod tests {
     use std::collections::HashSet;
     use std::io::ErrorKind;
     use std::io::Write;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use tokio::time::sleep;
+
+    const LOG_TAIL_LINES: usize = 60;
+
+    struct SpawnedServer {
+        child: Child,
+        stdout_log: PathBuf,
+        stderr_log: PathBuf,
+    }
 
     fn get_server_bin() -> PathBuf {
         let mut path = std::env::current_exe().expect("Failed to get current exe path");
@@ -69,10 +78,53 @@ mod tests {
         port
     }
 
-    async fn spawn_server(port: u16, data_dir: &std::path::Path) -> Child {
+    fn read_log_tail(path: &Path, line_count: usize) -> String {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => return format!("<unavailable: {}>", e),
+        };
+
+        let mut lines: Vec<&str> = content.lines().rev().take(line_count).collect();
+        lines.reverse();
+        if lines.is_empty() {
+            "<empty>".to_string()
+        } else {
+            lines.join("\n")
+        }
+    }
+
+    fn panic_with_server_logs(message: &str, stdout_log: &Path, stderr_log: &Path) -> ! {
+        let stdout_tail = read_log_tail(stdout_log, LOG_TAIL_LINES);
+        let stderr_tail = read_log_tail(stderr_log, LOG_TAIL_LINES);
+        panic!(
+            "{message}\n\
+             📄 stdout log: {}\n\
+             📄 stderr log: {}\n\
+             --- stdout tail ---\n{}\n\
+             --- stderr tail ---\n{}",
+            stdout_log.display(),
+            stderr_log.display(),
+            stdout_tail,
+            stderr_tail
+        );
+    }
+
+    async fn spawn_server(
+        port: u16,
+        data_dir: &std::path::Path,
+        epoch: u32,
+        phase: &str,
+    ) -> SpawnedServer {
         let bin_path = get_server_bin();
         print!("   🚀 Spawning server (Port {})... ", port);
         std::io::stdout().flush().unwrap();
+
+        let log_dir = data_dir.join("chaos_logs");
+        std::fs::create_dir_all(&log_dir).expect("failed to create chaos log dir");
+        let stdout_log = log_dir.join(format!("epoch_{epoch}_{phase}_stdout.log"));
+        let stderr_log = log_dir.join(format!("epoch_{epoch}_{phase}_stderr.log"));
+        let stdout_file = std::fs::File::create(&stdout_log).expect("failed to create stdout log");
+        let stderr_file = std::fs::File::create(&stderr_log).expect("failed to create stderr log");
 
         let mut child = Command::new(&bin_path)
             .arg("--port")
@@ -84,9 +136,8 @@ mod tests {
             .arg("file")
             .arg("--path")
             .arg(data_dir.join("storage"))
-            // Keep test output clean; rely on explicit panic messages on failure.
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file))
             .env("RUST_LOG", "error")
             .spawn()
             .expect("Failed to spawn drift_server");
@@ -97,20 +148,32 @@ mod tests {
         for _ in 0..50 {
             if let Ok(Some(status)) = child.try_wait() {
                 // If we get here, the child exited before accepting connections.
-                panic!(
-                    "❌ Server died immediately (Exit Code: {:?})",
-                    status.code()
+                panic_with_server_logs(
+                    &format!(
+                        "❌ Server died immediately (Exit Code: {:?})",
+                        status.code()
+                    ),
+                    &stdout_log,
+                    &stderr_log,
                 );
             }
 
             if DriftClient::connect(addr.clone()).await.is_ok() {
                 println!("Connected.");
-                return child;
+                return SpawnedServer {
+                    child,
+                    stdout_log,
+                    stderr_log,
+                };
             }
             sleep(Duration::from_millis(100)).await;
         }
         let _ = child.kill();
-        panic!("❌ Server timed out connecting to {}", addr);
+        panic_with_server_logs(
+            &format!("❌ Server timed out connecting to {}", addr),
+            &stdout_log,
+            &stderr_log,
+        );
     }
 
     #[tokio::test]
@@ -131,7 +194,7 @@ mod tests {
             println!("\n⚡ EPOCH {} STARTING...", epoch);
 
             // 1. Start
-            let mut process = spawn_server(port, dir.path()).await;
+            let mut process = spawn_server(port, dir.path(), epoch, "primary").await;
 
             // Warmup: wait for gRPC and health readiness.
             print!("   ⏳ Warming up with health check...");
@@ -142,13 +205,21 @@ mod tests {
 
             let mut client: DriftClient<tonic::transport::Channel> = loop {
                 // Check if process died
-                if let Ok(Some(status)) = process.try_wait() {
-                    panic!("❌ Server process died during warmup! Exit: {:?}", status);
+                if let Ok(Some(status)) = process.child.try_wait() {
+                    panic_with_server_logs(
+                        &format!("❌ Server process died during warmup! Exit: {:?}", status),
+                        &process.stdout_log,
+                        &process.stderr_log,
+                    );
                 }
 
                 if warmup_start.elapsed() > Duration::from_secs(30) {
-                    let _ = process.kill();
-                    panic!("\n❌ Warmup timed out! Last Client Error: {}", last_err);
+                    let _ = process.child.kill();
+                    panic_with_server_logs(
+                        &format!("\n❌ Warmup timed out! Last Client Error: {}", last_err),
+                        &process.stdout_log,
+                        &process.stderr_log,
+                    );
                 }
 
                 match DriftClient::connect(addr.clone()).await {
@@ -162,9 +233,15 @@ mod tests {
                                 break connected_client;
                             }
                             Err(e) if e.code() == tonic::Code::Unimplemented => {
-                                // Backward compatibility for stale local binaries.
-                                println!(" Health endpoint unavailable; continuing.");
-                                break connected_client;
+                                let _ = process.child.kill();
+                                panic_with_server_logs(
+                                    "❌ Health RPC is unimplemented. This usually means a stale \
+                                     drift_server binary is running with older proto/server code. \
+                                     Rebuild and restart with `cargo build -p drift_server --bin \
+                                     drift_server`.",
+                                    &process.stdout_log,
+                                    &process.stderr_log,
+                                );
                             }
                             Err(e) => {
                                 last_err = format!("Health failed: {e}");
@@ -185,11 +262,22 @@ mod tests {
                 metric: MetricType::L2 as i32,
                 max_bucket_capacity: 0,
             });
-            if let Err(e) = client.create_collection(create_req).await
-                && e.code() != tonic::Code::Unimplemented
-            {
-                let _ = process.kill();
-                panic!("❌ create_collection failed during warmup: {}", e);
+            if let Err(e) = client.create_collection(create_req).await {
+                let _ = process.child.kill();
+                if e.code() == tonic::Code::Unimplemented {
+                    panic_with_server_logs(
+                        "❌ CreateCollection RPC is unimplemented. This usually means a stale \
+                         drift_server binary is running with older proto/server code. Rebuild and \
+                         restart with `cargo build -p drift_server --bin drift_server`.",
+                        &process.stdout_log,
+                        &process.stderr_log,
+                    );
+                }
+                panic_with_server_logs(
+                    &format!("❌ create_collection failed during warmup: {}", e),
+                    &process.stdout_log,
+                    &process.stderr_log,
+                );
             }
 
             // Verify insert path is healthy after collection creation.
@@ -205,8 +293,12 @@ mod tests {
                     println!("   ✅ Warmup insert accepted");
                 }
                 Err(e) => {
-                    let _ = process.kill();
-                    panic!("❌ Warmup insert failed after collection create: {}", e);
+                    let _ = process.child.kill();
+                    panic_with_server_logs(
+                        &format!("❌ Warmup insert failed after collection create: {}", e),
+                        &process.stdout_log,
+                        &process.stderr_log,
+                    );
                 }
             }
 
@@ -240,8 +332,8 @@ mod tests {
 
             // 3. KILL
             println!("   💀 KILLING SERVER...");
-            process.kill().expect("Failed to kill");
-            let _ = process.wait();
+            process.child.kill().expect("Failed to kill");
+            let _ = process.child.wait();
 
             println!("   🛑 Stopped. Confirmed writes: {}", confirmed_ids.len());
 
@@ -254,8 +346,17 @@ mod tests {
 
             // 4. RESTART
             println!("   ♻️  RESTARTING...");
-            let mut process_2 = spawn_server(port, dir.path()).await;
-            let mut client_2 = DriftClient::connect(addr.clone()).await.unwrap();
+            let mut process_2 = spawn_server(port, dir.path(), epoch, "restart").await;
+            let mut client_2 = match DriftClient::connect(addr.clone()).await {
+                Ok(c) => c,
+                Err(e) => {
+                    panic_with_server_logs(
+                        &format!("❌ Failed to reconnect after restart: {}", e),
+                        &process_2.stdout_log,
+                        &process_2.stderr_log,
+                    );
+                }
+            };
 
             // 5. VERIFY
             sleep(Duration::from_millis(500)).await;
@@ -277,17 +378,25 @@ mod tests {
                     if !hits.is_empty() {
                         println!("   ✅ RECOVERY SUCCESS: Found {} results.", hits.len());
                     } else {
-                        panic!(
-                            "❌ DATA LOSS: Index is empty but we confirmed {} writes!",
-                            confirmed_ids.len()
+                        panic_with_server_logs(
+                            &format!(
+                                "❌ DATA LOSS: Index is empty but we confirmed {} writes!",
+                                confirmed_ids.len()
+                            ),
+                            &process_2.stdout_log,
+                            &process_2.stderr_log,
                         );
                     }
                 }
-                Err(e) => panic!("❌ Search failed: {}", e),
+                Err(e) => panic_with_server_logs(
+                    &format!("❌ Search failed after restart: {}", e),
+                    &process_2.stdout_log,
+                    &process_2.stderr_log,
+                ),
             }
 
-            process_2.kill().unwrap();
-            let _ = process_2.wait();
+            process_2.child.kill().unwrap();
+            let _ = process_2.child.wait();
         }
         println!("\n✅ CHAOS TEST PASSED");
     }

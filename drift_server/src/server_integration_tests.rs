@@ -1,9 +1,13 @@
 #[cfg(test)]
 mod tests {
+    use crate::config::{Config, FileConfig, StorageCommand};
+    use crate::drift_proto::{HealthRequest, drift_server::Drift};
     use crate::local_staging::LocalStagingManager;
+    use crate::manager::CollectionManager;
     use crate::manifest::ServerManifestManager;
     use crate::persistence::PersistenceManager;
     use crate::recovery::RecoveryManager;
+    use crate::server::DriftService;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
     use drift_core::partitioner::PartitionGroup;
@@ -15,6 +19,7 @@ mod tests {
     use opendal::{Operator, services};
     use std::sync::Arc;
     use tempfile::tempdir;
+    use tonic::Request;
 
     fn create_fs_operator(path: &std::path::Path) -> Operator {
         let builder = services::Fs::default().root(path.to_str().unwrap());
@@ -35,6 +40,39 @@ mod tests {
             count,
             centroid: Some(vec![0.0; dim]),
         }
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_reports_ready_and_version() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            port: 50051,
+            wal_dir: dir.path().join("wal"),
+            data_dir: dir.path().join("data"),
+            default_dim: 8,
+            max_bucket_capacity: 100,
+            ef_construction: 32,
+            ef_search: 32,
+            storage: StorageCommand::File(FileConfig {
+                path: dir.path().join("storage"),
+            }),
+        };
+
+        let service = DriftService {
+            manager: Arc::new(CollectionManager::new(config)),
+        };
+
+        let health = service
+            .health(Request::new(HealthRequest {}))
+            .await
+            .expect("health call should succeed")
+            .into_inner();
+
+        assert!(health.ready, "health endpoint should report ready=true");
+        assert!(
+            !health.version.trim().is_empty(),
+            "health endpoint should return a non-empty version"
+        );
     }
 
     #[tokio::test]

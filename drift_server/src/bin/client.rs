@@ -1,5 +1,5 @@
 use drift_server::drift_proto::{
-    CreateCollectionRequest, InsertRequest, MetricType, SearchRequest, Vector,
+    CreateCollectionRequest, HealthRequest, InsertRequest, MetricType, SearchRequest, Vector,
     drift_client::DriftClient,
 };
 
@@ -7,6 +7,12 @@ use drift_server::drift_proto::{
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "http://127.0.0.1:50051";
     let mut client = DriftClient::connect(addr).await?;
+    let health = client.health(tonic::Request::new(HealthRequest {})).await?;
+    let health = health.into_inner();
+    if !health.ready {
+        return Err(format!("Server at {} reported ready=false", addr).into());
+    }
+    println!("Connected to healthy server version {}", health.version);
     let dim = 128;
 
     println!("--- TEST 3: MULTI-COLLECTION ISOLATION ---");

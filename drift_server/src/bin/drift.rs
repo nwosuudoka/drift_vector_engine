@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use drift_server::drift_proto::{
-    CreateCollectionRequest, InsertRequest, MetricType, SearchRequest, TrainRequest, Vector,
-    drift_client::DriftClient,
+    CreateCollectionRequest, HealthRequest, InsertRequest, MetricType, SearchRequest, TrainRequest,
+    Vector, drift_client::DriftClient,
 };
 use serde_json::from_str;
 use tracing::info;
@@ -99,6 +99,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = DriftClient::connect(cli.url.clone())
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", cli.url, e))?;
+    let health = client
+        .health(tonic::Request::new(HealthRequest {}))
+        .await
+        .map_err(|e| {
+            if e.code() == tonic::Code::Unimplemented {
+                format!(
+                    "Server at {} does not implement Health RPC. \
+                 This usually means a stale server binary/proto. Rebuild and restart the server.",
+                    cli.url
+                )
+            } else {
+                format!("Server health check failed for {}: {}", cli.url, e)
+            }
+        })?;
+    let health = health.into_inner();
+    if !health.ready {
+        return Err(format!("Server at {} reported ready=false", cli.url).into());
+    }
+    info!("Connected to healthy server version {}", health.version);
 
     match &cli.command {
         Commands::Create {
