@@ -3,7 +3,8 @@
 mod s3_tests {
     use crate::config::{Config, S3Config, StorageCommand};
     use crate::drift_proto::{
-        InsertRequest, SearchRequest, TrainRequest, Vector, drift_server::Drift,
+        CreateCollectionRequest, InsertRequest, MetricType, SearchRequest, TrainRequest, Vector,
+        drift_server::Drift,
     };
     use crate::manager::CollectionManager;
     use crate::server::DriftService;
@@ -110,6 +111,15 @@ mod s3_tests {
         let collection = "s3_test_collection";
 
         // 4) Run Lifecycle
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                collection_name: collection.to_string(),
+                dim: 128,
+                metric: MetricType::L2 as i32,
+                max_bucket_capacity: 0,
+            }))
+            .await
+            .expect("CreateCollection failed");
 
         // A) TRAIN
         let train_vecs: Vec<Vector> = (0..50).map(|_| random_vector(128)).collect();

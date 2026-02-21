@@ -1,22 +1,21 @@
+use crate::cleanup::CleanupApi;
 use crate::local_staging::LocalStagingManager;
-use crate::persistence::PersistenceManager; // ⚡ Import this
+use crate::persistence::PersistenceManager;
 use drift_storage::bucket_manager::{BucketVersion, StorageClass};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 pub struct Reaper {
     queue: VecDeque<Arc<BucketVersion>>,
-    staging: Arc<LocalStagingManager>,
-    persistence: Arc<PersistenceManager>, // ⚡ Add field
+    cleanup: CleanupApi,
 }
 
 impl Reaper {
     pub fn new(staging: Arc<LocalStagingManager>, persistence: Arc<PersistenceManager>) -> Self {
         Self {
             queue: VecDeque::new(),
-            staging,
-            persistence,
+            cleanup: CleanupApi::new(staging, persistence),
         }
     }
 
@@ -38,7 +37,9 @@ impl Reaper {
                         StorageClass::Local => {
                             // Delete local active file
                             info!("Reaper: 💀 Reaping Local {}", version.path);
-                            let _ = self.staging.delete_file(&version.path).await;
+                            self.cleanup
+                                .delete_local_best_effort(&version.path, "reaper-local")
+                                .await;
                         }
                         StorageClass::Promoting {
                             local_frozen,
@@ -47,14 +48,16 @@ impl Reaper {
                         } => {
                             // 1. Delete the unique Staging File (Always safe now due to UUID)
                             info!("Reaper: 💀 Reaping Frozen {}", local_frozen);
-                            let _ = self.staging.delete_file(local_frozen).await;
+                            self.cleanup
+                                .delete_local_best_effort(local_frozen, "reaper-promoting-local")
+                                .await;
 
                             // 2. ⚡ Delete the OLD S3 File
                             if let Some(path) = remote_path {
                                 info!("Reaper: 💀 Reaping Obsolete S3 Segment {}", path);
-                                if let Err(e) = self.persistence.delete_file(path).await {
-                                    warn!("Reaper: Failed to delete S3 file {}: {}", path, e);
-                                }
+                                self.cleanup
+                                    .delete_remote_best_effort(path, "reaper-promoting-remote")
+                                    .await;
                             }
                         }
                         _ => {}

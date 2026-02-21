@@ -1,3 +1,4 @@
+use crate::{math::Metric, metric_strategy::strategy_for};
 use drift_traits::TombstoneView;
 use parking_lot::{RwLock, RwLockReadGuard};
 use rayon::prelude::*;
@@ -92,10 +93,17 @@ impl MemTable {
     }
 
     /// Parallel Scan Search
-    pub fn search<TV: TombstoneView>(&self, query: &[f32], k: usize, view: &TV) -> Vec<(u64, f32)> {
+    pub fn search<TV: TombstoneView>(
+        &self,
+        query: &[f32],
+        k: usize,
+        metric: Metric,
+        view: &TV,
+    ) -> Vec<(u64, f32)> {
         let ids = self.ids.read();
         let data = self.data.read();
         let dim = self.options.dim;
+        let strategy = strategy_for(metric);
 
         let n = ids.len();
         let chunk_size = dim;
@@ -113,10 +121,10 @@ impl MemTable {
 
                     let start = i * chunk_size;
                     let vector = &data[start..start + chunk_size];
-                    let dist_sq = l2_sq_simd_friendly(query, vector);
+                    let score = strategy.score(query, vector);
 
                     let item = HeapItem {
-                        distance: OrderedFloat(dist_sq),
+                        distance: OrderedFloat(score),
                         id,
                     };
 
@@ -163,17 +171,6 @@ impl MemTable {
         let data = self.data.read().clone();
         (ids, data)
     }
-}
-
-// Helpers
-#[inline(always)]
-pub fn l2_sq_simd_friendly(a: &[f32], b: &[f32]) -> f32 {
-    let mut sum = 0.0;
-    for i in 0..a.len() {
-        let diff = a[i] - b[i];
-        sum += diff * diff;
-    }
-    sum
 }
 
 #[derive(Debug, PartialEq)]

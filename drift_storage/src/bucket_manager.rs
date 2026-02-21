@@ -1,6 +1,7 @@
 use crate::bucket_file_reader::BucketFileReader;
 use atomic_float::AtomicF32;
 use drift_core::lock_manager::BucketCoordinator;
+use drift_core::math::Metric;
 use drift_traits::{BucketStats, StorageEngine, TombstoneView};
 use futures::future::join_all;
 use opendal::Operator;
@@ -89,6 +90,7 @@ pub struct BucketManager {
     registry: Arc<RwLock<HashMap<u32, Arc<LiveBucketState>>>>,
     scan_semaphore: Arc<Semaphore>,
     coordinator: Arc<BucketCoordinator>,
+    metric: Metric,
 }
 
 impl BucketManager {
@@ -97,6 +99,7 @@ impl BucketManager {
         remote_op: Operator,
         max_concurrent_scans: usize,
         coordinator: Arc<BucketCoordinator>,
+        metric: Metric,
     ) -> Self {
         Self {
             local_op,
@@ -104,6 +107,7 @@ impl BucketManager {
             registry: Arc::new(RwLock::new(HashMap::new())),
             scan_semaphore: Arc::new(Semaphore::new(max_concurrent_scans)),
             coordinator,
+            metric,
         }
     }
 
@@ -134,6 +138,10 @@ impl BucketManager {
         });
         let state = Arc::new(LiveBucketState::new(version, count));
         self.registry.write().insert(bucket_id, state);
+    }
+
+    pub fn remote_operator(&self) -> Operator {
+        self.remote_op.clone()
     }
 
     pub fn get_version(&self, bucket_id: u32) -> Option<Arc<BucketVersion>> {
@@ -240,6 +248,7 @@ impl StorageEngine for BucketManager {
         oversample_factor: usize,
     ) -> Vec<(u64, f32)> {
         let mut handles = Vec::with_capacity(bucket_ids.len());
+        let metric = self.metric;
 
         for &bid in bucket_ids {
             let local_op = self.local_op.clone();
@@ -303,7 +312,7 @@ impl StorageEngine for BucketManager {
                     match BucketFileReader::open(op, &path).await {
                         Ok(mut reader) => {
                             if let Ok(candidates) = reader
-                                .scan(&query, oversample_factor, bucket_view.as_ref())
+                                .scan(&query, oversample_factor, metric, bucket_view.as_ref())
                                 .await
                             {
                                 let dim = reader
@@ -311,7 +320,9 @@ impl StorageEngine for BucketManager {
                                     .as_ref()
                                     .map(|q| q.min.len())
                                     .unwrap_or(query.len());
-                                if let Ok(matches) = reader.refine(candidates, &query, dim).await {
+                                if let Ok(matches) =
+                                    reader.refine(candidates, &query, dim, metric).await
+                                {
                                     refined_results.extend(matches);
                                 }
                             }

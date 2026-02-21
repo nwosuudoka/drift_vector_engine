@@ -2,10 +2,11 @@ use clap::Parser;
 use drift_server::config::Config;
 use drift_server::drift_proto::drift_server::DriftServer as GrpcServer;
 use drift_server::manager::CollectionManager;
+use drift_server::metrics::{metrics_addr_from_env, serve_metrics};
 use drift_server::server::DriftService;
 use std::sync::Arc;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, prelude::*};
 
 #[tokio::main]
@@ -22,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Banner
     println!("========================================");
-    println!("   🚀 DRIFT VECTOR ENGINE v2.0.0 (LBR)");
+    println!("   🚀 DRIFT VECTOR ENGINE v3.0.0 (LBR)");
     println!("========================================");
     println!("Config Loaded:");
     println!("  • Port:            {}", config.port);
@@ -32,13 +33,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  • Max Bucket Cap:  {}", config.max_bucket_capacity);
     println!("----------------------------------------");
 
-    // 2. Initialize Manager (V2)
-    // This spins up the RecoveryManager, JanitorV2, and Reaper automatically.
+    // 2. Initialize Manager
+    // This spins up the RecoveryManager, Janitor, and Reaper automatically.
     let manager = Arc::new(CollectionManager::new(config.clone()));
 
     // 3. Start gRPC Service
     let addr = format!("0.0.0.0:{}", config.port).parse()?;
     let drift_service = DriftService { manager };
+
+    if let Some(metrics_addr) = metrics_addr_from_env() {
+        tokio::spawn(async move {
+            if let Err(err) = serve_metrics(metrics_addr).await {
+                error!("Metrics exporter stopped: {}", err);
+            }
+        });
+    }
 
     info!("gRPC Listening on {}", addr);
 

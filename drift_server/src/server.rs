@@ -1,9 +1,16 @@
 use crate::drift_proto::{
-    InsertBatchRequest, InsertRequest, SearchRequest, SearchResponse, SearchResult,
-    drift_server::Drift,
+    CreateCollectionRequest, CreateCollectionResponse, InsertBatchRequest, InsertRequest,
+    MetricType, SearchRequest, SearchResponse, SearchResult, drift_server::Drift,
 };
-use crate::drift_proto::{InsertResponse, TrainRequest, TrainResponse};
+use crate::drift_proto::{
+    HealthRequest, HealthResponse, InsertResponse, NvmeCacheMetrics, RecoveryGuardMetrics,
+    TrainRequest, TrainResponse,
+};
 use crate::manager::CollectionManager;
+use crate::recovery::RecoveryManager;
+use drift_core::math::Metric;
+use drift_storage::disk_manager::DiskManager;
+use std::io;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
@@ -11,8 +18,93 @@ pub struct DriftService {
     pub manager: Arc<CollectionManager>,
 }
 
+fn map_collection_error(err: io::Error) -> Status {
+    match err.kind() {
+        io::ErrorKind::NotFound => Status::not_found(err.to_string()),
+        io::ErrorKind::InvalidInput => Status::invalid_argument(err.to_string()),
+        _ => Status::internal(err.to_string()),
+    }
+}
+
+fn metric_from_proto(metric: i32) -> Result<Metric, Status> {
+    let parsed = MetricType::try_from(metric)
+        .map_err(|_| Status::invalid_argument(format!("Unknown metric enum value: {metric}")))?;
+
+    match parsed {
+        MetricType::L2 => Ok(Metric::L2),
+        MetricType::Cosine => Ok(Metric::COSINE),
+        MetricType::Unspecified => Err(Status::invalid_argument("Metric must be specified")),
+    }
+}
+
 #[tonic::async_trait]
 impl Drift for DriftService {
+    async fn health(
+        &self,
+        _request: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        let (cache_enabled, cache_snapshot) = match DiskManager::global_nvme_cache_metrics() {
+            Some(snapshot) => (true, snapshot),
+            None => (false, Default::default()),
+        };
+        let recovery_guard = RecoveryManager::global_fingerprint_guard_metrics();
+
+        Ok(Response::new(HealthResponse {
+            ready: true,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            nvme_cache: Some(NvmeCacheMetrics {
+                enabled: cache_enabled,
+                hits: cache_snapshot.hits,
+                misses: cache_snapshot.misses,
+                remote_fetches: cache_snapshot.remote_fetches,
+                singleflight_waits: cache_snapshot.singleflight_waits,
+                evictions: cache_snapshot.evictions,
+                bytes_cached: cache_snapshot.bytes_cached,
+                bytes_evicted: cache_snapshot.bytes_evicted,
+                invalidations: cache_snapshot.invalidations,
+                fingerprint_mismatches: cache_snapshot.fingerprint_mismatches,
+                recovered_entries: cache_snapshot.recovered_entries,
+            }),
+            recovery_guard: Some(RecoveryGuardMetrics {
+                mismatches_detected: recovery_guard.mismatches_detected,
+                invalidations_performed: recovery_guard.invalidations_performed,
+                fail_fast_aborts: recovery_guard.fail_fast_aborts,
+            }),
+        }))
+    }
+
+    async fn create_collection(
+        &self,
+        request: Request<CreateCollectionRequest>,
+    ) -> Result<Response<CreateCollectionResponse>, Status> {
+        let req = request.into_inner();
+        if req.collection_name.trim().is_empty() {
+            return Err(Status::invalid_argument("collection_name cannot be empty"));
+        }
+        if req.dim == 0 {
+            return Err(Status::invalid_argument("dim must be > 0"));
+        }
+
+        let metric = metric_from_proto(req.metric)?;
+        let max_bucket_capacity = if req.max_bucket_capacity == 0 {
+            None
+        } else {
+            Some(req.max_bucket_capacity as usize)
+        };
+
+        self.manager
+            .get_or_create(
+                &req.collection_name,
+                Some(req.dim as usize),
+                max_bucket_capacity,
+                Some(metric),
+            )
+            .await
+            .map_err(map_collection_error)?;
+
+        Ok(Response::new(CreateCollectionResponse { success: true }))
+    }
+
     async fn train(
         &self,
         request: Request<TrainRequest>,
@@ -24,9 +116,9 @@ impl Drift for DriftService {
 
         let collection = self
             .manager
-            .get_or_create(&req.collection_name, dim_hint, None)
+            .get_or_create(&req.collection_name, dim_hint, None, None)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(map_collection_error)?;
 
         let batch: Vec<(u64, Vec<f32>)> =
             req.vectors.into_iter().map(|v| (v.id, v.values)).collect();
@@ -52,9 +144,9 @@ impl Drift for DriftService {
 
         let collection = self
             .manager
-            .get_or_create(&collection_name, dim_hint, None) // Add dim hint support in proto if needed
+            .get_or_create(&collection_name, dim_hint, None, None) // Add dim hint support in proto if needed
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(map_collection_error)?;
 
         if let Some(vec) = req.vector {
             collection
@@ -76,9 +168,9 @@ impl Drift for DriftService {
 
         let collection = self
             .manager
-            .get_or_create(&req.collection_name, dim_hint, None)
+            .get_or_create(&req.collection_name, dim_hint, None, None)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(map_collection_error)?;
 
         let batch: Vec<(u64, Vec<f32>)> =
             req.vectors.into_iter().map(|v| (v.id, v.values)).collect();
@@ -99,9 +191,9 @@ impl Drift for DriftService {
         let dim_hint = Some(req.vector.len());
         let collection = self
             .manager
-            .get_or_create(&req.collection_name, dim_hint, None)
+            .get_or_create(&req.collection_name, dim_hint, None, None)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(map_collection_error)?;
 
         let results = collection
             .index

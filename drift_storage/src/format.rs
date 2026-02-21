@@ -3,8 +3,10 @@
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 // --- CONSTANTS ---
-pub const MAGIC_V2: u64 = 0x32565F5446495244;
-pub const VERSION_2: u16 = 2;
+pub const MAGIC_V3: u64 = 0x33565F5446495244;
+pub const MAGIC_CURRENT: u64 = MAGIC_V3;
+pub const VERSION_3: u16 = 3;
+pub const VERSION_CURRENT: u16 = VERSION_3;
 pub const HEADER_SIZE: usize = 128;
 pub const ROW_GROUP_HEADER_SIZE: usize = 64;
 pub const FOOTER_SIZE: usize = 128;
@@ -36,8 +38,8 @@ impl DriftHeader {
         quantizer_length: u32,
     ) -> Self {
         Self {
-            magic: MAGIC_V2,
-            version: VERSION_2,
+            magic: MAGIC_CURRENT,
+            version: VERSION_CURRENT,
             flags: 0,
             _reserved: 0, // Must initialize explicit padding
             total_vectors,
@@ -55,18 +57,23 @@ impl DriftHeader {
 
     pub fn force_copy(buf: &[u8]) -> Self {
         let mut header = DriftHeader::new_zeroed();
+        let copy_len = buf.len().min(HEADER_SIZE);
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                &mut header as *mut _ as *mut u8,
-                ROW_GROUP_HEADER_SIZE,
-            );
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), &mut header as *mut _ as *mut u8, copy_len);
         }
         header // Return the OWNED struct
     }
 
+    pub fn is_supported_magic(magic: u64) -> bool {
+        magic == MAGIC_CURRENT
+    }
+
+    pub fn is_supported_version(version: u16) -> bool {
+        version == VERSION_CURRENT
+    }
+
     pub fn validate(&self) -> bool {
-        self.magic == MAGIC_V2 && self.version == VERSION_2
+        Self::is_supported_magic(self.magic) && Self::is_supported_version(self.version)
     }
 }
 
@@ -135,7 +142,11 @@ impl DriftFooter {
             bloom_filter_offset: bloom_offset,
             bloom_filter_length: bloom_length,
             padding: [0u8; 88],
-            magic: MAGIC_V2,
+            magic: MAGIC_CURRENT,
         }
+    }
+
+    pub fn is_supported_magic(magic: u64) -> bool {
+        magic == MAGIC_CURRENT
     }
 }

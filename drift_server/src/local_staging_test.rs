@@ -3,7 +3,7 @@ mod tests {
     use super::super::local_staging::LocalStagingManager;
     use drift_core::lock_manager::BucketCoordinator; // ⚡ Import Coordinator
     use drift_core::partitioner::PartitionGroup;
-    use drift_storage::format::{DriftFooter, FOOTER_SIZE, MAGIC_V2};
+    use drift_storage::format::{DriftFooter, FOOTER_SIZE, MAGIC_CURRENT};
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
     use std::sync::Arc;
@@ -42,7 +42,7 @@ mod tests {
         let mut buf = [0u8; FOOTER_SIZE];
         file.read_exact(&mut buf).unwrap();
         let footer = DriftFooter::read_from_bytes(&buf).unwrap();
-        assert_eq!(footer.magic, MAGIC_V2);
+        assert_eq!(footer.magic, MAGIC_CURRENT);
         footer.row_group_count
     }
 
@@ -121,6 +121,7 @@ mod tests {
 mod race_cond_tests {
     use crate::local_staging::LocalStagingManager;
     use drift_core::lock_manager::BucketCoordinator; // ⚡ Import
+    use drift_core::math::Metric;
     use drift_core::partitioner::PartitionGroup;
     use drift_storage::bucket_file_reader::BucketFileReader;
     use opendal::{Operator, services};
@@ -200,7 +201,7 @@ mod race_cond_tests {
                 match BucketFileReader::open(op.clone(), &filename).await {
                     Ok(mut reader) => {
                         if reader
-                            .scan(&[0.0; 8], 1, &drift_traits::mock::NoTombstones)
+                            .scan(&[0.0; 8], 1, Metric::L2, &drift_traits::mock::NoTombstones)
                             .await
                             .is_ok()
                         {

@@ -32,4 +32,6 @@ message Bucket {
   uint64 vector_count = 3;  // Approximate count for balancing
   uint32 tombstone_count = 4; // Hint for compaction
   float radius = 5;         // Max distance in bucket (for pruning optimization)
+  string object_path = 6;   // Provider-agnostic object key/path
+  string object_fingerprint = 7; // Provider-agnostic object version fingerprint
 }

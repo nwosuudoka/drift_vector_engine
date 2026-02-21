@@ -59,6 +59,7 @@ mod tests {
             op.clone(),
             4,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         let manifest = Arc::new(ServerManifestManager::new(&data_dir, dim as u32).unwrap());
@@ -277,5 +278,96 @@ mod persistence_integration_tests {
         assert_eq!(read_vecs[idx_0][0], 1.0);
 
         println!("✅ Persistence Integration Test Passed!");
+    }
+}
+
+#[cfg(test)]
+mod cleanup_invalidation_tests {
+    use crate::cleanup::CleanupApi;
+    use crate::local_staging::LocalStagingManager;
+    use crate::persistence::PersistenceManager;
+    use drift_storage::disk_manager::DiskManager;
+    use opendal::{Operator, services};
+    use std::sync::{Arc, OnceLock};
+    use tempfile::tempdir;
+    use walkdir::WalkDir;
+
+    static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: This test serializes access via ENV_LOCK so environment mutation
+            // does not race with other env-mutating tests in this crate.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.prev {
+                // SAFETY: Guarded by ENV_LOCK in this test module.
+                unsafe { std::env::set_var(self.key, prev) };
+            } else {
+                // SAFETY: Guarded by ENV_LOCK in this test module.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    fn memory_op() -> Operator {
+        Operator::new(services::Memory::default()).unwrap().finish()
+    }
+
+    fn count_cache_object_files(root: &std::path::Path) -> usize {
+        WalkDir::new(root)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file() && e.file_name() == "object.cache")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_api_delete_remote_invalidates_nvme_cache() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let cache_root = tempdir().unwrap();
+        let _cache_dir =
+            EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
+
+        let op = memory_op();
+        let path = "cleanup/test_object.bin";
+        let payload = vec![9u8; 64];
+        op.write(path, payload.clone()).await.unwrap();
+
+        let mgr = DiskManager::new(op.clone(), path.to_string());
+        let first = mgr.read_at(0, 16).await.unwrap();
+        assert_eq!(first, payload[..16].to_vec());
+        assert_eq!(count_cache_object_files(cache_root.path()), 1);
+
+        let staging_root = tempdir().unwrap();
+        let staging = Arc::new(LocalStagingManager::new(staging_root.path()).unwrap());
+        let persistence = Arc::new(PersistenceManager::new(op.clone()));
+        let cleanup = CleanupApi::new(staging, persistence);
+
+        cleanup.delete_remote(path).await.unwrap();
+
+        assert_eq!(count_cache_object_files(cache_root.path()), 0);
+        let err = mgr
+            .read_at(0, 16)
+            .await
+            .expect_err("cache should be invalidated and remote object deleted");
+        assert!(
+            err.kind() == std::io::ErrorKind::NotFound || err.kind() == std::io::ErrorKind::Other
+        );
     }
 }

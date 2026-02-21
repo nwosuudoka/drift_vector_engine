@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::manifest::ServerManifestManager;
+    use drift_core::math::Metric;
     use tempfile::tempdir;
 
     #[test]
@@ -63,5 +64,44 @@ mod tests {
         // Ensure we didn't nuke the file
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), b"not_a_valid_protobuf");
+    }
+
+    #[test]
+    fn test_manifest_rejects_invalid_metric() {
+        let dir = tempdir().unwrap();
+        let manager = ServerManifestManager::new(dir.path(), 128).unwrap();
+        let result = manager.apply_atomic(|m| {
+            m.inner.metric = "NOT_A_METRIC".to_string();
+        });
+        assert!(
+            result.is_err(),
+            "Should reject unknown metric in apply_atomic"
+        );
+    }
+
+    #[test]
+    fn test_manifest_allows_cosine_when_requested() {
+        let dir = tempdir().unwrap();
+        let manager = ServerManifestManager::new_with_metric(dir.path(), 128, Metric::COSINE)
+            .expect("Should create COSINE manifest");
+
+        let state = manager.get_state();
+        assert_eq!(state.inner.metric, "COSINE");
+
+        let reopened = ServerManifestManager::new_with_metric(dir.path(), 128, Metric::COSINE)
+            .expect("Should reopen COSINE manifest");
+        assert_eq!(reopened.get_state().inner.metric, "COSINE");
+    }
+
+    #[test]
+    fn test_manifest_rejects_requested_metric_mismatch() {
+        let dir = tempdir().unwrap();
+        ServerManifestManager::new_with_metric(dir.path(), 128, Metric::L2).unwrap();
+
+        let mismatched = ServerManifestManager::new_with_metric(dir.path(), 128, Metric::COSINE);
+        assert!(
+            mismatched.is_err(),
+            "Opening with mismatched requested metric should fail"
+        );
     }
 }

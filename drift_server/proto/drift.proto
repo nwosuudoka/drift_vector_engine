@@ -4,6 +4,12 @@ package drift;
 
 // The Drift Vector Database Service
 service Drift {
+  // Lightweight server readiness endpoint.
+  rpc Health (HealthRequest) returns (HealthResponse);
+
+  // Creates (or validates) a collection with explicit metric and dimension.
+  rpc CreateCollection (CreateCollectionRequest) returns (CreateCollectionResponse);
+
   // Inserts a vector into an index.
   rpc Insert (InsertRequest) returns (InsertResponse);
 
@@ -17,6 +23,52 @@ service Drift {
 }
 
 // --- Messages ---
+
+message HealthRequest {}
+
+message NvmeCacheMetrics {
+  bool enabled = 1;
+  uint64 hits = 2;
+  uint64 misses = 3;
+  uint64 remote_fetches = 4;
+  uint64 singleflight_waits = 5;
+  uint64 evictions = 6;
+  uint64 bytes_cached = 7;
+  uint64 bytes_evicted = 8;
+  uint64 invalidations = 9;
+  uint64 fingerprint_mismatches = 10;
+  uint64 recovered_entries = 11;
+}
+
+message RecoveryGuardMetrics {
+  uint64 mismatches_detected = 1;
+  uint64 invalidations_performed = 2;
+  uint64 fail_fast_aborts = 3;
+}
+
+message HealthResponse {
+  bool ready = 1;
+  string version = 2;
+  NvmeCacheMetrics nvme_cache = 3;
+  RecoveryGuardMetrics recovery_guard = 4;
+}
+
+enum MetricType {
+  METRIC_TYPE_UNSPECIFIED = 0;
+  METRIC_TYPE_L2 = 1;
+  METRIC_TYPE_COSINE = 2;
+}
+
+message CreateCollectionRequest {
+  string collection_name = 1;
+  uint32 dim = 2;
+  MetricType metric = 3;
+  uint32 max_bucket_capacity = 4; // 0 => server default
+}
+
+message CreateCollectionResponse {
+  bool success = 1;
+}
 
 message Vector {
   uint64 id = 1;

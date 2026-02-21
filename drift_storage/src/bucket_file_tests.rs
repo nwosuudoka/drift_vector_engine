@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::bucket_file_writer::BucketFileWriter;
-    use crate::format::{DriftFooter, DriftHeader, HEADER_SIZE, MAGIC_V2};
+    use crate::format::{DriftFooter, DriftHeader, HEADER_SIZE, MAGIC_CURRENT};
     use drift_core::quantizer::Quantizer;
     use std::io::Cursor;
     use std::vec;
@@ -50,7 +50,7 @@ mod tests {
         // B. Check Header (Start)
         let header_bytes = &written_data[0..HEADER_SIZE];
         let header = DriftHeader::read_from_bytes(header_bytes).unwrap();
-        assert_eq!(header.magic, MAGIC_V2);
+        assert_eq!(header.magic, MAGIC_CURRENT);
         assert_eq!(header.run_id, run_id);
 
         // C. Check Footer (End)
@@ -59,7 +59,7 @@ mod tests {
         let footer_bytes = &written_data[footer_start..];
         let footer = DriftFooter::read_from_bytes(footer_bytes).unwrap();
 
-        assert_eq!(footer.magic, MAGIC_V2);
+        assert_eq!(footer.magic, MAGIC_CURRENT);
         assert_eq!(footer.row_group_count, 2); // We wrote 2 batches
 
         // D. Verify Directory Layout
@@ -192,7 +192,7 @@ mod writer_tests {
         file.read_exact(&mut header_buf).unwrap();
         // Just verify magic
         let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
-        assert_eq!(magic, crate::format::MAGIC_V2);
+        assert_eq!(magic, crate::format::MAGIC_CURRENT);
 
         // 2. Verify Footer (At the VERY end)
         file.seek(SeekFrom::End(-(crate::format::FOOTER_SIZE as i64)))

@@ -6,6 +6,7 @@ pub mod maintainance;
 pub mod manifest;
 pub mod math;
 pub mod memtable;
+pub mod metric_strategy;
 pub mod partitioner;
 pub mod quantizer;
 pub mod router;

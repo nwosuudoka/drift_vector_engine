@@ -3,9 +3,11 @@ use crate::compression::wrapper::{
 };
 use crate::disk_manager::DiskManager;
 use crate::format::{
-    DriftFooter, DriftHeader, HEADER_SIZE, MAGIC_V2, ROW_GROUP_HEADER_SIZE, RowGroupHeader,
+    DriftFooter, DriftHeader, FOOTER_SIZE, HEADER_SIZE, ROW_GROUP_HEADER_SIZE, RowGroupHeader,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
+use drift_core::math::Metric;
+use drift_core::metric_strategy::strategy_for;
 use drift_core::quantizer::Quantizer;
 use drift_traits::{IoContext, SearchCandidate, TombstoneView};
 use fastbloom::BloomFilter;
@@ -21,9 +23,13 @@ use zerocopy::FromBytes;
 struct CandidateWrapper(SearchCandidate);
 
 struct ScanParams<'a> {
-    lut: &'a [f32],
+    metric: Metric,
+    lut: Option<&'a [f32]>,
     dim: usize,
     k: usize,
+    query: &'a [f32],
+    query_norm: f32,
+    quantizer: &'a Quantizer,
     tombstones: &'a dyn TombstoneView,
 }
 
@@ -59,33 +65,55 @@ impl BucketFileReader {
         let manager = DiskManager::new(op, path.to_string());
         let file_len = manager.len().await?;
 
-        if file_len < crate::format::FOOTER_SIZE as u64 {
+        if file_len < FOOTER_SIZE as u64 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "File too small"));
         }
 
         // 1. Read Footer
-        let footer_pos = file_len - crate::format::FOOTER_SIZE as u64;
-        let footer_bytes = manager
-            .read_at(footer_pos, crate::format::FOOTER_SIZE)
-            .await?;
+        let footer_pos = file_len - FOOTER_SIZE as u64;
+        let footer_bytes = manager.read_at(footer_pos, FOOTER_SIZE).await?;
         let footer = DriftFooter::read_from_bytes(&footer_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid Footer"))?;
 
-        if footer.magic != MAGIC_V2 {
+        if !DriftFooter::is_supported_magic(footer.magic) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad Magic"));
+        }
+        if footer.index_start_offset < HEADER_SIZE as u64 || footer.index_start_offset >= footer_pos
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid footer index_start_offset",
+            ));
         }
 
         // 2. Read Index (RowGroup Headers)
         // Format: [Count: u32] [Header 1] [Header 2] ...
-        // We trust the footer's row_group_count and index_start_offset.
         // Size = 4 bytes (count) + (N * 64 bytes)
-        let index_size = 4 + (footer.row_group_count as usize * ROW_GROUP_HEADER_SIZE);
+        let index_size = 4usize
+            .checked_add((footer.row_group_count as usize).saturating_mul(ROW_GROUP_HEADER_SIZE))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Index size overflow"))?;
+        let index_end = footer
+            .index_start_offset
+            .checked_add(index_size as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Index end overflow"))?;
+        if index_end > footer_pos {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Index region overlaps footer",
+            ));
+        }
         let index_bytes = manager
             .read_at(footer.index_start_offset, index_size)
             .await?;
 
         let mut cursor = Cursor::new(index_bytes);
-        let _stored_count = cursor.read_u32::<LittleEndian>()?;
+        let stored_count = cursor.read_u32::<LittleEndian>()?;
+        if stored_count != footer.row_group_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Row-group count mismatch between footer and index",
+            ));
+        }
 
         let mut row_groups = Vec::with_capacity(footer.row_group_count as usize);
         let mut rg_buf = [0u8; ROW_GROUP_HEADER_SIZE];
@@ -94,6 +122,27 @@ impl BucketFileReader {
             cursor.read_exact(&mut rg_buf)?;
             let rg = RowGroupHeader::read_from_bytes(&rg_buf)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Bad RG Header"))?;
+            let hot_end = rg
+                .hot_offset
+                .checked_add(rg.hot_length as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Hot range overflow"))?;
+            let cold_end = rg
+                .cold_offset
+                .checked_add(rg.cold_length as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Cold range overflow"))?;
+
+            if rg.hot_offset < HEADER_SIZE as u64
+                || rg.cold_offset < HEADER_SIZE as u64
+                || hot_end > footer.index_start_offset
+                || cold_end > footer.index_start_offset
+                || rg.cold_offset < rg.hot_offset
+                || rg.cold_offset < hot_end
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid row-group range layout",
+                ));
+            }
             row_groups.push(rg);
         }
 
@@ -102,6 +151,27 @@ impl BucketFileReader {
         let head_bytes = manager.read_at(0, HEADER_SIZE).await?;
         let header = DriftHeader::read_from_bytes(&head_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid Header"))?;
+        if !header.validate() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported header magic/version",
+            ));
+        }
+        let quantizer_end = header
+            .quantizer_offset
+            .checked_add(header.quantizer_length as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Quantizer range overflow")
+            })?;
+        if header.quantizer_offset < HEADER_SIZE as u64
+            || quantizer_end > footer.index_start_offset
+            || header.quantizer_length == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid quantizer range",
+            ));
+        }
 
         // We load the quantizer eagerly or lazy?
         // Let's load Lazy to keep open() fast, but we need data_start_offset.
@@ -109,6 +179,18 @@ impl BucketFileReader {
 
         // 4. Read Bloom (Optional)
         let bloom = if footer.bloom_filter_length > 0 {
+            let bloom_end = footer
+                .bloom_filter_offset
+                .checked_add(footer.bloom_filter_length as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Bloom range overflow")
+                })?;
+            if footer.bloom_filter_offset < index_end || bloom_end > footer_pos {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid bloom filter range",
+                ));
+            }
             let b_bytes = manager
                 .read_at(
                     footer.bloom_filter_offset,
@@ -142,6 +224,12 @@ impl BucketFileReader {
         let head_bytes = self.manager.read_at(0, HEADER_SIZE).await?;
         let header = DriftHeader::read_from_bytes(&head_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid Header"))?;
+        if !header.validate() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unsupported header magic/version",
+            ));
+        }
 
         let q_bytes = self
             .manager
@@ -160,15 +248,25 @@ impl BucketFileReader {
         &mut self,
         query: &[f32],
         k: usize,
+        metric: Metric,
         tombstones: &dyn TombstoneView,
     ) -> io::Result<Vec<SearchCandidate>> {
         if self.quantizer.is_none() {
             self.load_quantizer().await?;
         }
         let q = self.quantizer.as_ref().unwrap();
-        let lut = q.precompute_lut(query);
+        let lut = if metric == Metric::L2 {
+            Some(q.precompute_lut(query))
+        } else {
+            None
+        };
         let dim = query.len();
         let q_dim = q.min.len();
+        let query_norm = if metric == Metric::COSINE {
+            query.iter().map(|v| v * v).sum::<f32>().sqrt()
+        } else {
+            0.0
+        };
 
         if q_dim != dim {
             tracing::warn!(
@@ -190,9 +288,13 @@ impl BucketFileReader {
         let mut heap: BinaryHeap<CandidateWrapper> = BinaryHeap::with_capacity(k + 1);
 
         let params = ScanParams {
-            lut: &lut,
+            metric,
+            lut: lut.as_deref(),
             dim,
             k,
+            query,
+            query_norm,
+            quantizer: q,
             tombstones,
         };
 
@@ -200,14 +302,20 @@ impl BucketFileReader {
         let mut total_vectors = 0usize;
         let mut total_hot_bytes = 0usize;
         for rg in &self.row_groups {
-            // Read Hot Index Blob
-            // Hot Layout: [IDs: u64 * N] [Codes: u8 * N * D] [Tombstones...]
-            // We read just enough for IDs + Codes.
-            // ID Size: N * 8
-            // Code Size: N * D
+            // Hot Layout (V3): [IDs: u64 * N] [Codes: u8 * N * D]
             let count = rg.vector_count as usize;
-            let _hot_size = (count * 8) + (count * dim); // Roughly. 
-            // Better: Read the whole hot_length as defined in header.
+            let expected_hot_size = (count * 8) + (count * dim);
+            if rg.hot_length as usize != expected_hot_size {
+                tracing::warn!(
+                    "⚠️ Scan RG: hot_length mismatch for strict V3 layout path={} expected={} actual={} cold_offset={} cold_len={}",
+                    self.manager.path,
+                    expected_hot_size,
+                    rg.hot_length,
+                    rg.cold_offset,
+                    rg.cold_length
+                );
+                continue;
+            }
 
             let hot_blob = self
                 .manager
@@ -264,9 +372,28 @@ impl BucketFileReader {
             );
             return;
         }
-        let codes = &hot_blob[ids_size..];
+        let code_bytes_len = count.saturating_mul(params.dim);
+        if ids_size + code_bytes_len > hot_blob.len() {
+            tracing::warn!(
+                "⚠️ Scan RG: invalid hot blob layout path={} ids_bytes={} code_bytes={} hot_len={}",
+                self.manager.path,
+                ids_size,
+                code_bytes_len,
+                hot_blob.len()
+            );
+            return;
+        }
+        let codes = &hot_blob[ids_size..ids_size + code_bytes_len];
+        let trailer_len = hot_blob.len() - (ids_size + code_bytes_len);
+        if trailer_len > 0 {
+            tracing::warn!(
+                "⚠️ Scan RG: detected {} unexpected trailer bytes in strict V3 layout path={}",
+                trailer_len,
+                self.manager.path
+            );
+            return;
+        }
 
-        let lut_ptr = params.lut.as_ptr();
         let codes_ptr = codes.as_ptr();
 
         let mut considered = 0usize;
@@ -285,7 +412,23 @@ impl BucketFileReader {
                 break;
             }
 
-            let dist = unsafe { compute_distance_lut(codes_ptr.add(offset), lut_ptr, params.dim) };
+            let dist = match params.metric {
+                Metric::L2 => match params.lut {
+                    Some(lut) => unsafe {
+                        compute_distance_lut(codes_ptr.add(offset), lut.as_ptr(), params.dim)
+                    },
+                    None => continue,
+                },
+                Metric::COSINE => {
+                    let code = &codes[offset..offset + params.dim];
+                    cosine_distance_quantized(
+                        params.query,
+                        params.query_norm,
+                        code,
+                        params.quantizer,
+                    )
+                }
+            };
             considered += 1;
             if dist < min_dist {
                 min_dist = dist;
@@ -335,10 +478,12 @@ impl BucketFileReader {
         candidates: Vec<SearchCandidate>,
         query: &[f32],
         dim: usize,
+        metric: Metric,
     ) -> io::Result<Vec<(u64, f32)>> {
         let candidate_count = candidates.len();
         let mut results = Vec::with_capacity(candidate_count);
         let mut groups: BTreeMap<u64, (u32, u32, Vec<SearchCandidate>)> = BTreeMap::new();
+        let strategy = strategy_for(metric);
 
         for c in candidates {
             groups
@@ -388,7 +533,7 @@ impl BucketFileReader {
                 let start = idx * dim;
                 if start + dim <= vectors.len() {
                     let vec = &vectors[start..start + dim];
-                    let exact_dist = drift_core::math::l2_sq(query, vec);
+                    let exact_dist = strategy.score(query, vec);
                     results.push((c.id, exact_dist));
                 }
             }
@@ -483,9 +628,14 @@ impl BucketFileReader {
         let header = DriftHeader::force_copy(&head_buf);
 
         // Validate
-        if header.magic != MAGIC_V2 {
-            tracing::error!("Invalid magic bytes {} != {}", header.magic, MAGIC_V2);
-            panic!("Invalid magic bytes")
+        if !header.validate() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid header magic/version pair: magic={} version={}",
+                    header.magic, header.version
+                ),
+            ));
         }
 
         // Read Quantizer Blob
@@ -541,4 +691,50 @@ pub unsafe fn compute_distance_lut(
         i += 1;
     }
     sum
+}
+
+#[inline(always)]
+fn cosine_distance_quantized(
+    query: &[f32],
+    query_norm: f32,
+    code: &[u8],
+    quantizer: &Quantizer,
+) -> f32 {
+    if query_norm <= f32::EPSILON {
+        return 1.0;
+    }
+
+    let dim = query
+        .len()
+        .min(code.len())
+        .min(quantizer.min.len())
+        .min(quantizer.scale.len());
+    let mut dot = 0.0f32;
+    let mut norm_v = 0.0f32;
+    let mut i = 0usize;
+
+    while i + 4 <= dim {
+        let r0 = quantizer.min[i] + (code[i] as f32 * quantizer.scale[i]);
+        let r1 = quantizer.min[i + 1] + (code[i + 1] as f32 * quantizer.scale[i + 1]);
+        let r2 = quantizer.min[i + 2] + (code[i + 2] as f32 * quantizer.scale[i + 2]);
+        let r3 = quantizer.min[i + 3] + (code[i + 3] as f32 * quantizer.scale[i + 3]);
+
+        dot += query[i] * r0 + query[i + 1] * r1 + query[i + 2] * r2 + query[i + 3] * r3;
+        norm_v += r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3;
+        i += 4;
+    }
+
+    while i < dim {
+        let reconstructed = quantizer.min[i] + (code[i] as f32 * quantizer.scale[i]);
+        dot += query[i] * reconstructed;
+        norm_v += reconstructed * reconstructed;
+        i += 1;
+    }
+
+    if norm_v <= f32::EPSILON {
+        return 1.0;
+    }
+
+    let sim = (dot / (query_norm * norm_v.sqrt())).clamp(-1.0, 1.0);
+    1.0 - sim
 }

@@ -1,3 +1,4 @@
+use crate::cleanup::CleanupApi;
 use crate::local_staging::LocalStagingManager;
 use crate::manifest::ServerManifestManager;
 use crate::persistence::PersistenceManager;
@@ -7,11 +8,32 @@ use drift_core::{index::VectorIndex, lock_manager::BucketCoordinator};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
 use drift_traits::StorageEngine;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, io};
 use tokio::sync::Mutex;
 use tokio::time;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+const KV_SYNC_INTERVAL_MS_ENV: &str = "DRIFT_KV_SYNC_INTERVAL_MS";
+
+fn kv_sync_interval_from_env() -> Duration {
+    let default = Duration::from_millis(5_000);
+    match std::env::var(KV_SYNC_INTERVAL_MS_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => {
+                warn!(
+                    "Janitor: invalid {}='{}'; using default {}ms",
+                    KV_SYNC_INTERVAL_MS_ENV,
+                    raw,
+                    default.as_millis()
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 pub struct JanitorVars {
     pub promotion_threshold_bytes: u64,
@@ -52,6 +74,7 @@ pub struct Janitor {
     manifest: Arc<ServerManifestManager>,
     staging: Arc<LocalStagingManager>,
     persistence: Arc<PersistenceManager>,
+    cleanup: CleanupApi,
     bucket_manager: Arc<BucketManager>,
     reaper: Mutex<Reaper>,
     coordinator: Arc<BucketCoordinator>,
@@ -60,6 +83,7 @@ pub struct Janitor {
 
 impl Janitor {
     pub fn new(config: JanitorConfig) -> Self {
+        let cleanup = CleanupApi::new(config.staging.clone(), config.persistence.clone());
         let reaper = Mutex::new(Reaper::new(
             config.staging.clone(),
             config.persistence.clone(),
@@ -69,6 +93,7 @@ impl Janitor {
             manifest: config.manifest,
             staging: config.staging,
             persistence: config.persistence,
+            cleanup,
             bucket_manager: config.bucket_manager,
             reaper,
             coordinator: config.coordinator,
@@ -80,19 +105,34 @@ impl Janitor {
         let kv = self.index.get_kv();
         let bucket_bytes = bucket_id.to_le_bytes();
         for id in ids {
-            let _ = kv.put(&id.to_le_bytes(), &bucket_bytes);
+            if let Err(e) = kv.put(&id.to_le_bytes(), &bucket_bytes) {
+                warn!(
+                    "Janitor: failed kv.put for id={} bucket={}: {}",
+                    id, bucket_id, e
+                );
+            }
         }
     }
 
     fn remove_kv_mapping(&self, ids: &[u64]) {
         let kv = self.index.get_kv();
         for id in ids {
-            let _ = kv.remove(&id.to_le_bytes());
+            if let Err(e) = kv.remove(&id.to_le_bytes()) {
+                warn!("Janitor: failed kv.remove for id={}: {}", id, e);
+            }
+        }
+    }
+
+    fn sync_kv_best_effort(&self, reason: &str) {
+        if let Err(e) = self.index.get_kv().sync() {
+            warn!("Janitor: kv.sync failed ({reason}): {e}");
         }
     }
 
     pub async fn run(&self) {
         let mut interval = time::interval(self.vars.check_interval);
+        let kv_sync_interval = kv_sync_interval_from_env();
+        let mut last_kv_sync = Instant::now();
         info!("Janitor: Started.");
 
         loop {
@@ -114,6 +154,11 @@ impl Janitor {
             // 4. Check for Promotions (Local -> S3)
             if let Err(e) = self.promote_segments().await {
                 error!("Janitor: Promotion failed: {}", e);
+            }
+
+            if last_kv_sync.elapsed() >= kv_sync_interval {
+                self.sync_kv_best_effort("periodic");
+                last_kv_sync = Instant::now();
             }
         }
     }
@@ -236,6 +281,7 @@ impl Janitor {
 
         // 5. Acknowledge
         self.index.acknowledge_flush(&wal_ids)?;
+        self.sync_kv_best_effort("flush");
 
         Ok(())
     }
@@ -423,7 +469,9 @@ impl Janitor {
             let (mut merged_ids, mut merged_vecs) =
                 self.staging.read_file_content(&staging_filename).await?;
             if merged_ids.is_empty() {
-                let _ = self.staging.delete_file(&staging_filename).await;
+                self.cleanup
+                    .delete_local_best_effort(&staging_filename, "promotion-empty-staging")
+                    .await;
                 continue;
             }
 
@@ -469,13 +517,28 @@ impl Janitor {
 
             // 3. Finalize Registry (Tiered)
             let new_remote_path = format!("bucket_{}_{}.drift", bucket_id, new_run_id);
+            let new_remote_fingerprint = match self
+                .persistence
+                .object_fingerprint_for_path(&new_remote_path)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "Janitor: failed to read remote fingerprint for {}: {}",
+                        new_remote_path,
+                        e
+                    );
+                    String::new()
+                }
+            };
             let tiered_class = StorageClass::Tiered {
                 remote_path: new_remote_path.clone(),
                 local_path: new_filename.clone(),
             };
             self.bucket_manager.register_bucket_with_count(
                 bucket_id,
-                new_remote_path,
+                new_remote_path.clone(),
                 tiered_class,
                 final_count,
             );
@@ -491,15 +554,24 @@ impl Janitor {
             // Get fresh stats for atomic update (retains any NEW tombstones that arrived during upload)
             if let Some(stats) = self.bucket_manager.get_bucket_stats(bucket_id) {
                 self.manifest.apply_atomic(|m| {
-                    m.update_bucket_run_id(bucket_id, new_run_id.clone());
+                    m.update_bucket_remote_meta(
+                        bucket_id,
+                        new_run_id.clone(),
+                        new_remote_path.clone(),
+                        new_remote_fingerprint.clone(),
+                    );
                     m.update_bucket_stats(bucket_id, final_count as u64, stats.tombstone_count);
                 })?;
             }
 
             // 6. Cleanup
-            let _ = self.staging.delete_file(&staging_filename).await;
+            self.cleanup
+                .delete_local_best_effort(&staging_filename, "promotion-rotated-staging")
+                .await;
             if let Some(old_path) = remote_path_opt {
-                let _ = self.persistence.delete_file(&old_path).await;
+                self.cleanup
+                    .delete_remote_best_effort(&old_path, "promotion-old-remote")
+                    .await;
             }
         }
         Ok(())
@@ -585,7 +657,7 @@ impl Janitor {
         // 5. Update In-Memory Router (Critical for Search)
         // We need to expose a method on Index to update router, or do it here if we have access.
         // Ideally, Index listens to Manifest updates or we call a method.
-        // For V2 MVP, we can call a helper on Index.
+        // Call a helper on Index for the split update.
         self.index
             .apply_split_update(
                 bucket_id,
@@ -607,7 +679,10 @@ impl Janitor {
         // We delete the STAGING file for the old bucket immediately if it exists.
         // Remote files are handled by Reaper later.
         let old_staging = self.staging.get_active_filename(bucket_id);
-        let _ = self.staging.delete_file(&old_staging).await;
+        self.cleanup
+            .delete_local_best_effort(&old_staging, "split-old-staging")
+            .await;
+        self.sync_kv_best_effort("split");
 
         info!(
             "Janitor: Split Complete. {} -> {}, {}",
@@ -640,12 +715,9 @@ impl Janitor {
 
             // 2. ⚡ NEW: Delete Physical File
             let zombie_file = self.staging.get_active_filename(zombie_id);
-            if let Err(e) = self.staging.delete_file(&zombie_file).await {
-                error!(
-                    "Janitor: Failed to delete zombie file {}: {}",
-                    zombie_file, e
-                );
-            }
+            self.cleanup
+                .delete_local_best_effort(&zombie_file, "merge-empty-zombie")
+                .await;
 
             return Ok(());
         }
@@ -755,13 +827,18 @@ impl Janitor {
 
         // 6. Cleanup
         let zombie_file = self.staging.get_active_filename(zombie_id);
-        let _ = self.staging.delete_file(&zombie_file).await;
+        self.cleanup
+            .delete_local_best_effort(&zombie_file, "merge-zombie-old")
+            .await;
 
         for f in files_to_delete {
             if !manifest_updates.iter().any(|(_, _, _, _, new)| *new == f) {
-                let _ = self.staging.delete_file(&f).await;
+                self.cleanup
+                    .delete_local_best_effort(&f, "merge-neighbor-old")
+                    .await;
             }
         }
+        self.sync_kv_best_effort("merge");
 
         info!("Janitor: Merge Complete. {} scattered.", zombie_id);
         Ok(())
@@ -769,7 +846,7 @@ impl Janitor {
 
     pub(crate) async fn check_maintainance(&self) {
         // 1. Global Cooling (Decay temperature for all buckets)
-        // V2 API: We tell the storage engine to decay all active temperatures.
+        // Ask the storage layer to decay active temperatures.
         // const TEMPERATURE_COOL_FACTOR: f32 = 0.98;
         self.bucket_manager
             .tick_cooling(self.vars.temperature_cool_factor);
@@ -790,14 +867,14 @@ impl Janitor {
             .collect();
 
         for b in buckets {
-            // 3. Fetch Live Stats from BucketManager (V2 API)
+            // 3. Fetch live stats from BucketManager
             // returns BucketStats { tombstone_count, total_count, temperature, ... }
             let stats = match self.bucket_manager.get_bucket_stats(b.id) {
                 Some(s) => s,
                 None => continue, // Bucket might be deleted or not yet registered
             };
 
-            // Fetch Vector Sum for Drift (V2 API)
+            // Fetch vector sum for drift calculation
             let (current_sum, _drift_count) = self
                 .bucket_manager
                 .get_bucket_drift_stats(b.id)

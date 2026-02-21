@@ -23,6 +23,10 @@ mod tests {
         assert_eq!(loaded.version(), 1);
         assert_eq!(loaded.get_buckets().len(), 1);
         assert_eq!(loaded.get_buckets()[0].run_id, "run_abc_123");
+        assert_eq!(
+            loaded.get_buckets()[0].object_path,
+            "bucket_100_run_abc_123.drift"
+        );
         assert_eq!(loaded.get_centroids().len(), 1);
     }
 
@@ -50,6 +54,8 @@ mod tests {
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].id, 100);
         assert_eq!(buckets[0].run_id, "run_A");
+        assert_eq!(buckets[0].object_path, "bucket_100_run_A.drift");
+        assert!(buckets[0].object_fingerprint.is_empty());
 
         let centroids = manifest.get_centroids();
         assert_eq!(centroids.len(), 1);
@@ -68,6 +74,7 @@ mod tests {
         let buckets_after = manifest.get_buckets();
         assert_eq!(buckets_after.len(), 1); // Still 1
         assert_eq!(buckets_after[0].run_id, "run_B"); // Updated run_id
+        assert_eq!(buckets_after[0].object_path, "bucket_100_run_B.drift");
         assert_eq!(buckets_after[0].vector_count, 0); // Reset count (as per add_bucket logic)
     }
 
@@ -142,5 +149,40 @@ mod tests {
         let garbage = vec![0u8, 1, 2, 3, 255];
         let result = ManifestWrapper::from_bytes(&garbage);
         assert!(result.is_err(), "Should fail on corrupt bytes");
+    }
+
+    #[test]
+    fn test_remote_meta_update() {
+        let metric = Metric::L2;
+        let mut manifest = ManifestWrapper::new(8, metric);
+        manifest.add_bucket(42, "run_old".to_string(), Some(vec![0.0; 8]));
+
+        manifest.update_bucket_remote_meta(
+            42,
+            "run_new".to_string(),
+            "remote/custom/path_42.drift".to_string(),
+            "len=123|etag=abc".to_string(),
+        );
+
+        let bucket = manifest.get_buckets().iter().find(|b| b.id == 42).unwrap();
+        assert_eq!(bucket.run_id, "run_new");
+        assert_eq!(bucket.object_path, "remote/custom/path_42.drift");
+        assert_eq!(bucket.object_fingerprint, "len=123|etag=abc");
+    }
+
+    #[test]
+    fn test_manifest_metric_parser() {
+        let mut manifest = ManifestWrapper::new(16, Metric::L2);
+        assert_eq!(manifest.metric().unwrap(), Metric::L2);
+
+        manifest.inner.metric = "COSINE".to_string();
+        assert_eq!(manifest.metric().unwrap(), Metric::COSINE);
+
+        // Backward compatibility for older manifests where metric was not set.
+        manifest.inner.metric.clear();
+        assert_eq!(manifest.metric().unwrap(), Metric::L2);
+
+        manifest.inner.metric = "invalid".to_string();
+        assert!(manifest.metric().is_err());
     }
 }

@@ -1,9 +1,10 @@
 use drift_core::{quantizer::Quantizer, tombstone::TombstoneFile};
 use drift_storage::bucket_file_reader::BucketFileReader;
 use drift_storage::bucket_file_writer::BucketFileWriter;
-use opendal::Operator;
+use drift_storage::disk_manager::DiskManager;
+use opendal::{Metadata, Operator};
 use std::io::{self, Cursor};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct PersistenceManager {
@@ -11,6 +12,24 @@ pub struct PersistenceManager {
 }
 
 impl PersistenceManager {
+    fn object_fingerprint(meta: &Metadata) -> String {
+        let mut fields = Vec::with_capacity(5);
+        fields.push(format!("len={}", meta.content_length()));
+        if let Some(v) = meta.version() {
+            fields.push(format!("version={}", v));
+        }
+        if let Some(etag) = meta.etag() {
+            fields.push(format!("etag={}", etag));
+        }
+        if let Some(md5) = meta.content_md5() {
+            fields.push(format!("md5={}", md5));
+        }
+        if let Some(ts) = meta.last_modified() {
+            fields.push(format!("last_modified={:?}", ts));
+        }
+        fields.join("|")
+    }
+
     pub fn new(op: Operator) -> Self {
         Self { op }
     }
@@ -75,7 +94,19 @@ impl PersistenceManager {
     }
 
     pub async fn delete_file(&self, path: &str) -> std::io::Result<()> {
-        self.op.delete(path).await.map_err(std::io::Error::other)
+        self.op.delete(path).await.map_err(std::io::Error::other)?;
+        if let Err(e) = DiskManager::invalidate_nvme_cache_for_object(&self.op, path).await {
+            warn!(
+                "Persistence: failed to invalidate NVMe cache for {}: {}",
+                path, e
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn object_fingerprint_for_path(&self, path: &str) -> io::Result<String> {
+        let meta = self.op.stat(path).await.map_err(io::Error::other)?;
+        Ok(Self::object_fingerprint(&meta))
     }
 
     pub async fn flush_tombstones(&self, ids: &[u64], run_id: &str) -> std::io::Result<String> {

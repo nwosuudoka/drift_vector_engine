@@ -3,6 +3,7 @@ mod tests {
     use crate::bucket_file_writer::BucketFileWriter;
     use crate::bucket_manager::{BucketManager, StorageClass};
     use drift_core::lock_manager::BucketCoordinator;
+    use drift_core::math::Metric;
     use drift_core::quantizer::Quantizer;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
@@ -40,7 +41,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         let dim = 2;
         let bucket_id = 1;
@@ -112,7 +113,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
         let dim = 2;
         let bucket_id = 2;
 
@@ -158,6 +159,7 @@ mod tests {
             op.clone(),
             4,
             coordinator.clone(),
+            Metric::L2,
         ));
 
         let bucket_id = 3;
@@ -228,7 +230,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         // Register a file that DOES NOT EXIST
         manager.register_bucket(99, "ghost.drift".to_string(), StorageClass::Local);
@@ -247,7 +249,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
         let dim = 2;
         let bucket_id = 1;
 
@@ -288,20 +290,20 @@ mod tests {
         assert_eq!(stats.total_count, 3);
     }
 
-    // --- TEST: Shadowing via Explicit Delete (V2 Style) ---
+    // --- TEST: Shadowing via explicit delete ---
     #[tokio::test]
     async fn test_bucket_manager_shadowing_view() {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         // 1. Setup Data (ID 100 exists on disk)
         create_bucket_file(dir.path(), "b1.drift", &[100], &[vec![0.0, 0.0]], 2).await;
         manager.register_bucket(1, "b1.drift".to_string(), StorageClass::Local);
 
         // 2. SHADOW ACTION
-        // In V2, "Shadowing" means marking the disk version as deleted because a newer one exists in RAM.
+        // "Shadowing" means marking the disk version as deleted because a newer one exists in RAM.
         manager.mark_delete(1, 100).expect("Failed to mark delete");
 
         // 3. Search
@@ -317,7 +319,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         let bucket_id = 1;
 
@@ -375,7 +377,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());
         let coordinator = Arc::new(BucketCoordinator::new());
-        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator);
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         let bucket_id = 99;
         manager.register_bucket(bucket_id, "safe.drift".to_string(), StorageClass::Local);

@@ -1,4 +1,5 @@
 use clap::Parser;
+use drift_core::math::Metric;
 use drift_server::config::{Config, FileConfig, StorageCommand};
 use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{InsertRequest, SearchRequest, TrainRequest, Vector};
@@ -117,7 +118,7 @@ fn calculate_recall(results: &[u64], ground_truth: &[u64]) -> f32 {
 async fn force_flush_and_wait(service: &DriftService, collection: &str) {
     let coll = service
         .manager
-        .get_or_create(collection, None, None)
+        .get_or_create(collection, None, None, None)
         .await
         .unwrap();
 
@@ -175,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ef_construction: 64,
         ef_search: 256,
     };
+    let max_bucket_capacity = config.max_bucket_capacity;
 
     println!("🌍 Starting Concept Drift Simulation (Instrumented)");
     println!("   • Clusters: {}", args.clusters);
@@ -186,6 +188,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager: manager.clone(),
     };
     let collection_name = "drift_simulation";
+    manager
+        .get_or_create(
+            collection_name,
+            Some(args.dim),
+            Some(max_bucket_capacity),
+            Some(Metric::L2),
+        )
+        .await?;
 
     let mut world = World::new(args.dim, args.clusters, 5.0, 999);
     let mut shadow_db: Vec<(u64, Vec<f32>)> = Vec::new();
@@ -255,7 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let recall = calculate_recall(&result_ids, &ground_truth);
 
         let coll = manager
-            .get_or_create(collection_name, Some(args.dim), None)
+            .get_or_create(collection_name, Some(args.dim), None, None)
             .await
             .unwrap();
         let (_centroids, _ids, counts) = coll.index.get_router().read().get_snapshot_with_counts();

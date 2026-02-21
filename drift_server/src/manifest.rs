@@ -18,6 +18,15 @@ pub struct ServerManifestManager {
 impl ServerManifestManager {
     /// Opens or creates a manifest in the given directory.
     pub fn new(base_path: impl AsRef<Path>, dim: u32) -> io::Result<Self> {
+        Self::new_with_metric(base_path, dim, Metric::L2)
+    }
+
+    /// Opens or creates a manifest and enforces the expected metric.
+    pub fn new_with_metric(
+        base_path: impl AsRef<Path>,
+        dim: u32,
+        expected_metric: Metric,
+    ) -> io::Result<Self> {
         let base = base_path.as_ref().to_path_buf();
         fs::create_dir_all(&base).context("Failed to create manifest dir")?;
         let path = base.join("manifest.pb");
@@ -26,13 +35,25 @@ impl ServerManifestManager {
             let bytes = fs::read(&path).context("Failed to read manifest file")?;
             let wrapper = ManifestWrapper::from_bytes(&bytes)
                 .map_err(|e| io::Error::other(format!("Protobuf decode error: {}", e)))?;
+            let metric = wrapper
+                .metric()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if metric != expected_metric {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Metric mismatch: manifest={}, requested={}",
+                        wrapper.inner.metric, expected_metric
+                    ),
+                ));
+            }
             Ok(Self {
                 base_path: base,
                 manifest_path: path,
                 state: RwLock::new(wrapper),
             })
         } else {
-            let wrapper = ManifestWrapper::new(dim, Metric::L2);
+            let wrapper = ManifestWrapper::new(dim, expected_metric);
             let manager = Self {
                 base_path: base,
                 manifest_path: path,
@@ -47,7 +68,7 @@ impl ServerManifestManager {
 
     /// Returns a clone of the inner wrapper (cheap if using Arc internally,
     /// but ManifestWrapper might be clone-heavy if large.
-    /// For V2 MVP, cloning the metadata is acceptable).
+    /// Cloning the metadata is acceptable for now).
     pub fn get_state(&self) -> ManifestWrapper {
         self.state.read().clone()
     }
@@ -62,6 +83,9 @@ impl ServerManifestManager {
 
         // 1. Apply Changes In-Memory
         op(&mut guard);
+        guard
+            .metric()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
         // 2. Bump Version & Persist
         guard.bump_version();

@@ -39,7 +39,6 @@ impl<W: Write> RowGroupWriter<W> {
         &mut self,
         ids: &[u64],
         flat_vectors: &[f32],
-        _tombstones: Option<&bit_set::BitSet>, // Future: Serialize BitSet
         quantizer: &drift_core::quantizer::Quantizer,
         dim: usize,
     ) -> io::Result<RowGroupHeader> {
@@ -86,23 +85,12 @@ impl<W: Write> RowGroupWriter<W> {
         }
 
         // 2. SQ8 Codes (Row-Major for streaming scan)
-        // for vec in vectors {
-        //     let codes = quantizer.encode(vec);
-        //     hot_buffer.write_all(&codes)?;
-        // }
-        // C. Hot Index
-        // 2. SQ8 Codes
-        // Quantizer also needs to support flat slice or we iterate chunks
         for i in 0..count {
             let start = i * dim;
             let vec_slice = &flat_vectors[start..start + dim];
             let codes = quantizer.encode(vec_slice);
             hot_buffer.write_all(&codes)?;
         }
-
-        // 3. Tombstones (Placeholder for now)
-        // In the future, we write the BitSet bytes here.
-        hot_buffer.write_u32::<LittleEndian>(0)?; // Length 0
 
         // --- STEP 2: CALCULATE CHECKSUM ---
         let mut hasher = Hasher::new();

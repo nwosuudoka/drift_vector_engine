@@ -2,11 +2,17 @@
 mod tests {
     use crate::bucket_file_reader::BucketFileReader;
     use crate::bucket_file_writer::BucketFileWriter;
+    use crate::format::{
+        DriftFooter, DriftHeader, FOOTER_SIZE, HEADER_SIZE, ROW_GROUP_HEADER_SIZE, RowGroupHeader,
+    };
+    use drift_core::math::Metric;
     use drift_core::quantizer::Quantizer;
     use drift_traits::TombstoneView;
     use opendal::{Operator, services};
     use std::fs::OpenOptions;
+    use std::path::Path;
     use tempfile::NamedTempFile;
+    use zerocopy::{FromBytes, IntoBytes};
 
     // --- Mocks & Helpers ---
 
@@ -37,6 +43,60 @@ mod tests {
             vecs.extend(std::iter::repeat(val).take(dim));
         }
         (ids, vecs)
+    }
+
+    fn write_single_row_group_file(path: &Path, dim: usize, count: usize) {
+        let (ids, vecs) = mock_batch(0, count, dim);
+        let q = Quantizer::train(&vecs, dim);
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        let mut writer = BucketFileWriter::new_streaming(file, [1u8; 16], q, dim).unwrap();
+        writer.write_batch(&ids, &vecs).unwrap();
+        writer.finalize().unwrap();
+    }
+
+    fn read_footer(bytes: &[u8]) -> DriftFooter {
+        DriftFooter::read_from_bytes(&bytes[bytes.len() - FOOTER_SIZE..]).unwrap()
+    }
+
+    fn write_footer(bytes: &mut [u8], footer: &DriftFooter) {
+        let start = bytes.len() - FOOTER_SIZE;
+        bytes[start..].copy_from_slice(footer.as_bytes());
+    }
+
+    fn read_header(bytes: &[u8]) -> DriftHeader {
+        DriftHeader::read_from_bytes(&bytes[..HEADER_SIZE]).unwrap()
+    }
+
+    fn write_header(bytes: &mut [u8], header: &DriftHeader) {
+        bytes[..HEADER_SIZE].copy_from_slice(header.as_bytes());
+    }
+
+    fn read_first_row_group(bytes: &[u8], footer: &DriftFooter) -> RowGroupHeader {
+        let start = footer.index_start_offset as usize + 4;
+        let end = start + ROW_GROUP_HEADER_SIZE;
+        RowGroupHeader::read_from_bytes(&bytes[start..end]).unwrap()
+    }
+
+    fn write_first_row_group(bytes: &mut [u8], footer: &DriftFooter, rg: &RowGroupHeader) {
+        let start = footer.index_start_offset as usize + 4;
+        let end = start + ROW_GROUP_HEADER_SIZE;
+        bytes[start..end].copy_from_slice(rg.as_bytes());
+    }
+
+    fn write_index_count(bytes: &mut [u8], footer: &DriftFooter, count: u32) {
+        let start = footer.index_start_offset as usize;
+        let end = start + 4;
+        bytes[start..end].copy_from_slice(&count.to_le_bytes());
+    }
+
+    async fn open_error_message(path: &Path) -> String {
+        let root = path.parent().unwrap().to_str().unwrap();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        let op = create_fs_operator(root);
+        match BucketFileReader::open(op, filename).await {
+            Ok(_) => panic!("file should be rejected by validation"),
+            Err(e) => e.to_string(),
+        }
     }
 
     // --- TEST 1: Write -> Read Round Trip (Maintenance Path) ---
@@ -191,7 +251,10 @@ mod tests {
         let query = vec![100.0f32; dim];
         let tombstones = NoTombstones;
 
-        let results = reader.scan(&query, 10, &tombstones).await.unwrap();
+        let results = reader
+            .scan(&query, 10, Metric::L2, &tombstones)
+            .await
+            .unwrap();
 
         // 4. Verify
         assert!(!results.is_empty(), "Results should not be empty");
@@ -210,5 +273,175 @@ mod tests {
         if results.len() > 1 {
             assert!(results[1].approx_dist > 100.0, "Distractors should be far");
         }
+    }
+
+    #[tokio::test]
+    async fn test_search_accuracy_cosine_metric() {
+        let tmp_file = NamedTempFile::new().unwrap();
+        let path = tmp_file.path().to_owned();
+        let dim = 4;
+
+        let ids = vec![1u64, 2, 3];
+        let vectors = vec![
+            vec![2.0, 0.0, 0.0, 0.0], // Perfect cosine match with query [1,0,0,0]
+            vec![0.8, 0.6, 0.0, 0.0], // Similar but worse
+            vec![0.0, 2.0, 0.0, 0.0], // Orthogonal
+        ];
+        let flat: Vec<f32> = vectors.iter().flatten().copied().collect();
+        let q = Quantizer::train(&flat, dim);
+
+        {
+            let file = OpenOptions::new().write(true).open(&path).unwrap();
+            let mut writer = BucketFileWriter::new_streaming(file, [1u8; 16], q, dim).unwrap();
+            writer.write_batch(&ids, &flat).unwrap();
+            writer.finalize().unwrap();
+        }
+
+        let root = path.parent().unwrap().to_str().unwrap();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        let op = create_fs_operator(root);
+
+        let mut reader = BucketFileReader::open(op, filename).await.unwrap();
+        let query = vec![1.0f32, 0.0, 0.0, 0.0];
+        let tombstones = NoTombstones;
+
+        let candidates = reader
+            .scan(&query, 3, Metric::COSINE, &tombstones)
+            .await
+            .unwrap();
+        let refined = reader
+            .refine(candidates, &query, dim, Metric::COSINE)
+            .await
+            .unwrap();
+
+        assert_eq!(refined[0].0, 1, "COSINE should rank vector 1 first");
+        assert!(refined[0].1 <= refined[1].1);
+        assert!(refined[1].1 <= refined[2].1);
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_bad_footer_magic() {
+        let tmp = NamedTempFile::new().unwrap();
+        write_single_row_group_file(tmp.path(), 8, 32);
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        let mut footer = read_footer(&bytes);
+        footer.magic = 0;
+        write_footer(&mut bytes, &footer);
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let err = open_error_message(tmp.path()).await;
+        assert!(err.contains("Bad Magic"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_bad_footer_index_start_offset() {
+        let tmp = NamedTempFile::new().unwrap();
+        write_single_row_group_file(tmp.path(), 8, 32);
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        let mut footer = read_footer(&bytes);
+        footer.index_start_offset = (HEADER_SIZE as u64).saturating_sub(1);
+        write_footer(&mut bytes, &footer);
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let err = open_error_message(tmp.path()).await;
+        assert!(
+            err.contains("Invalid footer index_start_offset"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_row_group_count_mismatch() {
+        let tmp = NamedTempFile::new().unwrap();
+        write_single_row_group_file(tmp.path(), 8, 32);
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        let footer = read_footer(&bytes);
+        write_index_count(
+            &mut bytes,
+            &footer,
+            footer.row_group_count.saturating_add(1),
+        );
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let err = open_error_message(tmp.path()).await;
+        assert!(
+            err.contains("Row-group count mismatch between footer and index"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_row_group_overlap_layout() {
+        let tmp = NamedTempFile::new().unwrap();
+        write_single_row_group_file(tmp.path(), 8, 32);
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        let footer = read_footer(&bytes);
+        let mut rg = read_first_row_group(&bytes, &footer);
+        rg.cold_offset = rg.hot_offset + (rg.hot_length as u64).saturating_sub(1);
+        write_first_row_group(&mut bytes, &footer, &rg);
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let err = open_error_message(tmp.path()).await;
+        assert!(
+            err.contains("Invalid row-group range layout"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_invalid_header_version() {
+        let tmp = NamedTempFile::new().unwrap();
+        write_single_row_group_file(tmp.path(), 8, 32);
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        let mut header = read_header(&bytes);
+        header.version = 2;
+        write_header(&mut bytes, &header);
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let err = open_error_message(tmp.path()).await;
+        assert!(
+            err.contains("Unsupported header magic/version"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_invalid_quantizer_range() {
+        let tmp = NamedTempFile::new().unwrap();
+        write_single_row_group_file(tmp.path(), 8, 32);
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        let mut header = read_header(&bytes);
+        header.quantizer_length = 0;
+        write_header(&mut bytes, &header);
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let err = open_error_message(tmp.path()).await;
+        assert!(err.contains("Invalid quantizer range"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_invalid_bloom_range() {
+        let tmp = NamedTempFile::new().unwrap();
+        write_single_row_group_file(tmp.path(), 8, 32);
+
+        let mut bytes = std::fs::read(tmp.path()).unwrap();
+        let mut footer = read_footer(&bytes);
+        footer.bloom_filter_offset = footer.index_start_offset;
+        footer.bloom_filter_length = 8;
+        write_footer(&mut bytes, &footer);
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let err = open_error_message(tmp.path()).await;
+        assert!(err.contains("Invalid bloom filter range"), "got: {}", err);
     }
 }
