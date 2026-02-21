@@ -140,6 +140,10 @@ impl BucketManager {
         self.registry.write().insert(bucket_id, state);
     }
 
+    pub fn remote_operator(&self) -> Operator {
+        self.remote_op.clone()
+    }
+
     pub fn get_version(&self, bucket_id: u32) -> Option<Arc<BucketVersion>> {
         self.registry
             .read()

@@ -736,6 +736,18 @@ impl DiskManager {
         DiskCacheRuntime::reset_registry_for_tests();
     }
 
+    pub fn nvme_cached_fingerprint_for_object(op: &Operator, path: &str) -> Option<String> {
+        if !Self::is_remote_scheme(op.info().scheme()) {
+            return None;
+        }
+
+        let root = Self::nvme_cache_root()?;
+        let runtime = DiskCacheRuntime::runtime_for_root(root, CacheConfig::from_env());
+        let namespace = Self::object_namespace(op);
+        let object_key = Self::object_cache_key(&namespace, path);
+        runtime.cached_fingerprint(&object_key)
+    }
+
     pub async fn invalidate_nvme_cache_for_object(op: &Operator, path: &str) -> io::Result<()> {
         if !Self::is_remote_scheme(op.info().scheme()) {
             return Ok(());

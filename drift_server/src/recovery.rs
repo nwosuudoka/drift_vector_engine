@@ -2,6 +2,7 @@ use crate::manifest::ServerManifestManager;
 use drift_core::router::Router;
 use drift_core::wal::{WalEntry, WalReader};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
+use drift_storage::disk_manager::DiskManager;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
@@ -76,20 +77,38 @@ impl RecoveryManager {
         };
 
         // --- STEP B: REBUILD STORAGE ---
+        let remote_op = bucket_manager.remote_operator();
         for b in wrapper.get_buckets() {
+            let remote_filename = if !b.object_path.is_empty() {
+                Some(b.object_path.clone())
+            } else if !b.run_id.is_empty() {
+                Some(format!("bucket_{}_{}.drift", b.id, b.run_id))
+            } else {
+                None
+            };
+
+            if let Some(remote_path) = &remote_filename
+                && !b.object_fingerprint.is_empty()
+                && let Some(cached_fingerprint) =
+                    DiskManager::nvme_cached_fingerprint_for_object(&remote_op, remote_path)
+                && cached_fingerprint != b.object_fingerprint
+            {
+                warn!(
+                    "Recovery: NVMe cache fingerprint mismatch for bucket {} (path: {}). \
+                     invalidating stale cache entry.",
+                    b.id, remote_path
+                );
+                DiskManager::invalidate_nvme_cache_for_object(&remote_op, remote_path).await?;
+            }
+
             let local_filename = format!("bucket_{}.drift", b.id);
             // Check staging dir specifically
             let local_full_path = self.root.join("staging").join(&local_filename);
 
             if local_full_path.exists() {
                 bucket_manager.register_bucket(b.id, local_filename, StorageClass::Local);
-            } else if !b.run_id.is_empty() {
-                let remote_filename = if !b.object_path.is_empty() {
-                    b.object_path.clone()
-                } else {
-                    format!("bucket_{}_{}.drift", b.id, b.run_id)
-                };
-                bucket_manager.register_bucket(b.id, remote_filename, StorageClass::Remote);
+            } else if let Some(remote_path) = remote_filename {
+                bucket_manager.register_bucket(b.id, remote_path, StorageClass::Remote);
             } else {
                 warn!("Recovery: Bucket {} is registered but has no file!", b.id);
             }
