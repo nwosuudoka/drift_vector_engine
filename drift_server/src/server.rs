@@ -3,9 +3,11 @@ use crate::drift_proto::{
     MetricType, SearchRequest, SearchResponse, SearchResult, drift_server::Drift,
 };
 use crate::drift_proto::{
-    HealthRequest, HealthResponse, InsertResponse, NvmeCacheMetrics, TrainRequest, TrainResponse,
+    HealthRequest, HealthResponse, InsertResponse, NvmeCacheMetrics, RecoveryGuardMetrics,
+    TrainRequest, TrainResponse,
 };
 use crate::manager::CollectionManager;
+use crate::recovery::RecoveryManager;
 use drift_core::math::Metric;
 use drift_storage::disk_manager::DiskManager;
 use std::io;
@@ -45,6 +47,7 @@ impl Drift for DriftService {
             Some(snapshot) => (true, snapshot),
             None => (false, Default::default()),
         };
+        let recovery_guard = RecoveryManager::global_fingerprint_guard_metrics();
 
         Ok(Response::new(HealthResponse {
             ready: true,
@@ -61,6 +64,11 @@ impl Drift for DriftService {
                 invalidations: cache_snapshot.invalidations,
                 fingerprint_mismatches: cache_snapshot.fingerprint_mismatches,
                 recovered_entries: cache_snapshot.recovered_entries,
+            }),
+            recovery_guard: Some(RecoveryGuardMetrics {
+                mismatches_detected: recovery_guard.mismatches_detected,
+                invalidations_performed: recovery_guard.invalidations_performed,
+                fail_fast_aborts: recovery_guard.fail_fast_aborts,
             }),
         }))
     }

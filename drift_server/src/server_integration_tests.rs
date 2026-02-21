@@ -77,6 +77,10 @@ mod tests {
             health.nvme_cache.is_some(),
             "health endpoint should always return nvme cache metrics payload"
         );
+        assert!(
+            health.recovery_guard.is_some(),
+            "health endpoint should always return recovery guard metrics payload"
+        );
     }
 
     #[tokio::test]

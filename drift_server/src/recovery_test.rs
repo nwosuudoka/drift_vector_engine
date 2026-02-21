@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
     use crate::manifest::ServerManifestManager;
-    use crate::recovery::RecoveryManager;
+    use crate::recovery::{
+        FingerprintMismatchPolicy, RecoveryFingerprintGuardConfig, RecoveryManager,
+    };
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
     use drift_core::wal::WalWriter;
@@ -64,6 +66,25 @@ mod tests {
             Arc::new(BucketCoordinator::new()),
             Metric::L2,
         )
+    }
+
+    fn create_broken_cache_entry(
+        root: &std::path::Path,
+        dir_name: &str,
+        object_key: &str,
+        with_object_file: bool,
+        with_meta_file: bool,
+    ) -> std::path::PathBuf {
+        let dir = root.join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        if with_object_file {
+            std::fs::write(dir.join("object.cache"), vec![1u8; 16]).unwrap();
+        }
+        if with_meta_file {
+            let body = format!("{object_key}\nmock_fingerprint\n");
+            std::fs::write(dir.join("cache.meta"), body.as_bytes()).unwrap();
+        }
+        dir
     }
 
     #[tokio::test]
@@ -145,6 +166,8 @@ mod tests {
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap();
+        RecoveryManager::reset_fingerprint_guard_metrics_for_tests();
+        let before = RecoveryManager::global_fingerprint_guard_metrics();
 
         let dir = tempdir().unwrap();
         let cache_root = tempdir().unwrap();
@@ -175,7 +198,14 @@ mod tests {
             })
             .unwrap();
 
-        let mgr = RecoveryManager::new(dir.path(), manifest);
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::InvalidateAndContinue,
+                max_mismatches: None,
+            },
+        );
         let bucket_mgr = create_memory_manager(op.clone());
         let wal_dir = dir.path().join("wal");
         mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
@@ -184,6 +214,19 @@ mod tests {
         assert!(
             cache_after.is_none(),
             "stale cache entry should be invalidated on recovery"
+        );
+        let after = RecoveryManager::global_fingerprint_guard_metrics();
+        assert!(
+            after
+                .mismatches_detected
+                .saturating_sub(before.mismatches_detected)
+                >= 1
+        );
+        assert!(
+            after
+                .invalidations_performed
+                .saturating_sub(before.invalidations_performed)
+                >= 1
         );
     }
 
@@ -218,7 +261,14 @@ mod tests {
             })
             .unwrap();
 
-        let mgr = RecoveryManager::new(dir.path(), manifest);
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::InvalidateAndContinue,
+                max_mismatches: None,
+            },
+        );
         let bucket_mgr = create_memory_manager(op.clone());
         let wal_dir = dir.path().join("wal");
         mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
@@ -228,6 +278,471 @@ mod tests {
             cache_after.is_some(),
             "matching fingerprint should preserve cache entry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_recover_handles_missing_cache_meta_file_gracefully() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        RecoveryManager::reset_fingerprint_guard_metrics_for_tests();
+        let before = RecoveryManager::global_fingerprint_guard_metrics();
+
+        let dir = tempdir().unwrap();
+        let cache_root = tempdir().unwrap();
+        let _cache_dir =
+            EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
+
+        let path = "custom/provider/object-20.drift";
+        let op = create_memory_operator();
+        op.write(path, vec![1u8; 32]).await.unwrap();
+
+        let broken_dir = create_broken_cache_entry(
+            cache_root.path(),
+            "broken_missing_meta",
+            "memory://::unused",
+            true,
+            false,
+        );
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 8).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(20, "run_remote".into(), Some(vec![0.0; 8]));
+                m.update_bucket_remote_meta(
+                    20,
+                    "run_remote".into(),
+                    path.into(),
+                    "len=32|etag=expected".into(),
+                );
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::InvalidateAndContinue,
+                max_mismatches: Some(0),
+            },
+        );
+        let bucket_mgr = create_memory_manager(op.clone());
+        let wal_dir = dir.path().join("wal");
+        mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
+
+        assert!(
+            !broken_dir.exists(),
+            "recovery-time cache load should purge entries missing cache.meta"
+        );
+
+        let after = RecoveryManager::global_fingerprint_guard_metrics();
+        assert_eq!(
+            after
+                .mismatches_detected
+                .saturating_sub(before.mismatches_detected),
+            0
+        );
+        assert_eq!(
+            after
+                .invalidations_performed
+                .saturating_sub(before.invalidations_performed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_handles_missing_cached_object_file_gracefully() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        RecoveryManager::reset_fingerprint_guard_metrics_for_tests();
+        let before = RecoveryManager::global_fingerprint_guard_metrics();
+
+        let dir = tempdir().unwrap();
+        let cache_root = tempdir().unwrap();
+        let _cache_dir =
+            EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
+
+        let path = "custom/provider/object-21.drift";
+        let op = create_memory_operator();
+        op.write(path, vec![1u8; 32]).await.unwrap();
+
+        let broken_dir = create_broken_cache_entry(
+            cache_root.path(),
+            "broken_missing_object",
+            "memory://::unused",
+            false,
+            true,
+        );
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 8).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(21, "run_remote".into(), Some(vec![0.0; 8]));
+                m.update_bucket_remote_meta(
+                    21,
+                    "run_remote".into(),
+                    path.into(),
+                    "len=32|etag=expected".into(),
+                );
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::InvalidateAndContinue,
+                max_mismatches: Some(0),
+            },
+        );
+        let bucket_mgr = create_memory_manager(op.clone());
+        let wal_dir = dir.path().join("wal");
+        mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
+
+        assert!(
+            !broken_dir.exists(),
+            "recovery-time cache load should purge entries missing object.cache"
+        );
+
+        let after = RecoveryManager::global_fingerprint_guard_metrics();
+        assert_eq!(
+            after
+                .mismatches_detected
+                .saturating_sub(before.mismatches_detected),
+            0
+        );
+        assert_eq!(
+            after
+                .invalidations_performed
+                .saturating_sub(before.invalidations_performed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_skips_guard_when_manifest_fingerprint_empty() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        RecoveryManager::reset_fingerprint_guard_metrics_for_tests();
+        let before = RecoveryManager::global_fingerprint_guard_metrics();
+
+        let dir = tempdir().unwrap();
+        let cache_root = tempdir().unwrap();
+        let _cache_dir =
+            EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
+
+        let path = "custom/provider/object-22.drift";
+        let op = create_memory_operator();
+        op.write(path, vec![9u8; 64]).await.unwrap();
+
+        let disk = DiskManager::new(op.clone(), path.to_string());
+        let _ = disk.read_at(0, 8).await.unwrap();
+        assert!(
+            DiskManager::nvme_cached_fingerprint_for_object(&op, path).is_some(),
+            "cache should be populated before recovery"
+        );
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 8).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(22, "run_remote".into(), Some(vec![0.0; 8]));
+                m.update_bucket_remote_meta(
+                    22,
+                    "run_remote".into(),
+                    path.into(),
+                    String::new(),
+                );
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::InvalidateAndContinue,
+                max_mismatches: Some(0),
+            },
+        );
+        let bucket_mgr = create_memory_manager(op.clone());
+        let wal_dir = dir.path().join("wal");
+        mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
+
+        let cache_after = DiskManager::nvme_cached_fingerprint_for_object(&op, path);
+        assert!(
+            cache_after.is_some(),
+            "empty manifest fingerprint should skip guard and preserve cache"
+        );
+
+        let after = RecoveryManager::global_fingerprint_guard_metrics();
+        assert_eq!(
+            after
+                .mismatches_detected
+                .saturating_sub(before.mismatches_detected),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_local_bucket_does_not_touch_remote_guard() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        RecoveryManager::reset_fingerprint_guard_metrics_for_tests();
+        let before = RecoveryManager::global_fingerprint_guard_metrics();
+
+        let dir = tempdir().unwrap();
+        let staging_dir = dir.path().join("staging");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        std::fs::write(staging_dir.join("bucket_23.drift"), vec![0u8; 4]).unwrap();
+
+        let cache_root = tempdir().unwrap();
+        let _cache_dir =
+            EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
+
+        let path = "custom/provider/object-23.drift";
+        let op = create_memory_operator();
+        op.write(path, vec![4u8; 64]).await.unwrap();
+        let disk = DiskManager::new(op.clone(), path.to_string());
+        let _ = disk.read_at(0, 8).await.unwrap();
+        let cached_fp = DiskManager::nvme_cached_fingerprint_for_object(&op, path).unwrap();
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 8).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(23, "run_remote".into(), Some(vec![0.0; 8]));
+                m.update_bucket_remote_meta(
+                    23,
+                    "run_remote".into(),
+                    path.into(),
+                    format!("{cached_fp}-stale"),
+                );
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::InvalidateAndContinue,
+                max_mismatches: Some(0),
+            },
+        );
+        let bucket_mgr = create_memory_manager(op.clone());
+        let wal_dir = dir.path().join("wal");
+        mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
+
+        let (local_path, class) = bucket_mgr.get_location(23).unwrap();
+        assert_eq!(class, StorageClass::Local);
+        assert!(local_path.contains("bucket_23.drift"));
+        assert!(
+            DiskManager::nvme_cached_fingerprint_for_object(&op, path).is_some(),
+            "local bucket recovery should not invalidate remote cache"
+        );
+
+        let after = RecoveryManager::global_fingerprint_guard_metrics();
+        assert_eq!(
+            after
+                .mismatches_detected
+                .saturating_sub(before.mismatches_detected),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_invalid_env_policy_falls_back_to_invalidate_and_continue() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        RecoveryManager::reset_fingerprint_guard_metrics_for_tests();
+        let before = RecoveryManager::global_fingerprint_guard_metrics();
+
+        let dir = tempdir().unwrap();
+        let cache_root = tempdir().unwrap();
+        let _cache_dir =
+            EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
+        let _policy = EnvVarGuard::set("DRIFT_RECOVERY_FINGERPRINT_POLICY", "not_a_real_policy");
+        let _max = EnvVarGuard::set(
+            "DRIFT_RECOVERY_FINGERPRINT_MAX_MISMATCHES",
+            "not_a_number",
+        );
+
+        let path = "custom/provider/object-24.drift";
+        let op = create_memory_operator();
+        op.write(path, vec![2u8; 64]).await.unwrap();
+        let disk = DiskManager::new(op.clone(), path.to_string());
+        let _ = disk.read_at(0, 8).await.unwrap();
+        let cached_fp = DiskManager::nvme_cached_fingerprint_for_object(&op, path).unwrap();
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 8).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(24, "run_remote".into(), Some(vec![0.0; 8]));
+                m.update_bucket_remote_meta(
+                    24,
+                    "run_remote".into(),
+                    path.into(),
+                    format!("{cached_fp}-stale"),
+                );
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new(dir.path(), manifest);
+        let bucket_mgr = create_memory_manager(op.clone());
+        let wal_dir = dir.path().join("wal");
+        mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
+
+        assert!(
+            DiskManager::nvme_cached_fingerprint_for_object(&op, path).is_none(),
+            "invalid env policy should fallback to invalidate_and_continue"
+        );
+
+        let after = RecoveryManager::global_fingerprint_guard_metrics();
+        assert!(
+            after
+                .mismatches_detected
+                .saturating_sub(before.mismatches_detected)
+                >= 1
+        );
+        assert!(
+            after
+                .invalidations_performed
+                .saturating_sub(before.invalidations_performed)
+                >= 1
+        );
+        assert_eq!(
+            after
+                .fail_fast_aborts
+                .saturating_sub(before.fail_fast_aborts),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_fingerprint_policy_fail_fast_aborts_startup() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        RecoveryManager::reset_fingerprint_guard_metrics_for_tests();
+        let before = RecoveryManager::global_fingerprint_guard_metrics();
+
+        let dir = tempdir().unwrap();
+        let cache_root = tempdir().unwrap();
+        let _cache_dir =
+            EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
+
+        let path = "custom/provider/object-11.drift";
+        let op = create_memory_operator();
+        op.write(path, vec![5u8; 64]).await.unwrap();
+
+        let disk = DiskManager::new(op.clone(), path.to_string());
+        let _ = disk.read_at(0, 8).await.unwrap();
+
+        let cached_fp = DiskManager::nvme_cached_fingerprint_for_object(&op, path).unwrap();
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 8).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(11, "run_remote".into(), Some(vec![0.0; 8]));
+                m.update_bucket_remote_meta(
+                    11,
+                    "run_remote".into(),
+                    path.into(),
+                    format!("{cached_fp}-stale"),
+                );
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::FailFast,
+                max_mismatches: None,
+            },
+        );
+        let bucket_mgr = create_memory_manager(op.clone());
+        let wal_dir = dir.path().join("wal");
+        let err = match mgr.recover(&bucket_mgr, 8, &wal_dir).await {
+            Ok(_) => panic!("fail_fast policy should abort on mismatch"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let cache_after = DiskManager::nvme_cached_fingerprint_for_object(&op, path);
+        assert!(
+            cache_after.is_some(),
+            "fail_fast should not invalidate cache as startup aborts immediately"
+        );
+        let after = RecoveryManager::global_fingerprint_guard_metrics();
+        assert!(
+            after
+                .mismatches_detected
+                .saturating_sub(before.mismatches_detected)
+                >= 1
+        );
+        assert!(
+            after
+                .fail_fast_aborts
+                .saturating_sub(before.fail_fast_aborts)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_fingerprint_policy_max_mismatches_enforced() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let dir = tempdir().unwrap();
+        let cache_root = tempdir().unwrap();
+        let _cache_dir =
+            EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
+
+        let path = "custom/provider/object-12.drift";
+        let op = create_memory_operator();
+        op.write(path, vec![6u8; 64]).await.unwrap();
+
+        let disk = DiskManager::new(op.clone(), path.to_string());
+        let _ = disk.read_at(0, 8).await.unwrap();
+
+        let cached_fp = DiskManager::nvme_cached_fingerprint_for_object(&op, path).unwrap();
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 8).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(12, "run_remote".into(), Some(vec![0.0; 8]));
+                m.update_bucket_remote_meta(
+                    12,
+                    "run_remote".into(),
+                    path.into(),
+                    format!("{cached_fp}-stale"),
+                );
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::InvalidateAndContinue,
+                max_mismatches: Some(0),
+            },
+        );
+        let bucket_mgr = create_memory_manager(op.clone());
+        let wal_dir = dir.path().join("wal");
+        let err = match mgr.recover(&bucket_mgr, 8, &wal_dir).await {
+            Ok(_) => panic!("max_mismatches=0 should fail on first mismatch"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

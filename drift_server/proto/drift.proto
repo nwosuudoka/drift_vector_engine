@@ -40,10 +40,17 @@ message NvmeCacheMetrics {
   uint64 recovered_entries = 11;
 }
 
+message RecoveryGuardMetrics {
+  uint64 mismatches_detected = 1;
+  uint64 invalidations_performed = 2;
+  uint64 fail_fast_aborts = 3;
+}
+
 message HealthResponse {
   bool ready = 1;
   string version = 2;
   NvmeCacheMetrics nvme_cache = 3;
+  RecoveryGuardMetrics recovery_guard = 4;
 }
 
 enum MetricType {
