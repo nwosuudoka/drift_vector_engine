@@ -451,12 +451,7 @@ mod tests {
         manifest
             .apply_atomic(|m| {
                 m.add_bucket(22, "run_remote".into(), Some(vec![0.0; 8]));
-                m.update_bucket_remote_meta(
-                    22,
-                    "run_remote".into(),
-                    path.into(),
-                    String::new(),
-                );
+                m.update_bucket_remote_meta(22, "run_remote".into(), path.into(), String::new());
             })
             .unwrap();
 
@@ -568,10 +563,7 @@ mod tests {
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
         let _policy = EnvVarGuard::set("DRIFT_RECOVERY_FINGERPRINT_POLICY", "not_a_real_policy");
-        let _max = EnvVarGuard::set(
-            "DRIFT_RECOVERY_FINGERPRINT_MAX_MISMATCHES",
-            "not_a_number",
-        );
+        let _max = EnvVarGuard::set("DRIFT_RECOVERY_FINGERPRINT_MAX_MISMATCHES", "not_a_number");
 
         let path = "custom/provider/object-24.drift";
         let op = create_memory_operator();

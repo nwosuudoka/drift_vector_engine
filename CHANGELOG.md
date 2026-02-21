@@ -7,6 +7,8 @@
 - **Collection metric contract:** metric is now part of collection creation semantics and validated across reopen/reuse.
 - **Cosine clustering path:** spherical K-Means support for cosine-based collection workflows.
 - **NVMe cache metrics in API:** `HealthResponse` now includes `NvmeCacheMetrics` sourced from runtime cache counters.
+- **Recovery guard metrics in API:** `HealthResponse` now includes recovery fingerprint-guard counters.
+- **Prometheus metrics exporter:** optional HTTP `/metrics` endpoint exposes NVMe cache and recovery-guard counters for external scraping.
 - **Cache hardening tests:**
   - byte-budget eviction coverage,
   - cleanup/delete-driven invalidation coverage,

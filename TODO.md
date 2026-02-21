@@ -31,8 +31,11 @@
 
 ## In Progress
 
-- [ ] Startup guard: manifest fingerprint vs local cache metadata cross-check.
-- [ ] Configurable startup policy on fingerprint mismatches (invalidate-and-continue vs fail-fast).
+- [x] Startup guard: manifest fingerprint vs local cache metadata cross-check.
+- [x] Configurable startup policy on fingerprint mismatches (invalidate-and-continue vs fail-fast).
+- [x] Metrics export for runtime observability:
+  - [x] Health RPC includes recovery-guard counters.
+  - [x] Optional Prometheus `/metrics` exporter for NVMe cache + recovery guard counters.
 - [ ] Remove stale V2 naming from remaining logs/tests/docs.
 
 ## Next Major Step: Payload and Secondary Index Expansion

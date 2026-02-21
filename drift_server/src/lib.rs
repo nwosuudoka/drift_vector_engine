@@ -4,6 +4,7 @@ pub mod janitor;
 pub mod local_staging;
 pub mod manager;
 pub mod manifest;
+pub mod metrics;
 pub mod persistence;
 pub mod reaper;
 pub mod recovery;

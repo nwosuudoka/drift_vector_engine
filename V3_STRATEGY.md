@@ -45,6 +45,7 @@ This document captures the V3 direction aligned with current implementation and 
 - Delete/cleanup calls routed through `CleanupApi` and `PersistenceManager::delete_file` for consistent remote cache invalidation.
 - Cache metrics are exposed via `DiskManager::global_nvme_cache_metrics()`.
 - Provider-agnostic object fingerprints are stored in manifest bucket metadata.
+- Recovery fingerprint guard metrics are exposed in health responses and optional Prometheus `/metrics`.
 
 ## Cache Configuration
 
@@ -79,7 +80,9 @@ If `DRIFT_NVME_CACHE_DIR` is not set, behavior stays unchanged (no local object-
 3. Query/runtime upgrades
 - Use bloom as actual scan pre-filter in query path.
 - Add optional per-row-group checksum verification mode during refine/debug.
-- Expand cache metrics export to external observability sinks (Prometheus/OpenTelemetry).
+- Expand metrics export beyond health payload:
+  - Implemented: optional Prometheus `/metrics` endpoint for NVMe cache + recovery guard counters.
+  - Next: OpenTelemetry integration and richer labels/histograms.
 - Tune eviction policy for workload-specific hot/cold behavior.
 - Add manifest/runtime cross-check path for fingerprint mismatch observability.
 

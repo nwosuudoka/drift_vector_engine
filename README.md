@@ -22,7 +22,8 @@ and files consistent.
 - **Collection metric is explicit at create time** and enforced across reopen/reuse.
 - **Remote reads use a local NVMe full-object cache** with local range slicing, singleflight
   miss coordination, and budget-based eviction.
-- **Health RPC includes NVMe cache runtime metrics** to expose cache behavior in production.
+- **Health RPC includes NVMe cache + recovery guard runtime metrics** to expose cache/recovery behavior.
+- **Optional Prometheus exporter** can expose the same counters on `/metrics`.
 
 ## Architecture
 
@@ -149,6 +150,12 @@ NVMe remote-read cache:
 - `DRIFT_NVME_FINGERPRINT_VERIFY_INTERVAL_MS` (optional fingerprint re-verify interval)
 - `DRIFT_NVME_CACHE_FORCE_ALL_SCHEMES=1` (test-only override; enables cache even for `fs` backend)
 
+Metrics exporter (optional):
+
+- `DRIFT_METRICS_ADDR` (for example `0.0.0.0:9091`; preferred)
+- `DRIFT_METRICS_PORT` (fallback; binds `0.0.0.0:<port>`)
+- If either is set, server starts HTTP metrics endpoint at `/metrics`.
+
 ## How to use
 
 ### Run the server
@@ -199,6 +206,7 @@ scripts/bench_rw.sh -- --total-vectors 50000 --query-count 500
 - maintenance includes split with defector loopback and scatter merge.
 - Promotion supports Local/Remote/Tiered/Promoting states.
 - Health endpoint reports readiness/version and includes NVMe cache metrics payload.
+- Recovery guard counters are included in health and exposed via optional `/metrics`.
 - Chaos durability test is hardened with health-gated warmup/restart and epoch-specific recovery checks.
 
 Reference #[System View](./SYSTEM_VIEW.md) for a vector lifecycle
