@@ -156,6 +156,13 @@ Metrics exporter (optional):
 - `DRIFT_METRICS_PORT` (fallback; binds `0.0.0.0:<port>`)
 - If either is set, server starts HTTP metrics endpoint at `/metrics`.
 
+KV durability and startup validation:
+
+- `DRIFT_KV_SYNC_INTERVAL_MS` (optional; janitor periodic `kv.sync()` interval, default `5000`)
+- `DRIFT_KV_FORCE_REBUILD_ON_STARTUP` (`1|true|yes|on`; force full KV rebuild from bucket files on startup)
+- `DRIFT_KV_VALIDATE_MAX_BUCKETS` (optional startup validation sample size, default `8`)
+- `DRIFT_KV_VALIDATE_IDS_PER_BUCKET` (optional per-bucket ID validation sample size, default `4`)
+
 ## How to use
 
 ### Run the server

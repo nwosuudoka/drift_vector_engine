@@ -262,7 +262,7 @@ mod tests {
 
     // --- TEST 3: END-TO-END FLOW ---
     #[tokio::test]
-    async fn test_end_to_end_v2_flow() {
+    async fn test_end_to_end_flow() {
         let dir = tempdir().unwrap();
         let (index, disk) = create_index(&dir, 2);
 

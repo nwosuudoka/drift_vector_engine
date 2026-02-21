@@ -36,7 +36,10 @@
 - [x] Metrics export for runtime observability:
   - [x] Health RPC includes recovery-guard counters.
   - [x] Optional Prometheus `/metrics` exporter for NVMe cache + recovery guard counters.
-- [ ] Remove stale V2 naming from remaining logs/tests/docs.
+- [x] Remove stale V2 naming from remaining logs/tests/docs.
+- [x] KV durability hardening:
+  - [x] Janitor periodic + lifecycle `kv.sync()` policy.
+  - [x] Startup KV validation with rebuild on missing/stale mappings.
 
 ## Next Major Step: Payload and Secondary Index Expansion
 

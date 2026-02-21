@@ -320,7 +320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ef_search: 64,
     };
 
-    // ⚡ Initialize V2 Manager
+    // Initialize manager
     let manager = Arc::new(CollectionManager::new(config));
     let service = DriftService {
         manager: manager.clone(),
@@ -336,7 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut deleted_all: HashSet<u64> = HashSet::new();
     let mut next_id = 0;
 
-    println!("🌪️ Starting Churn Simulation (V2)");
+    println!("🌪️ Starting Churn Simulation (v3)");
     println!("   • Base Size: {}", args.base_size);
     println!("   • Churn Rate: {}/cycle", args.churn_batch);
     println!(
@@ -378,7 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_id += 1;
     }
 
-    // In V2, Train is just an insert batch that triggers auto-training
+    // Train is just an insert batch that triggers auto-training
     service
         .train(Request::new(drift_server::drift_proto::TrainRequest {
             collection_name: collection.to_string(),
@@ -411,15 +411,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     force_flush_and_wait(&coll_ref).await;
 
-    // In V2, data is in root/data/<collection>/staging and root/storage/<collection>
+    // Data is in root/data/<collection>/staging and root/storage/<collection>
     // We measure the whole root/data directory for simplicity
     let initial_size = get_dir_size(&root.join("data").join(collection));
 
-    // V2: Use get_router().read().get_snapshot().1.len() ?
-    // Or just rely on the test logic. V2 doesn't expose bucket headers publicly easily without
+    // Use get_router().read().get_snapshot().1.len()?
+    // Or rely on the test logic. Index doesn't expose bucket headers publicly without
     // digging into index internals which are crate-private.
-    // We'll skip printing bucket counts here unless you expose `get_bucket_count()` on IndexV2.
-    // Assuming `get_all_bucket_headers` is NOT available on IndexV2 (it was V1).
+    // We'll skip printing bucket counts here unless `get_bucket_count()` is exposed.
+    // `get_all_bucket_headers` is not available (it was part of older architecture).
     // Let's just print size.
     println!(
         "   💾 Initial Size: {:.2} MB",

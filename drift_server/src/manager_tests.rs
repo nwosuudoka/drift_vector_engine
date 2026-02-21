@@ -4,7 +4,9 @@ mod tests {
     use crate::manager::CollectionManager;
     use drift_core::math::Metric;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
+    use tokio::time::sleep;
 
     const DIM: usize = 128;
 
@@ -24,13 +26,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_manager_initializes_v2_architecture() {
+    async fn test_manager_initializes_collection_architecture() {
         let dir = tempdir().unwrap();
         let config = test_config(dir.path());
         let data_dir = config.data_dir.clone();
         let manager = Arc::new(CollectionManager::new(config));
 
-        let collection_name = "v2_init_test";
+        let collection_name = "init_test";
 
         // 1. Initialize Collection
         let collection = manager
@@ -38,8 +40,8 @@ mod tests {
             .await
             .expect("Failed to create collection");
 
-        // 2. Verify Directory Structure (The V2 Signature)
-        // Root: data/v2_init_test/
+        // 2. Verify directory structure
+        // Root: data/init_test/
         let coll_root = data_dir.join(collection_name);
 
         // Assert these directories were created by the Manager
@@ -56,7 +58,7 @@ mod tests {
         // 3. Verify Components are Live
         let index = &collection.index;
 
-        // Check V2 specific components
+        // Check core components
         // KV should be accessible
         let test_key = 100u64.to_le_bytes();
         assert!(index.get_kv().get(&test_key).is_ok(), "KV store not active");
@@ -149,6 +151,66 @@ mod tests {
                 .to_string()
                 .contains("Metric mismatch")
         );
+    }
+
+    #[tokio::test]
+    async fn test_manager_rebuilds_kv_when_store_files_are_missing_on_restart() {
+        let dir = tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_bucket_capacity = 2;
+        let name = "kv_rebuild_test";
+        let tracked_id = 42u64;
+
+        let expected_bucket = {
+            let manager = Arc::new(CollectionManager::new(config.clone()));
+            let coll = manager
+                .get_or_create(name, Some(DIM), None, Some(Metric::L2))
+                .await
+                .unwrap();
+
+            for i in 0..8 {
+                let id = tracked_id + i;
+                let vec = vec![i as f32; DIM];
+                coll.index.insert(id, &vec).unwrap();
+            }
+
+            let start = Instant::now();
+            let mut mapped_bucket = None;
+            while start.elapsed() < Duration::from_secs(6) {
+                if let Ok(Some(val)) = coll.index.get_kv().get(&tracked_id.to_le_bytes())
+                    && let Ok(raw) = <[u8; 4]>::try_from(val.as_slice())
+                {
+                    mapped_bucket = Some(u32::from_le_bytes(raw));
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+
+            mapped_bucket.expect("initial KV mapping should exist after janitor flush")
+        };
+
+        let kv_base = config.data_dir.join(name).join("kv");
+        std::fs::remove_file(kv_base.with_extension("idx")).unwrap();
+        std::fs::remove_file(kv_base.with_extension("dat")).unwrap();
+
+        let manager2 = Arc::new(CollectionManager::new(config));
+        let coll2 = manager2
+            .get_or_create(name, Some(DIM), None, None)
+            .await
+            .unwrap();
+
+        let rebuilt_mapping = coll2
+            .index
+            .get_kv()
+            .get(&tracked_id.to_le_bytes())
+            .unwrap()
+            .expect("KV mapping should be rebuilt on startup");
+        let rebuilt_bucket = u32::from_le_bytes(
+            <[u8; 4]>::try_from(rebuilt_mapping.as_slice())
+                .expect("rebuilt KV value should be 4-byte bucket id"),
+        );
+
+        assert_eq!(rebuilt_bucket, expected_bucket);
     }
 }
 

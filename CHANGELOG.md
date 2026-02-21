@@ -9,6 +9,10 @@
 - **NVMe cache metrics in API:** `HealthResponse` now includes `NvmeCacheMetrics` sourced from runtime cache counters.
 - **Recovery guard metrics in API:** `HealthResponse` now includes recovery fingerprint-guard counters.
 - **Prometheus metrics exporter:** optional HTTP `/metrics` endpoint exposes NVMe cache and recovery-guard counters for external scraping.
+- **KV durability hardening:**
+  - janitor now performs lifecycle and periodic `kv.sync()` calls,
+  - startup validates sampled `id -> bucket` mappings and auto-rebuilds KV from bucket files when missing/stale,
+  - force rebuild available via `DRIFT_KV_FORCE_REBUILD_ON_STARTUP`.
 - **Cache hardening tests:**
   - byte-budget eviction coverage,
   - cleanup/delete-driven invalidation coverage,

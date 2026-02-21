@@ -68,7 +68,7 @@ impl ServerManifestManager {
 
     /// Returns a clone of the inner wrapper (cheap if using Arc internally,
     /// but ManifestWrapper might be clone-heavy if large.
-    /// For V2 MVP, cloning the metadata is acceptable).
+    /// Cloning the metadata is acceptable for now).
     pub fn get_state(&self) -> ManifestWrapper {
         self.state.read().clone()
     }

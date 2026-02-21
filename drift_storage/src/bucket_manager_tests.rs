@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(stats.total_count, 3);
     }
 
-    // --- TEST: Shadowing via Explicit Delete (V2 Style) ---
+    // --- TEST: Shadowing via explicit delete ---
     #[tokio::test]
     async fn test_bucket_manager_shadowing_view() {
         let dir = tempdir().unwrap();
@@ -303,7 +303,7 @@ mod tests {
         manager.register_bucket(1, "b1.drift".to_string(), StorageClass::Local);
 
         // 2. SHADOW ACTION
-        // In V2, "Shadowing" means marking the disk version as deleted because a newer one exists in RAM.
+        // "Shadowing" means marking the disk version as deleted because a newer one exists in RAM.
         manager.mark_delete(1, 100).expect("Failed to mark delete");
 
         // 3. Search

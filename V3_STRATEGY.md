@@ -46,6 +46,7 @@ This document captures the V3 direction aligned with current implementation and 
 - Cache metrics are exposed via `DiskManager::global_nvme_cache_metrics()`.
 - Provider-agnostic object fingerprints are stored in manifest bucket metadata.
 - Recovery fingerprint guard metrics are exposed in health responses and optional Prometheus `/metrics`.
+- KV durability is hardened with periodic/lifecycle sync and startup validation/rebuild when mappings are missing/stale.
 
 ## Cache Configuration
 

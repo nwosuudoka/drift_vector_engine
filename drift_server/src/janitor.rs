@@ -8,11 +8,32 @@ use drift_core::{index::VectorIndex, lock_manager::BucketCoordinator};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
 use drift_traits::StorageEngine;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{collections::HashMap, io};
 use tokio::sync::Mutex;
 use tokio::time;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+const KV_SYNC_INTERVAL_MS_ENV: &str = "DRIFT_KV_SYNC_INTERVAL_MS";
+
+fn kv_sync_interval_from_env() -> Duration {
+    let default = Duration::from_millis(5_000);
+    match std::env::var(KV_SYNC_INTERVAL_MS_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => {
+                warn!(
+                    "Janitor: invalid {}='{}'; using default {}ms",
+                    KV_SYNC_INTERVAL_MS_ENV,
+                    raw,
+                    default.as_millis()
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
 
 pub struct JanitorVars {
     pub promotion_threshold_bytes: u64,
@@ -84,19 +105,34 @@ impl Janitor {
         let kv = self.index.get_kv();
         let bucket_bytes = bucket_id.to_le_bytes();
         for id in ids {
-            let _ = kv.put(&id.to_le_bytes(), &bucket_bytes);
+            if let Err(e) = kv.put(&id.to_le_bytes(), &bucket_bytes) {
+                warn!(
+                    "Janitor: failed kv.put for id={} bucket={}: {}",
+                    id, bucket_id, e
+                );
+            }
         }
     }
 
     fn remove_kv_mapping(&self, ids: &[u64]) {
         let kv = self.index.get_kv();
         for id in ids {
-            let _ = kv.remove(&id.to_le_bytes());
+            if let Err(e) = kv.remove(&id.to_le_bytes()) {
+                warn!("Janitor: failed kv.remove for id={}: {}", id, e);
+            }
+        }
+    }
+
+    fn sync_kv_best_effort(&self, reason: &str) {
+        if let Err(e) = self.index.get_kv().sync() {
+            warn!("Janitor: kv.sync failed ({reason}): {e}");
         }
     }
 
     pub async fn run(&self) {
         let mut interval = time::interval(self.vars.check_interval);
+        let kv_sync_interval = kv_sync_interval_from_env();
+        let mut last_kv_sync = Instant::now();
         info!("Janitor: Started.");
 
         loop {
@@ -118,6 +154,11 @@ impl Janitor {
             // 4. Check for Promotions (Local -> S3)
             if let Err(e) = self.promote_segments().await {
                 error!("Janitor: Promotion failed: {}", e);
+            }
+
+            if last_kv_sync.elapsed() >= kv_sync_interval {
+                self.sync_kv_best_effort("periodic");
+                last_kv_sync = Instant::now();
             }
         }
     }
@@ -240,6 +281,7 @@ impl Janitor {
 
         // 5. Acknowledge
         self.index.acknowledge_flush(&wal_ids)?;
+        self.sync_kv_best_effort("flush");
 
         Ok(())
     }
@@ -615,7 +657,7 @@ impl Janitor {
         // 5. Update In-Memory Router (Critical for Search)
         // We need to expose a method on Index to update router, or do it here if we have access.
         // Ideally, Index listens to Manifest updates or we call a method.
-        // For V2 MVP, we can call a helper on Index.
+        // Call a helper on Index for the split update.
         self.index
             .apply_split_update(
                 bucket_id,
@@ -640,6 +682,7 @@ impl Janitor {
         self.cleanup
             .delete_local_best_effort(&old_staging, "split-old-staging")
             .await;
+        self.sync_kv_best_effort("split");
 
         info!(
             "Janitor: Split Complete. {} -> {}, {}",
@@ -795,6 +838,7 @@ impl Janitor {
                     .await;
             }
         }
+        self.sync_kv_best_effort("merge");
 
         info!("Janitor: Merge Complete. {} scattered.", zombie_id);
         Ok(())
@@ -802,7 +846,7 @@ impl Janitor {
 
     pub(crate) async fn check_maintainance(&self) {
         // 1. Global Cooling (Decay temperature for all buckets)
-        // V2 API: We tell the storage engine to decay all active temperatures.
+        // Ask the storage layer to decay active temperatures.
         // const TEMPERATURE_COOL_FACTOR: f32 = 0.98;
         self.bucket_manager
             .tick_cooling(self.vars.temperature_cool_factor);
@@ -823,14 +867,14 @@ impl Janitor {
             .collect();
 
         for b in buckets {
-            // 3. Fetch Live Stats from BucketManager (V2 API)
+            // 3. Fetch live stats from BucketManager
             // returns BucketStats { tombstone_count, total_count, temperature, ... }
             let stats = match self.bucket_manager.get_bucket_stats(b.id) {
                 Some(s) => s,
                 None => continue, // Bucket might be deleted or not yet registered
             };
 
-            // Fetch Vector Sum for Drift (V2 API)
+            // Fetch vector sum for drift calculation
             let (current_sum, _drift_count) = self
                 .bucket_manager
                 .get_bucket_drift_stats(b.id)

@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
 
-    println!("🏁 Bench RW (v2)");
+    println!("🏁 Bench RW (v3)");
     println!(
         "   • Vectors: {} (batch {})",
         args.total_vectors, args.batch_size
