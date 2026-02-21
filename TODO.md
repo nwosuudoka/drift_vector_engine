@@ -48,6 +48,13 @@
 - [ ] Pluggable index trait for metadata/text/range fields.
 - [ ] First production secondary index implementation (exact match + range baseline).
 
+## Deferred (Post-Expansion Hardening)
+
+- [ ] Cache integrity verification off query path:
+  - [ ] Keep query read path free of per-request checksum/fingerprint verification overhead.
+  - [ ] Add background cache scrubber to sample cached objects and invalidate mismatches asynchronously.
+  - [ ] Keep startup/recovery fingerprint guard as the primary online integrity gate.
+
 ## Future: Distributed Drift Cluster
 
 - [ ] Consensus layer for shard ownership (OpenRaft or etcd-backed).
