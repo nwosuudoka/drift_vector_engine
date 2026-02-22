@@ -174,7 +174,11 @@ mod tests {
 #[cfg(test)]
 mod persistence_integration_tests {
     use crate::persistence::PersistenceManager;
-    use drift_storage::bucket_file_reader::BucketFileReader;
+    use drift_storage::unified_format::{
+        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadRow, UnifiedPayloadSchema,
+        UnifiedPayloadValue,
+    };
+    use drift_storage::unified_reader::UnifiedReader;
     use opendal::{Operator, services};
     use tempfile::tempdir;
 
@@ -213,7 +217,7 @@ mod persistence_integration_tests {
             .expect("Initial promotion failed");
 
         assert_eq!(count_1, 10);
-        let key_1 = format!("bucket_{}_{}.drift", bucket_id, run_id_1);
+        let key_1 = format!("bucket_{}_{}.driftu", bucket_id, run_id_1);
 
         // Verify file exists
         assert!(op.exists(&key_1).await.unwrap());
@@ -246,14 +250,14 @@ mod persistence_integration_tests {
             .expect("Merge promotion failed");
 
         assert_eq!(count_2, 20, "Should contain 10 old + 10 new items");
-        let key_2 = format!("bucket_{}_{}.drift", bucket_id, run_id_2);
+        let key_2 = format!("bucket_{}_{}.driftu", bucket_id, run_id_2);
 
         // ==========================================================
         // PHASE 3: Verification (Read Back)
         // ==========================================================
         println!("Phase 3: Verify Merged Data...");
 
-        let mut reader = BucketFileReader::open(op.clone(), &key_2)
+        let mut reader = UnifiedReader::open(op.clone(), &key_2)
             .await
             .expect("Failed to open merged file");
 
@@ -278,6 +282,74 @@ mod persistence_integration_tests {
         assert_eq!(read_vecs[idx_0][0], 1.0);
 
         println!("✅ Persistence Integration Test Passed!");
+    }
+
+    #[tokio::test]
+    async fn test_persistence_writes_and_reads_payload_schema() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op.clone());
+        let bucket_id = 7;
+        let dim = 3;
+
+        let ids = vec![10, 11];
+        let flat = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let schema = UnifiedPayloadSchema::new(vec![
+            UnifiedFieldSchema {
+                field_id: 1,
+                name: "tenant".to_string(),
+                logical_type: UnifiedLogicalType::Keyword,
+                nullable: false,
+                indexed: true,
+            },
+            UnifiedFieldSchema {
+                field_id: 2,
+                name: "ts".to_string(),
+                logical_type: UnifiedLogicalType::TimestampMicros,
+                nullable: false,
+                indexed: true,
+            },
+        ]);
+        let rows: Vec<UnifiedPayloadRow> = vec![
+            std::collections::BTreeMap::from([
+                (1, UnifiedPayloadValue::Keyword("tenant_a".to_string())),
+                (2, UnifiedPayloadValue::TimestampMicros(1_700_000)),
+            ]),
+            std::collections::BTreeMap::from([
+                (1, UnifiedPayloadValue::Keyword("tenant_b".to_string())),
+                (2, UnifiedPayloadValue::TimestampMicros(1_700_100)),
+            ]),
+        ];
+
+        let (run_id, count) = persistence
+            .write_remote_bucket_unified_flat_with_payload(
+                bucket_id,
+                &ids,
+                &flat,
+                dim,
+                Some(&schema),
+                Some(&rows),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, ids.len() as u64);
+
+        let key = format!("bucket_{}_{}.driftu", bucket_id, run_id);
+        let reader = UnifiedReader::open(op.clone(), &key).await.unwrap();
+        let decoded = reader.read_payload_schema().await.unwrap();
+        assert_eq!(decoded, Some(schema.clone()));
+
+        let via_persistence = persistence
+            .read_remote_bucket_payload_schema(bucket_id, &run_id)
+            .await
+            .unwrap();
+        assert_eq!(via_persistence, Some(schema));
+
+        let payload_rows = persistence
+            .read_remote_bucket_payload_rows(bucket_id, &run_id)
+            .await
+            .unwrap();
+        assert_eq!(payload_rows, rows);
     }
 }
 

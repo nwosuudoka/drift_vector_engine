@@ -298,12 +298,11 @@ mod janitor_split_test {
     use drift_core::index::VectorIndex;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
-    use drift_core::quantizer::Quantizer;
     use drift_core::router::Router;
     use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
-    use drift_storage::bucket_file_writer::BucketFileWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_storage::unified_writer::UnifiedLocalWriter;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
     use std::sync::Arc;
@@ -322,12 +321,8 @@ mod janitor_split_test {
         dim: usize,
     ) {
         let path = dir.join(filename);
-        let file = std::fs::File::create(&path).unwrap();
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
-        let q = Quantizer::train(&flat, dim);
-        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-        writer.write_batch(ids, &flat).unwrap();
-        writer.finalize().unwrap();
+        UnifiedLocalWriter::write_vector_only_flat_to_path(&path, ids, &flat, dim).unwrap();
     }
 
     #[tokio::test]
@@ -389,7 +384,7 @@ mod janitor_split_test {
             vecs.push(vec![10.0 + 0.1 * (i as f32), 10.0 + 0.1 * (i as f32)]);
         }
 
-        let filename = "bucket_1.drift";
+        let filename = "bucket_1.driftu";
         create_bucket_file(&data_dir, filename, &ids, &vecs, dim).await;
 
         // Register in Manager & Manifest
@@ -464,12 +459,11 @@ mod edge_case_tests {
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::manifest::pb::Centroid;
     use drift_core::math::Metric;
-    use drift_core::quantizer::Quantizer;
     use drift_core::router::Router;
     use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
-    use drift_storage::bucket_file_writer::BucketFileWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_storage::unified_writer::UnifiedLocalWriter;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
     use std::sync::Arc;
@@ -536,12 +530,8 @@ mod edge_case_tests {
         dim: usize,
     ) {
         let path = dir.join("data").join(name);
-        let file = std::fs::File::create(&path).unwrap();
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
-        let q = Quantizer::train(&flat, dim);
-        let mut w = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-        w.write_batch(ids, &flat).unwrap();
-        w.finalize().unwrap();
+        UnifiedLocalWriter::write_vector_only_flat_to_path(path, ids, &flat, dim).unwrap();
     }
 
     // --- TEST 1: SINGULARITY DETECTION ---
@@ -557,8 +547,8 @@ mod edge_case_tests {
         let ids: Vec<u64> = (0..count).collect();
         let vecs = vec![vec![10.0, 10.0]; count as usize];
 
-        create_bucket_file(dir.path(), "singularity.drift", &ids, &vecs, dim).await;
-        bucket_mgr.register_bucket(1, "singularity.drift".into(), StorageClass::Local);
+        create_bucket_file(dir.path(), "singularity.driftu", &ids, &vecs, dim).await;
+        bucket_mgr.register_bucket(1, "singularity.driftu".into(), StorageClass::Local);
 
         // 2. Attempt Split
         let result = index.calculate_split(1).await.unwrap();
@@ -613,8 +603,8 @@ mod edge_case_tests {
             vecs.push(vec![130.0; dim]);
         }
 
-        create_bucket_file(dir.path(), "mixed.drift", &ids, &vecs, dim).await;
-        bucket_mgr.register_bucket(1, "mixed.drift".into(), StorageClass::Local);
+        create_bucket_file(dir.path(), "mixed.driftu", &ids, &vecs, dim).await;
+        bucket_mgr.register_bucket(1, "mixed.driftu".into(), StorageClass::Local);
 
         // 2. Setup Neighbor Bucket (ID 2 at [140.0])
         {
@@ -667,20 +657,20 @@ mod edge_case_tests {
         // 1. Remote Base (IDs 0-49)
         let ids_base: Vec<u64> = (0..50).collect();
         let vecs_base = vec![vec![0.0, 0.0]; 50];
-        create_bucket_file(dir.path(), "base.drift", &ids_base, &vecs_base, dim).await;
+        create_bucket_file(dir.path(), "base.driftu", &ids_base, &vecs_base, dim).await;
 
         // 2. Local Delta (IDs 50-99)
         let ids_delta: Vec<u64> = (50..100).collect();
         let vecs_delta = vec![vec![10.0, 10.0]; 50];
-        create_bucket_file(dir.path(), "delta.drift", &ids_delta, &vecs_delta, dim).await;
+        create_bucket_file(dir.path(), "delta.driftu", &ids_delta, &vecs_delta, dim).await;
 
         // 3. Register Tiered
         bucket_mgr.register_bucket_with_count(
             1,
             "ignored".into(),
             StorageClass::Tiered {
-                remote_path: "base.drift".into(),
-                local_path: "delta.drift".into(),
+                remote_path: "base.driftu".into(),
+                local_path: "delta.driftu".into(),
             },
             100,
         );
@@ -721,12 +711,11 @@ mod janitor_scatter_merge_test {
     use drift_core::index::VectorIndex;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
-    use drift_core::quantizer::Quantizer;
     use drift_core::router::Router;
     use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
-    use drift_storage::bucket_file_writer::BucketFileWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_storage::unified_writer::UnifiedLocalWriter;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
@@ -747,21 +736,8 @@ mod janitor_scatter_merge_test {
         dim: usize,
     ) {
         let path = dir.join(filename);
-        let file = std::fs::File::create(&path).unwrap();
-        // Flatten vectors
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
-        // Handle empty case for quantization
-        let q = if !flat.is_empty() {
-            Quantizer::train(&flat, dim)
-        } else {
-            Quantizer::train(&vec![0.0; dim], dim)
-        };
-
-        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-        if !ids.is_empty() {
-            writer.write_batch(ids, &flat).unwrap();
-        }
-        writer.finalize().unwrap();
+        UnifiedLocalWriter::write_vector_only_flat_to_path(path, ids, &flat, dim).unwrap();
     }
 
     async fn setup_env(
@@ -853,7 +829,7 @@ mod janitor_scatter_merge_test {
         let b1_vecs = vec![c1.clone(); 5];
         create_bucket_file(
             staging.get_base_path(),
-            "bucket_1.drift",
+            "bucket_1.driftu",
             &b1_ids,
             &b1_vecs,
             dim,
@@ -865,18 +841,18 @@ mod janitor_scatter_merge_test {
         let b2_vecs = vec![c2.clone(); 50];
         create_bucket_file(
             staging.get_base_path(),
-            "bucket_2.drift",
+            "bucket_2.driftu",
             &b2_ids,
             &b2_vecs,
             dim,
         )
         .await;
 
-        staging.set_active_filename(1, "bucket_1.drift".into());
-        staging.set_active_filename(2, "bucket_2.drift".into());
+        staging.set_active_filename(1, "bucket_1.driftu".into());
+        staging.set_active_filename(2, "bucket_2.driftu".into());
 
-        bucket_mgr.register_bucket(1, "bucket_1.drift".into(), StorageClass::Local);
-        bucket_mgr.register_bucket(2, "bucket_2.drift".into(), StorageClass::Local);
+        bucket_mgr.register_bucket(1, "bucket_1.driftu".into(), StorageClass::Local);
+        bucket_mgr.register_bucket(2, "bucket_2.driftu".into(), StorageClass::Local);
 
         bucket_mgr
             .update_bucket_drift(1, &vec![0.0; dim], 5)
@@ -938,7 +914,7 @@ mod janitor_scatter_merge_test {
         let b1_vecs = vec![c1.clone(); large_count];
         create_bucket_file(
             staging.get_base_path(),
-            "bucket_1.drift",
+            "bucket_1.driftu",
             &vec![0; large_count],
             &b1_vecs,
             dim,
@@ -947,15 +923,15 @@ mod janitor_scatter_merge_test {
 
         create_bucket_file(
             staging.get_base_path(),
-            "bucket_2.drift",
+            "bucket_2.driftu",
             &vec![0; 10],
             &vec![c2.clone(); 10],
             dim,
         )
         .await;
 
-        staging.set_active_filename(1, "bucket_1.drift".into());
-        bucket_mgr.register_bucket(1, "bucket_1.drift".into(), StorageClass::Local);
+        staging.set_active_filename(1, "bucket_1.driftu".into());
+        bucket_mgr.register_bucket(1, "bucket_1.driftu".into(), StorageClass::Local);
         bucket_mgr
             .update_bucket_drift(1, &vec![0.0; dim], large_count as u32)
             .unwrap();
@@ -994,10 +970,10 @@ mod janitor_scatter_merge_test {
 
         // If it has data but no neighbors, index returns SkippedTooSmall to prevent data loss.
         // If it is EMPTY, index returns Empty Proposal, allowing deletion.
-        create_bucket_file(staging.get_base_path(), "bucket_1.drift", &[], &[], dim).await;
+        // No local file is created here; missing component resolves to empty in fetch path.
 
-        staging.set_active_filename(1, "bucket_1.drift".into());
-        bucket_mgr.register_bucket(1, "bucket_1.drift".into(), StorageClass::Local);
+        staging.set_active_filename(1, "bucket_1.driftu".into());
+        bucket_mgr.register_bucket(1, "bucket_1.driftu".into(), StorageClass::Local);
         // Zero drift stats
         bucket_mgr.update_bucket_drift(1, &c1, 0).unwrap();
 
@@ -1019,7 +995,7 @@ mod janitor_scatter_merge_test {
             "Empty zombie bucket should be deleted"
         );
 
-        let path = staging.get_base_path().join("bucket_1.drift");
+        let path = staging.get_base_path().join("bucket_1.driftu");
         assert!(!path.exists(), "File should be deleted");
     }
 }
@@ -1034,12 +1010,14 @@ mod janitor_promotion_test {
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
     use drift_core::partitioner::PartitionGroup;
-    use drift_core::quantizer::Quantizer;
     use drift_core::router::Router;
     use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
-    use drift_storage::bucket_file_writer::BucketFileWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_storage::unified_format::{
+        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadSchema,
+    };
+    use drift_storage::unified_writer::UnifiedLocalWriter;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
@@ -1052,24 +1030,19 @@ mod janitor_promotion_test {
         Operator::new(builder).unwrap().finish()
     }
 
-    /// Helper to write a valid .drift segment file manually (simulating an old S3 flush)
+    /// Helper to write a valid .driftu segment file manually (simulating an old S3 flush)
     async fn create_s3_segment(
         dir: &std::path::Path,
         filename: &str,
         ids: &[u64],
         vecs: &[Vec<f32>],
         dim: usize,
+        schema: Option<&UnifiedPayloadSchema>,
     ) {
         let path = dir.join(filename);
-        let file = std::fs::File::create(&path).unwrap();
-
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
-        let q = Quantizer::train(&flat, dim);
-
-        // We use new_streaming to create a proper segment with header/footer
-        let mut writer = BucketFileWriter::new_streaming(file, [1u8; 16], q, dim).unwrap();
-        writer.write_batch(ids, &flat).unwrap();
-        writer.finalize().unwrap();
+        UnifiedLocalWriter::write_vector_with_schema_flat_to_path(&path, ids, &flat, dim, schema)
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1079,6 +1052,13 @@ mod janitor_promotion_test {
         std::fs::create_dir(&data_dir).unwrap();
         let dim = 2;
         let bucket_id = 1;
+        let schema = UnifiedPayloadSchema::new(vec![UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
 
         // --- SETUP COMPONENTS ---
         let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
@@ -1114,10 +1094,11 @@ mod janitor_promotion_test {
         let remote_vecs = vec![vec![1.0, 1.0]; 10];
         create_s3_segment(
             &data_dir,
-            "bucket_1_run_OLD.drift",
+            "bucket_1_run_OLD.driftu",
             &remote_ids,
             &remote_vecs,
             dim,
+            Some(&schema),
         )
         .await;
 
@@ -1131,7 +1112,10 @@ mod janitor_promotion_test {
         group.count = 10;
 
         // Write to staging and register as Active
-        staging.append_batch(bucket_id, &group).await.unwrap();
+        staging
+            .append_batch_with_schema(bucket_id, &group, Some(&schema))
+            .await
+            .unwrap();
 
         // Register the Tiered State (simulating startup or previous operations)
         // Note: Janitor expects a file in staging to exist for promotion logic
@@ -1139,9 +1123,9 @@ mod janitor_promotion_test {
 
         bucket_manager.register_bucket(
             bucket_id,
-            "bucket_1_run_OLD.drift".to_string(), // Currently pointing to remote
+            "bucket_1_run_OLD.driftu".to_string(), // Currently pointing to remote
             StorageClass::Tiered {
-                remote_path: "bucket_1_run_OLD.drift".to_string(),
+                remote_path: "bucket_1_run_OLD.driftu".to_string(),
                 local_path: staging_file.clone(), // But also has local data
             },
         );
@@ -1215,27 +1199,30 @@ mod janitor_promotion_test {
             !b1.object_fingerprint.is_empty(),
             "Object fingerprint should be recorded in manifest"
         );
+        let expected_ext = "driftu";
         assert_eq!(
             b1.object_path,
-            format!("bucket_{}_{}.drift", bucket_id, b1.run_id)
+            format!("bucket_{}_{}.{}", bucket_id, b1.run_id, expected_ext)
         );
 
         // 2. Check S3 File Content
-        let new_key = format!("bucket_1_{}.drift", b1.run_id);
+        let new_key = format!("bucket_1_{}.{}", b1.run_id, expected_ext);
         assert!(
             op.exists(&new_key).await.unwrap(),
             "New S3 segment should exist"
         );
 
-        let (stored_ids, _) = persistence
-            .read_remote_bucket(bucket_id, &b1.run_id)
-            .await
-            .unwrap();
+        let (stored_ids, _) = persistence.read_remote_bucket_path(&new_key).await.unwrap();
         assert_eq!(stored_ids.len(), 18);
         assert!(!stored_ids.contains(&5), "ID 5 should be purged");
         assert!(!stored_ids.contains(&15), "ID 15 should be purged");
         assert!(stored_ids.contains(&0), "ID 0 should remain");
         assert!(stored_ids.contains(&19), "ID 19 should remain");
+        let decoded_schema = persistence
+            .read_remote_bucket_payload_schema(bucket_id, &b1.run_id)
+            .await
+            .unwrap();
+        assert_eq!(decoded_schema, Some(schema));
 
         // 3. Check Memory Reconcile (Pruning)
         // The bucket's specific tombstones should now be empty (since we flushed them)
@@ -1251,7 +1238,7 @@ mod janitor_promotion_test {
         assert!(!staging_path.exists(), "Staging file should be deleted");
 
         // Old S3 file should be gone
-        let old_path = data_dir.join("bucket_1_run_OLD.drift");
+        let old_path = data_dir.join("bucket_1_run_OLD.driftu");
         assert!(!old_path.exists(), "Old S3 segment should be deleted");
     }
 }

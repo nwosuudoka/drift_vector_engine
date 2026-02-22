@@ -25,7 +25,7 @@ mod tests {
         assert_eq!(loaded.get_buckets()[0].run_id, "run_abc_123");
         assert_eq!(
             loaded.get_buckets()[0].object_path,
-            "bucket_100_run_abc_123.drift"
+            "bucket_100_run_abc_123.driftu"
         );
         assert_eq!(loaded.get_centroids().len(), 1);
     }
@@ -54,7 +54,7 @@ mod tests {
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].id, 100);
         assert_eq!(buckets[0].run_id, "run_A");
-        assert_eq!(buckets[0].object_path, "bucket_100_run_A.drift");
+        assert_eq!(buckets[0].object_path, "bucket_100_run_A.driftu");
         assert!(buckets[0].object_fingerprint.is_empty());
 
         let centroids = manifest.get_centroids();
@@ -74,7 +74,7 @@ mod tests {
         let buckets_after = manifest.get_buckets();
         assert_eq!(buckets_after.len(), 1); // Still 1
         assert_eq!(buckets_after[0].run_id, "run_B"); // Updated run_id
-        assert_eq!(buckets_after[0].object_path, "bucket_100_run_B.drift");
+        assert_eq!(buckets_after[0].object_path, "bucket_100_run_B.driftu");
         assert_eq!(buckets_after[0].vector_count, 0); // Reset count (as per add_bucket logic)
     }
 
@@ -160,13 +160,13 @@ mod tests {
         manifest.update_bucket_remote_meta(
             42,
             "run_new".to_string(),
-            "remote/custom/path_42.drift".to_string(),
+            "remote/custom/path_42.driftu".to_string(),
             "len=123|etag=abc".to_string(),
         );
 
         let bucket = manifest.get_buckets().iter().find(|b| b.id == 42).unwrap();
         assert_eq!(bucket.run_id, "run_new");
-        assert_eq!(bucket.object_path, "remote/custom/path_42.drift");
+        assert_eq!(bucket.object_path, "remote/custom/path_42.driftu");
         assert_eq!(bucket.object_fingerprint, "len=123|etag=abc");
     }
 

@@ -3,12 +3,14 @@ mod tests {
     use super::super::local_staging::LocalStagingManager;
     use drift_core::lock_manager::BucketCoordinator; // ⚡ Import Coordinator
     use drift_core::partitioner::PartitionGroup;
-    use drift_storage::format::{DriftFooter, FOOTER_SIZE, MAGIC_CURRENT};
-    use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
+    use drift_storage::unified_format::{
+        UnifiedBlockType, UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadSchema,
+    };
+    use drift_storage::unified_reader::UnifiedReader;
+    use opendal::{Operator, services};
+    use std::collections::HashSet;
     use std::sync::Arc;
     use tempfile::tempdir;
-    use zerocopy::FromBytes;
 
     // --- HELPERS ---
 
@@ -34,16 +36,30 @@ mod tests {
         }
     }
 
-    fn read_row_group_count(path: &std::path::Path) -> u32 {
-        let mut file = File::open(path).expect("failed to open file");
-        let len = file.metadata().unwrap().len();
-        file.seek(SeekFrom::Start(len - FOOTER_SIZE as u64))
-            .unwrap();
-        let mut buf = [0u8; FOOTER_SIZE];
-        file.read_exact(&mut buf).unwrap();
-        let footer = DriftFooter::read_from_bytes(&buf).unwrap();
-        assert_eq!(footer.magic, MAGIC_CURRENT);
-        footer.row_group_count
+    async fn read_row_group_count(path: &std::path::Path) -> u32 {
+        let root = path.parent().unwrap().to_str().unwrap().to_string();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let reader = UnifiedReader::open(op, &filename).await.unwrap();
+        let mut groups = HashSet::new();
+        for block in reader.blocks {
+            if block.block_type == UnifiedBlockType::Ids {
+                groups.insert((block.row_start, block.row_count));
+            }
+        }
+        groups.len() as u32
+    }
+
+    async fn read_payload_schema(path: &std::path::Path) -> Option<UnifiedPayloadSchema> {
+        let root = path.parent().unwrap().to_str().unwrap().to_string();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let reader = UnifiedReader::open(op, &filename).await.unwrap();
+        reader.read_payload_schema().await.unwrap()
     }
 
     // --- TESTS ---
@@ -60,15 +76,45 @@ mod tests {
         let size1 = manager.append_batch(bucket_id, &batch1).await.unwrap();
         assert_eq!(size1, 10);
 
-        let file_path = dir.path().join(format!("bucket_{}.drift", bucket_id));
+        let file_path = dir.path().join(format!("bucket_{}.driftu", bucket_id));
         assert!(file_path.exists());
-        assert_eq!(read_row_group_count(&file_path), 1);
+        assert_eq!(read_row_group_count(&file_path).await, 1);
 
         // 2. Second Write
         let batch2 = create_batch(10, 5, dim, None);
         let size2 = manager.append_batch(bucket_id, &batch2).await.unwrap();
         assert_eq!(size2, 15);
-        assert_eq!(read_row_group_count(&file_path), 2);
+        assert_eq!(read_row_group_count(&file_path).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_staging_append_with_schema_persists_schema_block() {
+        let dir = tempdir().unwrap();
+        let manager = LocalStagingManager::new(dir.path()).unwrap();
+        let bucket_id = 2;
+        let dim = 4;
+        let schema = UnifiedPayloadSchema::new(vec![UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+
+        let batch1 = create_batch(100, 4, dim, None);
+        let size1 = manager
+            .append_batch_with_schema(bucket_id, &batch1, Some(&schema))
+            .await
+            .unwrap();
+        assert_eq!(size1, 4);
+
+        let batch2 = create_batch(104, 2, dim, None);
+        let size2 = manager.append_batch(bucket_id, &batch2).await.unwrap();
+        assert_eq!(size2, 6);
+
+        let file_path = dir.path().join(format!("bucket_{}.driftu", bucket_id));
+        let decoded_schema = read_payload_schema(&file_path).await;
+        assert_eq!(decoded_schema, Some(schema));
     }
 
     #[tokio::test]
@@ -107,8 +153,8 @@ mod tests {
             h.await.unwrap();
         }
 
-        let path = dir.path().join(format!("bucket_{}.drift", bucket_id));
-        let rg_count = read_row_group_count(&path);
+        let path = dir.path().join(format!("bucket_{}.driftu", bucket_id));
+        let rg_count = read_row_group_count(&path).await;
 
         assert_eq!(
             rg_count, num_tasks as u32,
@@ -121,9 +167,8 @@ mod tests {
 mod race_cond_tests {
     use crate::local_staging::LocalStagingManager;
     use drift_core::lock_manager::BucketCoordinator; // ⚡ Import
-    use drift_core::math::Metric;
     use drift_core::partitioner::PartitionGroup;
-    use drift_storage::bucket_file_reader::BucketFileReader;
+    use drift_storage::unified_reader::UnifiedReader;
     use opendal::{Operator, services};
     use std::sync::Arc;
     use std::time::Duration;
@@ -157,7 +202,7 @@ mod race_cond_tests {
 
         let bucket_id = 1;
         let dim = 8;
-        let filename = format!("bucket_{}.drift", bucket_id);
+        let filename = format!("bucket_{}.driftu", bucket_id);
 
         // 1. Initialize
         let initial = create_batch(0, 100, dim);
@@ -198,13 +243,9 @@ mod race_cond_tests {
                 let _guard = c_reader.read(bucket_id).await;
 
                 // Now it's safe to open and read
-                match BucketFileReader::open(op.clone(), &filename).await {
+                match UnifiedReader::open(op.clone(), &filename).await {
                     Ok(mut reader) => {
-                        if reader
-                            .scan(&[0.0; 8], 1, Metric::L2, &drift_traits::mock::NoTombstones)
-                            .await
-                            .is_ok()
-                        {
+                        if reader.read_all_vectors_flat().await.is_ok() {
                             successes += 1;
                         } else {
                             failures += 1;

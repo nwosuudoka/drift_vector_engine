@@ -419,11 +419,11 @@ impl Janitor {
 
             // 1. Rotate Local File
             let staging_filename = format!(
-                "bucket_{}_staging_{}.drift",
+                "bucket_{}_staging_{}.driftu",
                 bucket_id,
                 uuid::Uuid::new_v4()
             );
-            let new_filename = format!("bucket_{}_{}.drift", bucket_id, uuid::Uuid::new_v4());
+            let new_filename = format!("bucket_{}_{}.driftu", bucket_id, uuid::Uuid::new_v4());
 
             let rotated = self
                 .staging
@@ -464,10 +464,17 @@ impl Janitor {
             );
 
             // --- ⚡ EXPLICIT MERGE & FILTER LOGIC ---
+            let dim = self.index.get_dim();
 
             // A. Read Local Staging
-            let (mut merged_ids, mut merged_vecs) =
-                self.staging.read_file_content(&staging_filename).await?;
+            let (mut merged_ids, mut merged_flat) = self
+                .staging
+                .read_file_content_flat(&staging_filename)
+                .await?;
+            let mut merged_schema = self
+                .staging
+                .read_file_payload_schema(&staging_filename)
+                .await?;
             if merged_ids.is_empty() {
                 self.cleanup
                     .delete_local_best_effort(&staging_filename, "promotion-empty-staging")
@@ -477,46 +484,77 @@ impl Janitor {
 
             // B. Read Remote (if exists)
             if let Some(path) = &remote_path_opt {
-                // Extract RunID from path "bucket_{id}_{uuid}.drift"
-                if let Some(run_id) = path
-                    .strip_prefix(&format!("bucket_{}_", bucket_id))
-                    .and_then(|s| s.strip_suffix(".drift"))
-                {
-                    let (r_ids, r_vecs) = self
-                        .persistence
-                        .read_remote_bucket(bucket_id, run_id)
-                        .await?;
-                    merged_ids.extend(r_ids);
-                    merged_vecs.extend(r_vecs);
+                let (r_ids, r_flat) = self.persistence.read_remote_bucket_path_flat(path).await?;
+                let r_schema = self
+                    .persistence
+                    .read_remote_bucket_payload_schema_path(path)
+                    .await?;
+                if let Some(remote_schema) = r_schema {
+                    if let Some(local_schema) = &merged_schema {
+                        if local_schema != &remote_schema {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "promotion payload schema mismatch for bucket {}",
+                                    bucket_id
+                                ),
+                            ));
+                        }
+                    } else {
+                        merged_schema = Some(remote_schema);
+                    }
                 }
+                merged_ids.extend(r_ids);
+                merged_flat.extend(r_flat);
             }
 
             // C. Snapshot Tombstones (Atomic Arc clone)
+            let rows_from_vectors = merged_flat.len() / dim;
+            if rows_from_vectors < merged_ids.len() {
+                tracing::warn!(
+                    "Janitor: merged row mismatch for bucket {} (ids={}, vectors={})",
+                    bucket_id,
+                    merged_ids.len(),
+                    rows_from_vectors
+                );
+                merged_ids.truncate(rows_from_vectors);
+                merged_flat.truncate(rows_from_vectors * dim);
+            }
 
             // D. Filter (Purge)
             let mut final_ids = Vec::with_capacity(merged_ids.len());
-            let mut final_vecs = Vec::with_capacity(merged_vecs.len());
+            let mut final_flat = Vec::with_capacity(merged_flat.len());
 
-            for (id, vec) in merged_ids.into_iter().zip(merged_vecs.into_iter()) {
+            for (row_idx, id) in merged_ids.into_iter().enumerate() {
                 if !tombstone_snapshot.contains(&id) {
+                    let start = row_idx * dim;
+                    let end = start + dim;
+                    if end > merged_flat.len() {
+                        break;
+                    }
                     final_ids.push(id);
-                    final_vecs.push(vec);
+                    final_flat.extend_from_slice(&merged_flat[start..end]);
                 }
             }
 
             let final_count = final_ids.len() as u32;
 
             // E. Write to S3
-            let dim = self.index.get_dim();
             let (new_run_id, _) = self
                 .persistence
-                .write_remote_bucket(bucket_id, &final_ids, &final_vecs, dim)
+                .write_remote_bucket_unified_flat_with_schema(
+                    bucket_id,
+                    &final_ids,
+                    &final_flat,
+                    dim,
+                    merged_schema.as_ref(),
+                )
                 .await?;
 
             // --- END EXPLICIT LOGIC ---
 
             // 3. Finalize Registry (Tiered)
-            let new_remote_path = format!("bucket_{}_{}.drift", bucket_id, new_run_id);
+            let new_remote_path = format!("bucket_{}_{}.driftu", bucket_id, new_run_id);
             let new_remote_fingerprint = match self
                 .persistence
                 .object_fingerprint_for_path(&new_remote_path)
@@ -733,7 +771,7 @@ impl Janitor {
 
         for (target_id, group) in &proposal.moves {
             // A. New File Name
-            let new_filename = format!("bucket_{}_{}.drift", target_id, uuid::Uuid::new_v4());
+            let new_filename = format!("bucket_{}_{}.driftu", target_id, uuid::Uuid::new_v4());
 
             // B. Read Old Data (to merge)
             let (mut ids, mut vecs) = self.staging.read_full_bucket(*target_id).await?;

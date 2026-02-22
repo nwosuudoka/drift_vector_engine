@@ -1,7 +1,8 @@
-use crate::bucket_file_reader::BucketFileReader;
+use crate::unified_reader::UnifiedReader;
 use atomic_float::AtomicF32;
 use drift_core::lock_manager::BucketCoordinator;
 use drift_core::math::Metric;
+use drift_core::metric_strategy::strategy_for;
 use drift_traits::{BucketStats, StorageEngine, TombstoneView};
 use futures::future::join_all;
 use opendal::Operator;
@@ -309,34 +310,42 @@ impl StorageEngine for BucketManager {
 
                 let mut refined_results = Vec::new();
                 for (op, path, label) in ops_to_scan {
-                    match BucketFileReader::open(op, &path).await {
+                    match UnifiedReader::open(op, &path).await {
                         Ok(mut reader) => {
-                            if let Ok(candidates) = reader
-                                .scan(&query, oversample_factor, metric, bucket_view.as_ref())
-                                .await
-                            {
-                                let dim = reader
-                                    .quantizer
-                                    .as_ref()
-                                    .map(|q| q.min.len())
-                                    .unwrap_or(query.len());
-                                if let Ok(matches) =
-                                    reader.refine(candidates, &query, dim, metric).await
-                                {
-                                    refined_results.extend(matches);
+                            if let Ok((ids, flat_vectors)) = reader.read_all_vectors_flat().await {
+                                let scorer = strategy_for(metric);
+                                let dim = query.len();
+                                let mut exact_matches = Vec::new();
+
+                                for (row_idx, id) in ids.into_iter().enumerate() {
+                                    if bucket_view.contains(id) {
+                                        continue;
+                                    }
+                                    let start = row_idx * dim;
+                                    let end = start + dim;
+                                    if end > flat_vectors.len() {
+                                        break;
+                                    }
+                                    let candidate = &flat_vectors[start..end];
+                                    exact_matches.push((id, scorer.score(&query, candidate)));
                                 }
+
+                                exact_matches.sort_by(|a, b| {
+                                    a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal)
+                                });
+                                if exact_matches.len() > oversample_factor {
+                                    exact_matches.truncate(oversample_factor);
+                                }
+                                refined_results.extend(exact_matches);
                             }
                         }
                         Err(e) => {
-                            // If file missing inside lock, it's a real error (unless empty bucket edge case)
-                            if !e.to_string().contains("File too small") {
-                                tracing::warn!(
-                                    "⚠️ BucketManager: Failed to open {} ({}): {}",
-                                    path,
-                                    label,
-                                    e
-                                );
-                            }
+                            tracing::warn!(
+                                "⚠️ BucketManager: Failed to open {} ({}): {}",
+                                path,
+                                label,
+                                e
+                            );
                         }
                     }
                 }
@@ -400,19 +409,20 @@ impl StorageEngine for BucketManager {
         let mut merged_vecs_flat = Vec::new();
 
         for (op, path) in ops_to_scan {
-            match BucketFileReader::open(op, &path).await {
+            match UnifiedReader::open(op, &path).await {
                 Ok(mut reader) => {
-                    // Read (IDs, Vec<Vec<f32>>)
-                    if let Ok((ids, vecs)) = reader.read_all_vectors().await {
+                    if let Ok((ids, flat)) = reader.read_all_vectors_flat().await {
                         merged_ids.extend(ids);
-                        for v in vecs {
-                            merged_vecs_flat.extend(v);
-                        }
+                        merged_vecs_flat.extend(flat);
                     }
                 }
                 Err(e) => {
                     // If a tiered file is missing, that's critical data loss (or config error)
-                    tracing::warn!("fetch_bucket: Failed to read component {}: {}", path, e);
+                    tracing::warn!(
+                        "fetch_bucket: Failed to read unified component {}: {}",
+                        path,
+                        e
+                    );
                     // We continue best-effort? No, for maintenance we want strict correctness.
                     // But for now, let's log and continue to avoid crashing the Janitor loop.
                 }

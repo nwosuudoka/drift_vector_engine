@@ -161,14 +161,14 @@ mod s3_tests {
         for obj in contents {
             let key = obj.key().unwrap_or("<none>");
             println!(" - {key}");
-            if key.contains(collection) && key.ends_with(".drift") {
+            if key.contains(collection) && key.ends_with(".driftu") {
                 found_segment = true;
             }
         }
 
         assert!(
             found_segment,
-            "Failed to find flushed .drift segment in MinIO bucket"
+            "Failed to find flushed .driftu segment in MinIO bucket"
         );
 
         // 6) Verify Read (Search)

@@ -930,7 +930,7 @@ impl DiskManager {
 #[derive(Clone)]
 pub struct DriftPageManager {
     op: Operator,
-    // Maps FileID -> Relative Path (e.g., 1 -> "segment_1.drift")
+    // Maps FileID -> Relative Path (e.g., 1 -> "segment_1.driftu")
     files: Arc<RwLock<HashMap<u32, String>>>,
 }
 
@@ -952,7 +952,7 @@ impl PageManager for DriftPageManager {
         let filename = path
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown.drift")
+            .unwrap_or("unknown.driftu")
             .to_string();
         let mut map = self.files.write().unwrap();
         map.insert(file_id, filename);

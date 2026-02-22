@@ -1,7 +1,7 @@
 use drift_core::partitioner::PartitionGroup;
-use drift_core::quantizer::Quantizer;
-use drift_storage::bucket_file_reader::BucketFileReader;
-use drift_storage::bucket_file_writer::BucketFileWriter;
+use drift_storage::unified_format::UnifiedPayloadSchema;
+use drift_storage::unified_reader::UnifiedReader;
+use drift_storage::unified_writer::UnifiedLocalWriter;
 use drift_traits::IoContext;
 use opendal::{Operator, services};
 use parking_lot::RwLock;
@@ -36,7 +36,7 @@ impl LocalStagingManager {
             .read()
             .get(&bucket_id)
             .cloned()
-            .unwrap_or_else(|| format!("bucket_{}.drift", bucket_id))
+            .unwrap_or_else(|| format!("bucket_{}.driftu", bucket_id))
     }
 
     /// ⚡ ATOMIC ROTATION (Caller holds Write Lock via Coordinator)
@@ -93,6 +93,15 @@ impl LocalStagingManager {
     }
 
     pub async fn append_batch(&self, bucket_id: u32, batch: &PartitionGroup) -> io::Result<u64> {
+        self.append_batch_with_schema(bucket_id, batch, None).await
+    }
+
+    pub async fn append_batch_with_schema(
+        &self,
+        bucket_id: u32,
+        batch: &PartitionGroup,
+        payload_schema: Option<&UnifiedPayloadSchema>,
+    ) -> io::Result<u64> {
         if batch.count == 0 {
             return Ok(0);
         }
@@ -103,35 +112,14 @@ impl LocalStagingManager {
         // Resolve Dynamic Filename
         let filename = self.get_active_filename(bucket_id);
         let path = self.base_path.join(&filename);
-        let exists = path.exists();
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .context("Failed to open bucket file")?;
-
-        let initial_len = file.metadata()?.len();
-
-        let mut writer = if exists && initial_len > 0 {
-            let op = self.create_local_op()?;
-            let mut reader = BucketFileReader::open(op, &filename).await?;
-            reader.load_quantizer().await?;
-            let q = reader
-                .quantizer
-                .ok_or_else(|| io::Error::other("Quantizer missing"))?;
-            BucketFileWriter::new_append(file, [0u8; 16], q, dim, initial_len)?
-        } else {
-            let q = Quantizer::train(&batch.flat_vectors, dim);
-            BucketFileWriter::new_streaming(file, [0u8; 16], q, dim)?
-        };
-
-        writer.write_batch(&batch.ids, &batch.flat_vectors)?;
-        let (_, total_count) = writer.finalize_and_truncate()?;
-
-        Ok(total_count)
+        let stats = UnifiedLocalWriter::append_vector_chunk_with_schema_to_path(
+            &path,
+            &batch.ids,
+            &batch.flat_vectors,
+            dim,
+            payload_schema,
+        )?;
+        Ok(stats.row_count)
     }
 
     pub async fn read_file_content(&self, filename: &str) -> io::Result<(Vec<u64>, Vec<Vec<f32>>)> {
@@ -140,9 +128,31 @@ impl LocalStagingManager {
             return Ok((vec![], vec![]));
         }
         let op = self.create_local_op()?;
-        let mut reader = BucketFileReader::open(op, filename).await?;
-        reader.load_quantizer().await?;
+        let mut reader = UnifiedReader::open(op, filename).await?;
         reader.read_all_vectors().await
+    }
+
+    pub async fn read_file_content_flat(&self, filename: &str) -> io::Result<(Vec<u64>, Vec<f32>)> {
+        let path = self.base_path.join(filename);
+        if !path.exists() {
+            return Ok((vec![], vec![]));
+        }
+        let op = self.create_local_op()?;
+        let mut reader = UnifiedReader::open(op, filename).await?;
+        reader.read_all_vectors_flat().await
+    }
+
+    pub async fn read_file_payload_schema(
+        &self,
+        filename: &str,
+    ) -> io::Result<Option<UnifiedPayloadSchema>> {
+        let path = self.base_path.join(filename);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let op = self.create_local_op()?;
+        let reader = UnifiedReader::open(op, filename).await?;
+        reader.read_payload_schema().await
     }
 
     /// Reads the current active file for the bucket.
@@ -150,6 +160,19 @@ impl LocalStagingManager {
     pub async fn read_full_bucket(&self, bucket_id: u32) -> io::Result<(Vec<u64>, Vec<Vec<f32>>)> {
         let filename = self.get_active_filename(bucket_id);
         self.read_file_content(&filename).await
+    }
+
+    pub async fn read_full_bucket_flat(&self, bucket_id: u32) -> io::Result<(Vec<u64>, Vec<f32>)> {
+        let filename = self.get_active_filename(bucket_id);
+        self.read_file_content_flat(&filename).await
+    }
+
+    pub async fn read_full_bucket_payload_schema(
+        &self,
+        bucket_id: u32,
+    ) -> io::Result<Option<UnifiedPayloadSchema>> {
+        let filename = self.get_active_filename(bucket_id);
+        self.read_file_payload_schema(&filename).await
     }
 
     pub async fn delete_file(&self, filename: &str) -> io::Result<()> {
@@ -177,11 +200,11 @@ impl LocalStagingManager {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|s| s.to_str())
                     && name.starts_with("bucket_")
-                    && name.ends_with(".drift")
+                    && name.ends_with(".driftu")
                 {
                     let id_part = name
                         .trim_start_matches("bucket_")
-                        .trim_end_matches(".drift");
+                        .trim_end_matches(".driftu");
                     if let Ok(id) = id_part.parse::<u32>()
                         && entry.metadata()?.len() >= threshold
                     {
@@ -211,22 +234,24 @@ impl LocalStagingManager {
     /// NEW: Writes a fresh file for a bucket (CoW support).
     /// Used during Scatter-Merge to rewrite a neighbor bucket with new data.
     pub async fn write_new_file(&self, filename: &str, group: &PartitionGroup) -> io::Result<u64> {
+        self.write_new_file_with_schema(filename, group, None).await
+    }
+
+    pub async fn write_new_file_with_schema(
+        &self,
+        filename: &str,
+        group: &PartitionGroup,
+        payload_schema: Option<&UnifiedPayloadSchema>,
+    ) -> io::Result<u64> {
         let path = self.base_path.join(filename);
         let dim = group.flat_vectors.len() / group.ids.len();
-
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .context("Failed to create new staging file")?;
-
-        let q = Quantizer::train(&group.flat_vectors, dim);
-        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim)?;
-
-        writer.write_batch(&group.ids, &group.flat_vectors)?;
-        let (_, total_count) = writer.finalize()?;
-
-        Ok(total_count)
+        let stats = UnifiedLocalWriter::write_vector_with_schema_flat_to_path(
+            &path,
+            &group.ids,
+            &group.flat_vectors,
+            dim,
+            payload_schema,
+        )?;
+        Ok(stats.row_count)
     }
 }

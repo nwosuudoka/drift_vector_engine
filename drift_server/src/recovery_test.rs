@@ -110,7 +110,7 @@ mod tests {
         std::fs::create_dir_all(&staging).unwrap();
 
         // Mock a local bucket file
-        std::fs::File::create(staging.join("bucket_1.drift")).unwrap();
+        std::fs::File::create(staging.join("bucket_1.driftu")).unwrap();
 
         let manifest = Arc::new(ServerManifestManager::new(dir.path(), 128).unwrap());
 
@@ -129,7 +129,7 @@ mod tests {
 
         // Should find local file and prefer it over remote run_id
         let (path, class) = bucket_mgr.get_location(1).unwrap();
-        assert!(path.contains("bucket_1.drift"));
+        assert!(path.contains("bucket_1.driftu"));
         assert_eq!(class, StorageClass::Local);
     }
 
@@ -143,7 +143,7 @@ mod tests {
                 m.update_bucket_remote_meta(
                     7,
                     "run_remote".into(),
-                    "custom/provider/object-7.drift".into(),
+                    "custom/provider/object-7.driftuu".into(),
                     "len=64|etag=test".into(),
                 );
             })
@@ -156,7 +156,7 @@ mod tests {
         mgr.recover(&bucket_mgr, 8, &wal_dir).await.unwrap();
 
         let (path, class) = bucket_mgr.get_location(7).unwrap();
-        assert_eq!(path, "custom/provider/object-7.drift");
+        assert_eq!(path, "custom/provider/object-7.driftuu");
         assert_eq!(class, StorageClass::Remote);
     }
 
@@ -174,7 +174,7 @@ mod tests {
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
 
-        let path = "custom/provider/object-9.drift";
+        let path = "custom/provider/object-9.driftu";
         let op = create_memory_operator();
         op.write(path, vec![42u8; 64]).await.unwrap();
 
@@ -242,7 +242,7 @@ mod tests {
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
 
-        let path = "custom/provider/object-10.drift";
+        let path = "custom/provider/object-10.driftu";
         let op = create_memory_operator();
         op.write(path, vec![7u8; 64]).await.unwrap();
 
@@ -294,7 +294,7 @@ mod tests {
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
 
-        let path = "custom/provider/object-20.drift";
+        let path = "custom/provider/object-20.driftu";
         let op = create_memory_operator();
         op.write(path, vec![1u8; 32]).await.unwrap();
 
@@ -365,7 +365,7 @@ mod tests {
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
 
-        let path = "custom/provider/object-21.drift";
+        let path = "custom/provider/object-21.driftu";
         let op = create_memory_operator();
         op.write(path, vec![1u8; 32]).await.unwrap();
 
@@ -436,7 +436,7 @@ mod tests {
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
 
-        let path = "custom/provider/object-22.drift";
+        let path = "custom/provider/object-22.driftu";
         let op = create_memory_operator();
         op.write(path, vec![9u8; 64]).await.unwrap();
 
@@ -494,13 +494,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let staging_dir = dir.path().join("staging");
         std::fs::create_dir_all(&staging_dir).unwrap();
-        std::fs::write(staging_dir.join("bucket_23.drift"), vec![0u8; 4]).unwrap();
+        std::fs::write(staging_dir.join("bucket_23.driftu"), vec![0u8; 4]).unwrap();
 
         let cache_root = tempdir().unwrap();
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
 
-        let path = "custom/provider/object-23.drift";
+        let path = "custom/provider/object-23.driftu";
         let op = create_memory_operator();
         op.write(path, vec![4u8; 64]).await.unwrap();
         let disk = DiskManager::new(op.clone(), path.to_string());
@@ -534,7 +534,7 @@ mod tests {
 
         let (local_path, class) = bucket_mgr.get_location(23).unwrap();
         assert_eq!(class, StorageClass::Local);
-        assert!(local_path.contains("bucket_23.drift"));
+        assert!(local_path.contains("bucket_23.driftu"));
         assert!(
             DiskManager::nvme_cached_fingerprint_for_object(&op, path).is_some(),
             "local bucket recovery should not invalidate remote cache"
@@ -565,7 +565,7 @@ mod tests {
         let _policy = EnvVarGuard::set("DRIFT_RECOVERY_FINGERPRINT_POLICY", "not_a_real_policy");
         let _max = EnvVarGuard::set("DRIFT_RECOVERY_FINGERPRINT_MAX_MISMATCHES", "not_a_number");
 
-        let path = "custom/provider/object-24.drift";
+        let path = "custom/provider/object-24.driftu";
         let op = create_memory_operator();
         op.write(path, vec![2u8; 64]).await.unwrap();
         let disk = DiskManager::new(op.clone(), path.to_string());
@@ -630,7 +630,7 @@ mod tests {
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
 
-        let path = "custom/provider/object-11.drift";
+        let path = "custom/provider/object-11.driftu";
         let op = create_memory_operator();
         op.write(path, vec![5u8; 64]).await.unwrap();
 
@@ -699,7 +699,7 @@ mod tests {
         let _cache_dir =
             EnvVarGuard::set("DRIFT_NVME_CACHE_DIR", cache_root.path().to_str().unwrap());
 
-        let path = "custom/provider/object-12.drift";
+        let path = "custom/provider/object-12.driftu";
         let op = create_memory_operator();
         op.write(path, vec![6u8; 64]).await.unwrap();
 

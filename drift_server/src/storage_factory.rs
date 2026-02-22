@@ -35,7 +35,7 @@ impl StorageFactory {
             .root(scope);
 
         // Isolation: Root = collection_name
-        // S3 keys will look like: s3://my-bucket/my_collection/segment_123.drift
+        // S3 keys will look like: s3://my-bucket/my_collection/segment_123.driftu
         // OpenDAL handles the prefixing automatically.
 
         if let Some(endpoint) = &config.endpoint {

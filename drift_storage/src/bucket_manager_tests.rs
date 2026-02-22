@@ -1,10 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::bucket_file_writer::BucketFileWriter;
     use crate::bucket_manager::{BucketManager, StorageClass};
+    use crate::unified_writer::UnifiedLocalWriter;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
-    use drift_core::quantizer::Quantizer;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
     use std::sync::Arc;
@@ -17,7 +16,7 @@ mod tests {
         Operator::new(builder).unwrap().finish()
     }
 
-    /// Creates a valid .drift file with specific data
+    /// Creates a valid unified file with specific data.
     async fn create_bucket_file(
         dir: &std::path::Path,
         filename: &str,
@@ -26,13 +25,8 @@ mod tests {
         dim: usize,
     ) {
         let path = dir.join(filename);
-        let file = std::fs::File::create(&path).unwrap();
-
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
-        let q = Quantizer::train(&flat, dim);
-        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-        writer.write_batch(ids, &flat).unwrap();
-        writer.finalize().unwrap();
+        UnifiedLocalWriter::write_vector_only_flat_to_path(path, ids, &flat, dim).unwrap();
     }
 
     // --- TEST 1: Tiered Access (Local Delta + Remote Base) ---
@@ -47,7 +41,7 @@ mod tests {
         let bucket_id = 1;
 
         // 1. Create Remote Base File (IDs 0-9, Value 10.0)
-        let remote_file = "remote_base.drift";
+        let remote_file = "remote_base.driftu";
         create_bucket_file(
             dir.path(),
             remote_file,
@@ -58,7 +52,7 @@ mod tests {
         .await;
 
         // 2. Create Local Delta File (IDs 10-14, Value 20.0)
-        let local_file = "local_delta.drift";
+        let local_file = "local_delta.driftu";
         create_bucket_file(
             dir.path(),
             local_file,
@@ -118,18 +112,18 @@ mod tests {
         let bucket_id = 2;
 
         // 1. Setup 3 Files simulating the Promotion transition
-        create_bucket_file(dir.path(), "active.drift", &[100], &[vec![1.0; dim]], dim).await; // ID 100
-        create_bucket_file(dir.path(), "frozen.drift", &[200], &[vec![2.0; dim]], dim).await; // ID 200
-        create_bucket_file(dir.path(), "remote.drift", &[300], &[vec![3.0; dim]], dim).await; // ID 300
+        create_bucket_file(dir.path(), "active.driftu", &[100], &[vec![1.0; dim]], dim).await; // ID 100
+        create_bucket_file(dir.path(), "frozen.driftu", &[200], &[vec![2.0; dim]], dim).await; // ID 200
+        create_bucket_file(dir.path(), "remote.driftu", &[300], &[vec![3.0; dim]], dim).await; // ID 300
 
         // 2. Register Promoting State
         manager.register_bucket_with_count(
             bucket_id,
-            "active.drift".to_string(),
+            "active.driftu".to_string(),
             StorageClass::Promoting {
-                local_active: "active.drift".to_string(),
-                local_frozen: "frozen.drift".to_string(),
-                remote_path: Some("remote.drift".to_string()),
+                local_active: "active.driftu".to_string(),
+                local_frozen: "frozen.driftu".to_string(),
+                remote_path: Some("remote.driftu".to_string()),
             },
             3,
         );
@@ -168,18 +162,18 @@ mod tests {
         // Initial State: Just Local
         create_bucket_file(
             dir.path(),
-            "initial.drift",
+            "initial.driftu",
             &(0..100).collect::<Vec<_>>(),
             &vec![vec![0.0; dim]; 100],
             dim,
         )
         .await;
-        manager.register_bucket(bucket_id, "initial.drift".to_string(), StorageClass::Local);
+        manager.register_bucket(bucket_id, "initial.driftu".to_string(), StorageClass::Local);
 
         // Next State: Remote (Simulating completion of promotion)
         create_bucket_file(
             dir.path(),
-            "final.drift",
+            "final.driftu",
             &(0..100).collect::<Vec<_>>(),
             &vec![vec![0.0; dim]; 100],
             dim,
@@ -213,7 +207,7 @@ mod tests {
             let _guard = c_clone.write(bucket_id).await;
 
             // Update Registry
-            m_clone_2.register_bucket(bucket_id, "final.drift".to_string(), StorageClass::Remote);
+            m_clone_2.register_bucket(bucket_id, "final.driftu".to_string(), StorageClass::Remote);
 
             // Verify lock works: Search shouldn't run here
             sleep(Duration::from_millis(20)).await;
@@ -233,7 +227,7 @@ mod tests {
         let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         // Register a file that DOES NOT EXIST
-        manager.register_bucket(99, "ghost.drift".to_string(), StorageClass::Local);
+        manager.register_bucket(99, "ghost.driftu".to_string(), StorageClass::Local);
 
         // Search should not panic, just return empty/partial
         let results = manager
@@ -256,11 +250,11 @@ mod tests {
         // 1. Setup Data: IDs 10, 20, 30
         let ids = vec![10, 20, 30];
         let vecs = vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]];
-        create_bucket_file(dir.path(), "b1.drift", &ids, &vecs, dim).await;
+        create_bucket_file(dir.path(), "b1.driftu", &ids, &vecs, dim).await;
 
         manager.register_bucket_with_count(
             bucket_id,
-            "b1.drift".to_string(),
+            "b1.driftu".to_string(),
             StorageClass::Local,
             3,
         );
@@ -299,8 +293,8 @@ mod tests {
         let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         // 1. Setup Data (ID 100 exists on disk)
-        create_bucket_file(dir.path(), "b1.drift", &[100], &[vec![0.0, 0.0]], 2).await;
-        manager.register_bucket(1, "b1.drift".to_string(), StorageClass::Local);
+        create_bucket_file(dir.path(), "b1.driftu", &[100], &[vec![0.0, 0.0]], 2).await;
+        manager.register_bucket(1, "b1.driftu".to_string(), StorageClass::Local);
 
         // 2. SHADOW ACTION
         // "Shadowing" means marking the disk version as deleted because a newer one exists in RAM.
@@ -325,7 +319,7 @@ mod tests {
 
         // 1. Register Bucket (Initialize State)
         // Storage class doesn't matter for this test, but it must be registered to exist in the registry.
-        manager.register_bucket(bucket_id, "test.drift".to_string(), StorageClass::Local);
+        manager.register_bucket(bucket_id, "test.driftu".to_string(), StorageClass::Local);
 
         // 2. First Update (Initialization Path)
         // Simulating flushing a batch of 10 vectors that sum to [10.0, 20.0]
@@ -380,7 +374,7 @@ mod tests {
         let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         let bucket_id = 99;
-        manager.register_bucket(bucket_id, "safe.drift".to_string(), StorageClass::Local);
+        manager.register_bucket(bucket_id, "safe.driftu".to_string(), StorageClass::Local);
 
         // 1. Initialize with Dim 2
         manager

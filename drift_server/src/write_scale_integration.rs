@@ -306,7 +306,7 @@ mod tests_2 {
             .expect("Persistence failed");
 
         // 🔍 DEBUG: Check File Size
-        let segment_file = format!("segment_{}.drift", run_id);
+        let segment_file = format!("segment_{}.driftu", run_id);
         let meta = op.stat(&segment_file).await.unwrap();
         println!(
             "   -> Segment Written: {} (Size: {} bytes)",

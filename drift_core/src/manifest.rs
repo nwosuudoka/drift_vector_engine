@@ -19,7 +19,7 @@ impl ManifestWrapper {
         if run_id.is_empty() {
             String::new()
         } else {
-            format!("bucket_{}_{}.drift", id, run_id)
+            format!("bucket_{}_{}.driftu", id, run_id)
         }
     }
 

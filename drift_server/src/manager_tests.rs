@@ -318,10 +318,9 @@ mod bucket_fetch_test {
     // use crate::bucket_manager::{BucketManager, StorageClass};
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
-    use drift_core::quantizer::Quantizer;
     use drift_storage::{
-        bucket_file_writer::BucketFileWriter,
         bucket_manager::{BucketManager, StorageClass},
+        unified_writer::UnifiedLocalWriter,
     };
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
@@ -335,7 +334,7 @@ mod bucket_fetch_test {
         Operator::new(builder).unwrap().finish()
     }
 
-    /// Creates a valid .drift file with specific data
+    /// Creates a valid unified file with specific data.
     async fn create_bucket_file(
         dir: &std::path::Path,
         filename: &str,
@@ -344,13 +343,8 @@ mod bucket_fetch_test {
         dim: usize,
     ) {
         let path = dir.join(filename);
-        let file = std::fs::File::create(&path).unwrap();
-
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
-        let q = Quantizer::train(&flat, dim);
-        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-        writer.write_batch(ids, &flat).unwrap();
-        writer.finalize().unwrap();
+        UnifiedLocalWriter::write_vector_only_flat_to_path(&path, ids, &flat, dim).unwrap();
     }
 
     // --- TEST 1: Tiered Fetch (Base + Delta) ---
@@ -367,20 +361,20 @@ mod bucket_fetch_test {
         // 1. Create Remote Base (IDs 0-9)
         let base_ids: Vec<u64> = (0..10).collect();
         let base_vecs = vec![vec![1.0, 1.0]; 10];
-        create_bucket_file(dir.path(), "base.drift", &base_ids, &base_vecs, dim).await;
+        create_bucket_file(dir.path(), "base.driftu", &base_ids, &base_vecs, dim).await;
 
         // 2. Create Local Delta (IDs 10-14)
         let delta_ids: Vec<u64> = (10..15).collect();
         let delta_vecs = vec![vec![2.0, 2.0]; 5];
-        create_bucket_file(dir.path(), "delta.drift", &delta_ids, &delta_vecs, dim).await;
+        create_bucket_file(dir.path(), "delta.driftu", &delta_ids, &delta_vecs, dim).await;
 
         // 3. Register Tiered
         manager.register_bucket_with_count(
             bucket_id,
-            "ignored.drift".to_string(),
+            "ignored.driftu".to_string(),
             StorageClass::Tiered {
-                remote_path: "base.drift".to_string(),
-                local_path: "delta.drift".to_string(),
+                remote_path: "base.driftu".to_string(),
+                local_path: "delta.driftu".to_string(),
             },
             15,
         );
@@ -427,22 +421,22 @@ mod bucket_fetch_test {
         let bucket_id = 200;
 
         // 1. Remote Base (ID 1)
-        create_bucket_file(dir.path(), "remote.drift", &[1], &[vec![1.0; dim]], dim).await;
+        create_bucket_file(dir.path(), "remote.driftu", &[1], &[vec![1.0; dim]], dim).await;
 
         // 2. Local Frozen (ID 2)
-        create_bucket_file(dir.path(), "frozen.drift", &[2], &[vec![2.0; dim]], dim).await;
+        create_bucket_file(dir.path(), "frozen.driftu", &[2], &[vec![2.0; dim]], dim).await;
 
         // 3. Local Active (ID 3)
-        create_bucket_file(dir.path(), "active.drift", &[3], &[vec![3.0; dim]], dim).await;
+        create_bucket_file(dir.path(), "active.driftu", &[3], &[vec![3.0; dim]], dim).await;
 
         // 4. Register Promoting
         manager.register_bucket(
             bucket_id,
-            "active.drift".to_string(),
+            "active.driftu".to_string(),
             StorageClass::Promoting {
-                local_active: "active.drift".to_string(),
-                local_frozen: "frozen.drift".to_string(),
-                remote_path: Some("remote.drift".to_string()),
+                local_active: "active.driftu".to_string(),
+                local_frozen: "frozen.driftu".to_string(),
+                remote_path: Some("remote.driftu".to_string()),
             },
         );
 
@@ -466,7 +460,7 @@ mod bucket_fetch_test {
         let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
 
         // Register bucket pointing to non-existent file
-        manager.register_bucket(999, "ghost.drift".to_string(), StorageClass::Local);
+        manager.register_bucket(999, "ghost.driftu".to_string(), StorageClass::Local);
 
         // Fetch should NOT fail. It should return empty data.
         let res = manager.fetch_bucket(999).await;

@@ -11,10 +11,9 @@ mod tests {
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
     use drift_core::partitioner::PartitionGroup;
-    use drift_core::quantizer::Quantizer;
     use drift_core::wal::WalWriter;
-    use drift_storage::bucket_file_writer::BucketFileWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_storage::unified_writer::UnifiedLocalWriter;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
     use std::sync::Arc;
@@ -178,23 +177,27 @@ mod tests {
 
         // 1. Create "Old" S3 File in data_dir (Remote)
         let run_id = "run_OLD";
-        let s3_path = data_dir.join(format!("bucket_{}_{}.drift", bucket_id, run_id));
+        let s3_path = data_dir.join(format!("bucket_{}_{}.driftu", bucket_id, run_id));
         {
-            let file = std::fs::File::create(s3_path).unwrap();
-            let q = Quantizer::train(&vec![0.0; dim], dim);
-            let mut w = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-            w.write_batch(&[100], &vec![100.0; dim]).unwrap();
-            w.finalize().unwrap();
+            UnifiedLocalWriter::write_vector_only_flat_to_path(
+                &s3_path,
+                &[100],
+                &vec![100.0; dim],
+                dim,
+            )
+            .unwrap();
         }
 
         // 2. Create "New" Local File in staging_dir
-        let local_path = staging_dir.join(format!("bucket_{}.drift", bucket_id));
+        let local_path = staging_dir.join(format!("bucket_{}.driftu", bucket_id));
         {
-            let file = std::fs::File::create(local_path).unwrap();
-            let q = Quantizer::train(&vec![0.0; dim], dim);
-            let mut w = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-            w.write_batch(&[200], &vec![200.0; dim]).unwrap();
-            w.finalize().unwrap();
+            UnifiedLocalWriter::write_vector_only_flat_to_path(
+                &local_path,
+                &[200],
+                &vec![200.0; dim],
+                dim,
+            )
+            .unwrap();
         }
 
         manifest
@@ -219,7 +222,7 @@ mod tests {
         let (path, class) = bucket_manager.get_location(bucket_id).unwrap();
 
         assert!(
-            path.contains("bucket_1.drift"),
+            path.contains("bucket_1.driftu"),
             "Recovery failed to prefer Local Staging. Got: {}",
             path
         );
@@ -285,12 +288,11 @@ mod janitor_reaper_integration_tests {
     use drift_core::index::VectorIndex;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
-    use drift_core::quantizer::Quantizer;
     use drift_core::router::Router;
     use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
-    use drift_storage::bucket_file_writer::BucketFileWriter;
     use drift_storage::bucket_manager::BucketManager;
+    use drift_storage::unified_writer::UnifiedLocalWriter;
     use opendal::{Operator, services};
     use parking_lot::Mutex;
     use parking_lot::RwLock;
@@ -307,15 +309,9 @@ mod janitor_reaper_integration_tests {
 
     async fn create_bucket_file(dir: &std::path::Path, filename: &str, count: usize, dim: usize) {
         let path = dir.join(filename);
-        let file = std::fs::File::create(&path).unwrap();
-
         let ids: Vec<u64> = (0..count as u64).collect();
         let vecs: Vec<f32> = (0..count * dim).map(|i| i as f32).collect();
-
-        let q = Quantizer::train(&vecs, dim);
-        let mut writer = BucketFileWriter::new_streaming(file, [0u8; 16], q, dim).unwrap();
-        writer.write_batch(&ids, &vecs).unwrap();
-        writer.finalize().unwrap();
+        UnifiedLocalWriter::write_vector_only_flat_to_path(path, &ids, &vecs, dim).unwrap();
     }
 
     #[tokio::test]
@@ -359,7 +355,7 @@ mod janitor_reaper_integration_tests {
 
         // 3. Create Local File
         let bucket_id = 1;
-        let filename = format!("bucket_{}.drift", bucket_id);
+        let filename = format!("bucket_{}.driftu", bucket_id);
         let item_count = 50;
 
         create_bucket_file(&staging_dir, &filename, item_count, dim).await;
@@ -419,7 +415,7 @@ mod janitor_reaper_integration_tests {
                 let path = entry.unwrap().path();
                 if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
                     remote_files.push(name.to_string());
-                    if name.starts_with("bucket_1_") && name.ends_with(".drift") {
+                    if name.starts_with("bucket_1_") && name.ends_with(".driftu") {
                         found_remote = true;
                     }
                 }

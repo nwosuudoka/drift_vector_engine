@@ -199,7 +199,7 @@ impl RecoveryManager {
         let remote_op = bucket_manager.remote_operator();
         let mut mismatch_count: usize = 0;
         for b in wrapper.get_buckets() {
-            let local_filename = format!("bucket_{}.drift", b.id);
+            let local_filename = format!("bucket_{}.driftu", b.id);
             // Check staging dir specifically
             let local_full_path = self.root.join("staging").join(&local_filename);
 
@@ -212,7 +212,7 @@ impl RecoveryManager {
             let remote_filename = if !b.object_path.is_empty() {
                 Some(b.object_path.clone())
             } else if !b.run_id.is_empty() {
-                Some(format!("bucket_{}_{}.drift", b.id, b.run_id))
+                Some(format!("bucket_{}_{}.driftu", b.id, b.run_id))
             } else {
                 None
             };

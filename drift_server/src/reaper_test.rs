@@ -36,11 +36,11 @@ mod tests {
 
         // 2. Create Dummy Files
         // "Old" Local File (e.g. frozen staging file)
-        let local_filename = "bucket_1_frozen.drift";
+        let local_filename = "bucket_1_frozen.driftu";
         std::fs::write(staging_dir.join(local_filename), b"local data").unwrap();
 
         // "Old" Remote File (e.g. previous S3 segment)
-        let remote_filename = "bucket_1_base_v1.drift";
+        let remote_filename = "bucket_1_base_v1.driftu";
         create_dummy_file(&remote_op, remote_filename).await;
 
         // 3. Create a BucketVersion representing the "Old State" we want to cleanup
@@ -48,11 +48,11 @@ mod tests {
         // so the old local frozen file and old remote base file are now garbage.
         let version = Arc::new(BucketVersion {
             bucket_id: 1,
-            path: "ignored_active.drift".to_string(), // The reaper ignores this field for promoting class
+            path: "ignored_active.driftu".to_string(), // The reaper ignores this field for promoting class
             class: StorageClass::Promoting {
-                local_active: "bucket_1_new_active.drift".to_string(), // Kept
-                local_frozen: local_filename.to_string(),              // To Delete
-                remote_path: Some(remote_filename.to_string()),        // To Delete
+                local_active: "bucket_1_new_active.driftu".to_string(), // Kept
+                local_frozen: local_filename.to_string(),               // To Delete
+                remote_path: Some(remote_filename.to_string()),         // To Delete
             },
         });
 
@@ -103,7 +103,7 @@ mod tests {
         let mut reaper = Reaper::new(staging, persistence);
 
         // 1. Create Local File
-        let filename = "bucket_99.drift";
+        let filename = "bucket_99.driftu";
         std::fs::write(staging_dir.join(filename), b"trash").unwrap();
 
         // 2. Schedule
