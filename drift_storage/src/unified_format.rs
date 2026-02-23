@@ -54,6 +54,9 @@ pub enum UnifiedCodec {
     Bitset = 4,
     VarLen = 5,
     DictPostings = 6,
+    ForBitpack = 7,
+    AlpRd = 8,
+    DictBitpack = 9,
 }
 
 impl UnifiedCodec {
@@ -65,6 +68,9 @@ impl UnifiedCodec {
             4 => Ok(Self::Bitset),
             5 => Ok(Self::VarLen),
             6 => Ok(Self::DictPostings),
+            7 => Ok(Self::ForBitpack),
+            8 => Ok(Self::AlpRd),
+            9 => Ok(Self::DictBitpack),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported codec: {v}"),

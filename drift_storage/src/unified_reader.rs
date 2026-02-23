@@ -1,3 +1,4 @@
+use crate::compression::alp_rd::alp_rd_decode;
 use crate::disk_manager::DiskManager;
 use crate::unified_format::{
     UNIFIED_BLOCK_DESC_SIZE, UNIFIED_FLAG_HAS_EXACT_INDEX, UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS,
@@ -436,7 +437,8 @@ impl UnifiedReader {
     }
 
     pub async fn read_exact_index(&self, field_id: u32) -> io::Result<Option<UnifiedExactIndex>> {
-        let mut found: Option<UnifiedExactIndex> = None;
+        let mut logical_type: Option<UnifiedLogicalType> = None;
+        let mut merged: BTreeMap<Vec<u8>, Vec<u64>> = BTreeMap::new();
         for block in self
             .blocks
             .iter()
@@ -455,18 +457,46 @@ impl UnifiedReader {
                     "exact index block has invalid codec",
                 ));
             }
-            if let Some(prev) = &found {
-                if prev != &index {
+            if index.dictionary.len() != index.postings.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact index dictionary/postings length mismatch",
+                ));
+            }
+            if let Some(prev) = &logical_type {
+                if prev != &index.logical_type {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "multiple exact indexes for field disagree",
+                        "exact index logical type mismatch across blocks",
                     ));
                 }
             } else {
-                found = Some(index);
+                logical_type = Some(index.logical_type.clone());
+            }
+
+            for (key, mut rows) in index.dictionary.into_iter().zip(index.postings.into_iter()) {
+                let entry = merged.entry(key).or_default();
+                entry.append(&mut rows);
             }
         }
-        Ok(found)
+        let Some(logical_type) = logical_type else {
+            return Ok(None);
+        };
+
+        let mut dictionary = Vec::with_capacity(merged.len());
+        let mut postings = Vec::with_capacity(merged.len());
+        for (key, mut rows) in merged {
+            rows.sort_unstable();
+            rows.dedup();
+            dictionary.push(key);
+            postings.push(rows);
+        }
+        Ok(Some(UnifiedExactIndex {
+            field_id,
+            logical_type,
+            dictionary,
+            postings,
+        }))
     }
 
     pub async fn filter_ids_exact(
@@ -712,7 +742,6 @@ fn decode_non_null_payload_values(
     data: &[u8],
     value_count: usize,
 ) -> io::Result<Vec<UnifiedPayloadValue>> {
-    let mut out = Vec::with_capacity(value_count);
     match logical_type {
         UnifiedLogicalType::Bool => {
             if codec != UnifiedCodec::Bitset {
@@ -722,166 +751,134 @@ fn decode_non_null_payload_values(
                 ));
             }
             let min_len = value_count.div_ceil(8);
-            if data.len() < min_len {
+            if data.len() != min_len {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "payload bool data truncated",
+                    "payload bool data length mismatch",
                 ));
             }
+            let mut out = Vec::with_capacity(value_count);
             for i in 0..value_count {
                 let v = ((data[i / 8] >> (i % 8)) & 1) == 1;
                 out.push(UnifiedPayloadValue::Bool(v));
             }
+            Ok(out)
         }
         UnifiedLogicalType::Int64 => {
-            if codec != UnifiedCodec::PlainLe {
+            if codec != UnifiedCodec::ForBitpack {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "payload int64 column codec mismatch",
                 ));
             }
-            let expected = value_count * 8;
-            if data.len() != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload int64 data length mismatch",
-                ));
-            }
-            let mut cursor = Cursor::new(data);
-            for _ in 0..value_count {
-                out.push(UnifiedPayloadValue::Int64(
-                    cursor.read_i64::<LittleEndian>()?,
-                ));
-            }
+            Ok(decode_for_bitpacked_i64(data, value_count)?
+                .into_iter()
+                .map(UnifiedPayloadValue::Int64)
+                .collect())
         }
         UnifiedLogicalType::Float32 => {
-            if codec != UnifiedCodec::PlainLe {
+            if codec != UnifiedCodec::AlpRd {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "payload float32 column codec mismatch",
                 ));
             }
-            let expected = value_count * 4;
-            if data.len() != expected {
+            let decoded: Vec<f32> = alp_rd_decode(data);
+            if decoded.len() != value_count {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "payload float32 data length mismatch",
+                    "payload float32 decoded length mismatch",
                 ));
             }
-            let mut cursor = Cursor::new(data);
-            for _ in 0..value_count {
-                out.push(UnifiedPayloadValue::Float32(
-                    cursor.read_f32::<LittleEndian>()?,
-                ));
-            }
+            Ok(decoded
+                .into_iter()
+                .map(UnifiedPayloadValue::Float32)
+                .collect())
         }
         UnifiedLogicalType::Float64 => {
-            if codec != UnifiedCodec::PlainLe {
+            if codec != UnifiedCodec::AlpRd {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "payload float64 column codec mismatch",
                 ));
             }
-            let expected = value_count * 8;
-            if data.len() != expected {
+            let decoded: Vec<f64> = alp_rd_decode(data);
+            if decoded.len() != value_count {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "payload float64 data length mismatch",
+                    "payload float64 decoded length mismatch",
                 ));
             }
-            let mut cursor = Cursor::new(data);
-            for _ in 0..value_count {
-                out.push(UnifiedPayloadValue::Float64(
-                    cursor.read_f64::<LittleEndian>()?,
-                ));
-            }
+            Ok(decoded
+                .into_iter()
+                .map(UnifiedPayloadValue::Float64)
+                .collect())
         }
         UnifiedLogicalType::TimestampMicros => {
-            if codec != UnifiedCodec::PlainLe {
+            if codec != UnifiedCodec::ForBitpack {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "payload timestamp column codec mismatch",
                 ));
             }
-            let expected = value_count * 8;
-            if data.len() != expected {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload timestamp data length mismatch",
-                ));
-            }
-            let mut cursor = Cursor::new(data);
-            for _ in 0..value_count {
-                out.push(UnifiedPayloadValue::TimestampMicros(
-                    cursor.read_i64::<LittleEndian>()?,
-                ));
-            }
+            Ok(decode_for_bitpacked_i64(data, value_count)?
+                .into_iter()
+                .map(UnifiedPayloadValue::TimestampMicros)
+                .collect())
         }
-        UnifiedLogicalType::Keyword | UnifiedLogicalType::Text => {
-            if codec != UnifiedCodec::VarLen {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload string column codec mismatch",
-                ));
-            }
-            let mut cursor = Cursor::new(data);
-            for _ in 0..value_count {
-                let len = cursor.read_u32::<LittleEndian>()? as usize;
-                let start = cursor.position() as usize;
-                let end = start.checked_add(len).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "payload string length overflow")
-                })?;
-                if end > data.len() {
+        UnifiedLogicalType::Keyword => {
+            let raw_values = match codec {
+                UnifiedCodec::VarLen => decode_varlen_values(data, value_count)?,
+                UnifiedCodec::DictBitpack => decode_dictionary_bitpacked_values(data, value_count)?,
+                _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "payload string data truncated",
+                        "payload keyword column codec mismatch",
                     ));
                 }
-                let s = String::from_utf8(data[start..end].to_vec())
+            };
+            let mut out = Vec::with_capacity(raw_values.len());
+            for raw in raw_values {
+                let s = String::from_utf8(raw)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                if matches!(logical_type, UnifiedLogicalType::Keyword) {
-                    out.push(UnifiedPayloadValue::Keyword(s));
-                } else {
-                    out.push(UnifiedPayloadValue::Text(s));
+                out.push(UnifiedPayloadValue::Keyword(s));
+            }
+            Ok(out)
+        }
+        UnifiedLogicalType::Text => {
+            let raw_values = match codec {
+                UnifiedCodec::VarLen => decode_varlen_values(data, value_count)?,
+                UnifiedCodec::DictBitpack => decode_dictionary_bitpacked_values(data, value_count)?,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "payload text column codec mismatch",
+                    ));
                 }
-                cursor.set_position(end as u64);
+            };
+            let mut out = Vec::with_capacity(raw_values.len());
+            for raw in raw_values {
+                let s = String::from_utf8(raw)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                out.push(UnifiedPayloadValue::Text(s));
             }
-            if cursor.position() as usize != data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload string column has trailing bytes",
-                ));
-            }
+            Ok(out)
         }
         UnifiedLogicalType::Bytes => {
-            if codec != UnifiedCodec::VarLen {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload bytes column codec mismatch",
-                ));
-            }
-            let mut cursor = Cursor::new(data);
-            for _ in 0..value_count {
-                let len = cursor.read_u32::<LittleEndian>()? as usize;
-                let start = cursor.position() as usize;
-                let end = start.checked_add(len).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "payload bytes length overflow")
-                })?;
-                if end > data.len() {
+            let raw_values = match codec {
+                UnifiedCodec::VarLen => decode_varlen_values(data, value_count)?,
+                UnifiedCodec::DictBitpack => decode_dictionary_bitpacked_values(data, value_count)?,
+                _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "payload bytes data truncated",
+                        "payload bytes column codec mismatch",
                     ));
                 }
-                out.push(UnifiedPayloadValue::Bytes(data[start..end].to_vec()));
-                cursor.set_position(end as u64);
-            }
-            if cursor.position() as usize != data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "payload bytes column has trailing bytes",
-                ));
-            }
+            };
+            Ok(raw_values
+                .into_iter()
+                .map(UnifiedPayloadValue::Bytes)
+                .collect())
         }
         UnifiedLogicalType::LobRef => {
             if codec != UnifiedCodec::VarLen {
@@ -891,6 +888,7 @@ fn decode_non_null_payload_values(
                 ));
             }
             let mut cursor = Cursor::new(data);
+            let mut out = Vec::with_capacity(value_count);
             for _ in 0..value_count {
                 let len = cursor.read_u32::<LittleEndian>()? as usize;
                 let start = cursor.position() as usize;
@@ -918,7 +916,154 @@ fn decode_non_null_payload_values(
                     "payload lob_ref column has trailing bytes",
                 ));
             }
+            Ok(out)
         }
+    }
+}
+
+fn decode_for_bitpacked_i64(data: &[u8], value_count: usize) -> io::Result<Vec<i64>> {
+    if data.len() < 9 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bitpacked payload header truncated",
+        ));
+    }
+
+    let mut cursor = Cursor::new(data);
+    let base = cursor.read_i64::<LittleEndian>()?;
+    let bit_width = cursor.read_u8()?;
+    let packed = &data[9..];
+    let deltas = unpack_u64_values(packed, value_count, bit_width)?;
+    let mut out = Vec::with_capacity(value_count);
+    for delta in deltas {
+        let value = (base as i128).checked_add(delta as i128).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "bitpacked value overflow")
+        })?;
+        let value = i64::try_from(value).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bitpacked value out of i64 range",
+            )
+        })?;
+        out.push(value);
+    }
+    Ok(out)
+}
+
+fn decode_varlen_values(data: &[u8], value_count: usize) -> io::Result<Vec<Vec<u8>>> {
+    let mut cursor = Cursor::new(data);
+    let mut out = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        let len = cursor.read_u32::<LittleEndian>()? as usize;
+        let start = cursor.position() as usize;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "varlen length overflow"))?;
+        if end > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varlen payload data truncated",
+            ));
+        }
+        out.push(data[start..end].to_vec());
+        cursor.set_position(end as u64);
+    }
+    if cursor.position() as usize != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "varlen payload has trailing bytes",
+        ));
+    }
+    Ok(out)
+}
+
+fn decode_dictionary_bitpacked_values(data: &[u8], value_count: usize) -> io::Result<Vec<Vec<u8>>> {
+    let mut cursor = Cursor::new(data);
+    let dict_len = cursor.read_u32::<LittleEndian>()? as usize;
+    let mut dictionary = Vec::with_capacity(dict_len);
+    for _ in 0..dict_len {
+        let len = cursor.read_u32::<LittleEndian>()? as usize;
+        let start = cursor.position() as usize;
+        let end = start.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dictionary entry length overflow",
+            )
+        })?;
+        if end > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dictionary entry data truncated",
+            ));
+        }
+        dictionary.push(data[start..end].to_vec());
+        cursor.set_position(end as u64);
+    }
+
+    let bit_width = cursor.read_u8()?;
+    let packed_start = cursor.position() as usize;
+    let ids = unpack_u64_values(&data[packed_start..], value_count, bit_width)?;
+    if dict_len == 0 && value_count > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dictionary payload has ids but empty dictionary",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(value_count);
+    for id in ids {
+        let idx = usize::try_from(id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dictionary id conversion overflow",
+            )
+        })?;
+        let value = dictionary.get(idx).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "dictionary id out of bounds")
+        })?;
+        out.push(value.clone());
+    }
+    Ok(out)
+}
+
+fn unpack_u64_values(data: &[u8], count: usize, bit_width: u8) -> io::Result<Vec<u64>> {
+    if bit_width > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bit width exceeds 64",
+        ));
+    }
+    if bit_width == 0 {
+        if !data.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zero-width bitpack has unexpected payload",
+            ));
+        }
+        return Ok(vec![0; count]);
+    }
+
+    let total_bits = count
+        .checked_mul(bit_width as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bit unpack length overflow"))?;
+    let expected_bytes = total_bits.div_ceil(8);
+    if data.len() != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bitpacked payload length mismatch",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(count);
+    let mut bit_cursor = 0usize;
+    for _ in 0..count {
+        let mut value = 0u64;
+        for bit in 0..bit_width {
+            let raw = (data[bit_cursor / 8] >> (bit_cursor % 8)) & 1;
+            value |= (raw as u64) << bit;
+            bit_cursor += 1;
+        }
+        out.push(value);
     }
     Ok(out)
 }
@@ -1147,5 +1292,229 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(active_true, vec![101, 103]);
+    }
+
+    #[tokio::test]
+    async fn test_unified_reader_payload_codec_matrix_roundtrip() {
+        let ids = vec![1, 2, 3];
+        let flat = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let schema = UnifiedPayloadSchema::new(vec![
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 1,
+                name: "active".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Bool,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 2,
+                name: "count".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Int64,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 3,
+                name: "score32".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Float32,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 4,
+                name: "score64".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Float64,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 5,
+                name: "tenant".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+                nullable: false,
+                indexed: true,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 6,
+                name: "body".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Text,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 7,
+                name: "blob".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Bytes,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 8,
+                name: "ts".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::TimestampMicros,
+                nullable: false,
+                indexed: false,
+            },
+        ]);
+
+        let score32 = [f32::from_bits(0x7fc0_0001), 1.25f32, -0.0f32];
+        let score64 = [f64::from_bits(0x7ff8_0000_0000_0001), 2.5f64, -0.0f64];
+        let body = "repeatable_text_payload".to_string();
+        let blob = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let rows: Vec<crate::unified_format::UnifiedPayloadRow> = vec![
+            BTreeMap::from([
+                (1, crate::unified_format::UnifiedPayloadValue::Bool(true)),
+                (2, crate::unified_format::UnifiedPayloadValue::Int64(-10)),
+                (
+                    3,
+                    crate::unified_format::UnifiedPayloadValue::Float32(score32[0]),
+                ),
+                (
+                    4,
+                    crate::unified_format::UnifiedPayloadValue::Float64(score64[0]),
+                ),
+                (
+                    5,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+                ),
+                (
+                    6,
+                    crate::unified_format::UnifiedPayloadValue::Text(body.clone()),
+                ),
+                (
+                    7,
+                    crate::unified_format::UnifiedPayloadValue::Bytes(blob.clone()),
+                ),
+                (
+                    8,
+                    crate::unified_format::UnifiedPayloadValue::TimestampMicros(1_700_000),
+                ),
+            ]),
+            BTreeMap::from([
+                (1, crate::unified_format::UnifiedPayloadValue::Bool(false)),
+                (2, crate::unified_format::UnifiedPayloadValue::Int64(0)),
+                (
+                    3,
+                    crate::unified_format::UnifiedPayloadValue::Float32(score32[1]),
+                ),
+                (
+                    4,
+                    crate::unified_format::UnifiedPayloadValue::Float64(score64[1]),
+                ),
+                (
+                    5,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("globex".to_string()),
+                ),
+                (
+                    6,
+                    crate::unified_format::UnifiedPayloadValue::Text(body.clone()),
+                ),
+                (
+                    7,
+                    crate::unified_format::UnifiedPayloadValue::Bytes(blob.clone()),
+                ),
+                (
+                    8,
+                    crate::unified_format::UnifiedPayloadValue::TimestampMicros(1_700_001),
+                ),
+            ]),
+            BTreeMap::from([
+                (1, crate::unified_format::UnifiedPayloadValue::Bool(true)),
+                (2, crate::unified_format::UnifiedPayloadValue::Int64(42)),
+                (
+                    3,
+                    crate::unified_format::UnifiedPayloadValue::Float32(score32[2]),
+                ),
+                (
+                    4,
+                    crate::unified_format::UnifiedPayloadValue::Float64(score64[2]),
+                ),
+                (
+                    5,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+                ),
+                (
+                    6,
+                    crate::unified_format::UnifiedPayloadValue::Text(body.clone()),
+                ),
+                (
+                    7,
+                    crate::unified_format::UnifiedPayloadValue::Bytes(blob.clone()),
+                ),
+                (
+                    8,
+                    crate::unified_format::UnifiedPayloadValue::TimestampMicros(1_700_002),
+                ),
+            ]),
+        ];
+
+        let bytes = UnifiedRemoteWriter::write_vector_with_payload_flat_to_bytes(
+            &ids,
+            &flat,
+            2,
+            Some(&schema),
+            Some(&rows),
+        )
+        .unwrap();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let name = "bucket_payload_codecs.driftu";
+        op.write(name, bytes).await.unwrap();
+
+        let reader = UnifiedReader::open(op.clone(), name).await.unwrap();
+        let mut codecs = BTreeMap::new();
+        for block in reader
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == UnifiedBlockType::PayloadColumn)
+        {
+            let payload = reader.read_block_bytes(block).await.unwrap();
+            let (chunk, _): (UnifiedPayloadColumnChunk, usize) =
+                bincode::decode_from_slice(&payload, bincode::config::standard()).unwrap();
+            codecs.insert(chunk.field_id, chunk.codec);
+        }
+
+        assert_eq!(codecs.get(&1), Some(&UnifiedCodec::Bitset));
+        assert_eq!(codecs.get(&2), Some(&UnifiedCodec::ForBitpack));
+        assert_eq!(codecs.get(&3), Some(&UnifiedCodec::AlpRd));
+        assert_eq!(codecs.get(&4), Some(&UnifiedCodec::AlpRd));
+        assert_eq!(codecs.get(&5), Some(&UnifiedCodec::DictBitpack));
+        assert_eq!(codecs.get(&6), Some(&UnifiedCodec::DictBitpack));
+        assert_eq!(codecs.get(&7), Some(&UnifiedCodec::DictBitpack));
+        assert_eq!(codecs.get(&8), Some(&UnifiedCodec::ForBitpack));
+
+        let columns = reader.read_payload_columns().await.unwrap();
+
+        let got_f32_bits: Vec<u32> = columns
+            .get(&3)
+            .unwrap()
+            .iter()
+            .map(|value| match value {
+                UnifiedPayloadValue::Float32(v) => v.to_bits(),
+                _ => panic!("expected float32 payload value"),
+            })
+            .collect();
+        assert_eq!(
+            got_f32_bits,
+            score32.iter().map(|v| v.to_bits()).collect::<Vec<u32>>()
+        );
+
+        let got_f64_bits: Vec<u64> = columns
+            .get(&4)
+            .unwrap()
+            .iter()
+            .map(|value| match value {
+                UnifiedPayloadValue::Float64(v) => v.to_bits(),
+                _ => panic!("expected float64 payload value"),
+            })
+            .collect();
+        assert_eq!(
+            got_f64_bits,
+            score64.iter().map(|v| v.to_bits()).collect::<Vec<u64>>()
+        );
     }
 }

@@ -1,3 +1,4 @@
+use crate::compression::alp_rd::alp_rd_encode;
 use crate::unified_format::{
     UNIFIED_FLAG_HAS_EXACT_INDEX, UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS,
     UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA, UNIFIED_FOOTER_SIZE, UNIFIED_HEADER_SIZE, UnifiedBlockDesc,
@@ -66,8 +67,15 @@ impl UnifiedRemoteWriter {
         validate_input_flat(ids, flat_vectors, dim)?;
 
         let row_count = ids.len() as u64;
-        let blocks_and_payload =
-            build_chunk_blocks(0, ids, flat_vectors, dim, payload_schema, payload_rows)?;
+        let blocks_and_payload = build_chunk_blocks(
+            0,
+            ids,
+            flat_vectors,
+            dim,
+            payload_schema,
+            payload_rows,
+            true,
+        )?;
         let (blocks, mut payload) = blocks_and_payload;
         let mut flags = 0u32;
         if blocks
@@ -251,7 +259,7 @@ impl UnifiedLocalWriter {
         flat_vectors: &[f32],
         dim: usize,
     ) -> io::Result<UnifiedWriteStats> {
-        Self::append_vector_chunk_with_schema_to_path(path, ids, flat_vectors, dim, None)
+        Self::append_vector_chunk_with_payload_to_path(path, ids, flat_vectors, dim, None, None)
     }
 
     pub fn append_vector_chunk_with_schema_to_path(
@@ -261,16 +269,35 @@ impl UnifiedLocalWriter {
         dim: usize,
         payload_schema: Option<&UnifiedPayloadSchema>,
     ) -> io::Result<UnifiedWriteStats> {
+        Self::append_vector_chunk_with_payload_to_path(
+            path,
+            ids,
+            flat_vectors,
+            dim,
+            payload_schema,
+            None,
+        )
+    }
+
+    pub fn append_vector_chunk_with_payload_to_path(
+        path: impl AsRef<Path>,
+        ids: &[u64],
+        flat_vectors: &[f32],
+        dim: usize,
+        payload_schema: Option<&UnifiedPayloadSchema>,
+        payload_rows: Option<&[UnifiedPayloadRow]>,
+    ) -> io::Result<UnifiedWriteStats> {
         validate_input_flat(ids, flat_vectors, dim)?;
         let path = path.as_ref();
 
         if !path.exists() || std::fs::metadata(path)?.len() == 0 {
-            return Self::write_vector_with_schema_flat_to_path(
+            return Self::write_vector_with_payload_flat_to_path(
                 path,
                 ids,
                 flat_vectors,
                 dim,
                 payload_schema,
+                payload_rows,
             );
         }
 
@@ -349,6 +376,12 @@ impl UnifiedLocalWriter {
         let has_schema_block = blocks
             .iter()
             .any(|b| b.block_type == UnifiedBlockType::PayloadSchema);
+        let has_payload_columns = blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadColumn);
+        let has_exact_index = blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadExactIndex);
         let flag_has_schema = (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA) != 0;
         if flag_has_schema != has_schema_block {
             return Err(io::Error::new(
@@ -356,57 +389,61 @@ impl UnifiedLocalWriter {
                 "append payload schema flag mismatch",
             ));
         }
-        if matches!(payload_schema, Some(schema) if !schema.is_empty()) && !flag_has_schema {
+        let flag_has_payload_columns = (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS) != 0;
+        if flag_has_payload_columns != has_payload_columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append payload columns flag mismatch",
+            ));
+        }
+        let flag_has_exact_index = (header.flags & UNIFIED_FLAG_HAS_EXACT_INDEX) != 0;
+        if flag_has_exact_index != has_exact_index {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append exact index flag mismatch",
+            ));
+        }
+
+        let existing_schema = if flag_has_schema {
+            Some(decode_existing_payload_schema(&blocks, &bytes)?)
+        } else {
+            None
+        };
+
+        let requested_schema = payload_schema.filter(|schema| !schema.is_empty());
+        if requested_schema.is_some() && existing_schema.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "append schema supplied but file has no schema",
             ));
         }
-        if let Some(expected_schema) = payload_schema.filter(|schema| !schema.is_empty())
-            && flag_has_schema
+        if let (Some(expected_schema), Some(actual_schema)) =
+            (requested_schema, existing_schema.as_ref())
+            && actual_schema != expected_schema
         {
-            let schema_block = blocks
-                .iter()
-                .find(|b| b.block_type == UnifiedBlockType::PayloadSchema)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "append schema flag set but schema block missing",
-                    )
-                })?;
-            let schema_start = schema_block.offset as usize;
-            let schema_end = schema_start
-                .checked_add(schema_block.compressed_len as usize)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "append schema overflow")
-                })?;
-            if schema_end > bytes.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "append schema block out of bounds",
-                ));
-            }
-            let (existing_schema, _): (UnifiedPayloadSchema, usize) = bincode::decode_from_slice(
-                &bytes[schema_start..schema_end],
-                bincode::config::standard(),
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if &existing_schema != expected_schema {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "append payload schema mismatch",
-                ));
-            }
-        }
-        if blocks.iter().any(|b| {
-            matches!(
-                b.block_type,
-                UnifiedBlockType::PayloadColumn | UnifiedBlockType::PayloadExactIndex
-            )
-        }) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "append with payload columns/indexes is not yet supported",
+                "append payload schema mismatch",
+            ));
+        }
+
+        let append_schema = requested_schema.or(existing_schema.as_ref());
+        if payload_rows.is_some() && append_schema.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "append payload rows require payload schema",
+            ));
+        }
+        if has_payload_columns && payload_rows.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "append payload rows required for file with payload columns",
+            ));
+        }
+        if !has_payload_columns && payload_rows.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot append payload rows to file that has no payload columns",
             ));
         }
 
@@ -414,8 +451,15 @@ impl UnifiedLocalWriter {
         bytes.truncate(header.block_dir_offset as usize);
         let row_start = header.row_count;
         let current_offset = bytes.len() as u64;
-        let (mut new_blocks, new_payload) =
-            build_chunk_blocks(row_start, ids, flat_vectors, dim, None, None)?;
+        let (mut new_blocks, new_payload) = build_chunk_blocks(
+            row_start,
+            ids,
+            flat_vectors,
+            dim,
+            append_schema,
+            payload_rows,
+            false,
+        )?;
 
         // Shift the new chunk block offsets to where we append in this file.
         for block in &mut new_blocks {
@@ -435,8 +479,27 @@ impl UnifiedLocalWriter {
         bytes.extend_from_slice(&block_dir_bytes);
 
         let new_row_count = row_start + ids.len() as u64;
+        let mut flags = 0u32;
+        if blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadSchema)
+        {
+            flags |= UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA;
+        }
+        if blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadColumn)
+        {
+            flags |= UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS;
+        }
+        if blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadExactIndex)
+        {
+            flags |= UNIFIED_FLAG_HAS_EXACT_INDEX;
+        }
         let footer = UnifiedFooter {
-            flags: header.flags,
+            flags,
             row_count: new_row_count,
             block_dir_offset,
             block_count: blocks.len() as u32,
@@ -449,6 +512,7 @@ impl UnifiedLocalWriter {
             .find(|b| b.block_type == UnifiedBlockType::Quantizer)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing quantizer block"))?;
 
+        header.flags = flags;
         header.row_count = new_row_count;
         header.block_dir_offset = block_dir_offset;
         header.block_count = blocks.len() as u32;
@@ -529,6 +593,37 @@ fn validate_input_flat(ids: &[u64], flat_vectors: &[f32], dim: usize) -> io::Res
     Ok(())
 }
 
+fn decode_existing_payload_schema(
+    blocks: &[UnifiedBlockDesc],
+    file_bytes: &[u8],
+) -> io::Result<UnifiedPayloadSchema> {
+    let schema_block = blocks
+        .iter()
+        .find(|b| b.block_type == UnifiedBlockType::PayloadSchema)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append schema flag set but schema block missing",
+            )
+        })?;
+    let schema_start = schema_block.offset as usize;
+    let schema_end = schema_start
+        .checked_add(schema_block.compressed_len as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "append schema overflow"))?;
+    if schema_end > file_bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "append schema block out of bounds",
+        ));
+    }
+    let (schema, _): (UnifiedPayloadSchema, usize) = bincode::decode_from_slice(
+        &file_bytes[schema_start..schema_end],
+        bincode::config::standard(),
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(schema)
+}
+
 fn build_chunk_blocks(
     row_start: u64,
     ids: &[u64],
@@ -536,6 +631,7 @@ fn build_chunk_blocks(
     dim: usize,
     payload_schema: Option<&UnifiedPayloadSchema>,
     payload_rows: Option<&[UnifiedPayloadRow]>,
+    include_schema_block: bool,
 ) -> io::Result<(Vec<UnifiedBlockDesc>, Vec<u8>)> {
     if let Some(rows) = payload_rows
         && rows.len() != ids.len()
@@ -563,12 +659,16 @@ fn build_chunk_blocks(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let ids_bytes = encode_ids(ids)?;
     let codes_bytes = encode_codes_flat(flat_vectors, dim, &quantizer)?;
-    let schema_bytes = match normalized_schema {
-        Some(schema) if !schema.is_empty() => Some(
-            bincode::encode_to_vec(schema, bincode::config::standard())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-        ),
-        _ => None,
+    let schema_bytes = if include_schema_block {
+        match normalized_schema {
+            Some(schema) if !schema.is_empty() => Some(
+                bincode::encode_to_vec(schema, bincode::config::standard())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            ),
+            _ => None,
+        }
+    } else {
+        None
     };
 
     let mut payload = Vec::new();
@@ -705,33 +805,18 @@ fn encode_payload_column_data(
         non_null.push(value.clone());
     }
 
-    let codec = payload_codec_for(logical_type);
-    let data = encode_non_null_payload_values(logical_type, &non_null)?;
+    let (codec, data) = encode_non_null_payload_values(logical_type, &non_null)?;
     let validity = if null_count > 0 { Some(validity) } else { None };
     Ok((codec, data, validity))
-}
-
-fn payload_codec_for(logical_type: &UnifiedLogicalType) -> UnifiedCodec {
-    match logical_type {
-        UnifiedLogicalType::Bool => UnifiedCodec::Bitset,
-        UnifiedLogicalType::Int64
-        | UnifiedLogicalType::Float32
-        | UnifiedLogicalType::Float64
-        | UnifiedLogicalType::TimestampMicros => UnifiedCodec::PlainLe,
-        UnifiedLogicalType::Keyword
-        | UnifiedLogicalType::Text
-        | UnifiedLogicalType::Bytes
-        | UnifiedLogicalType::LobRef => UnifiedCodec::VarLen,
-    }
 }
 
 fn encode_non_null_payload_values(
     logical_type: &UnifiedLogicalType,
     values: &[UnifiedPayloadValue],
-) -> io::Result<Vec<u8>> {
-    let mut out = Vec::new();
+) -> io::Result<(UnifiedCodec, Vec<u8>)> {
     match logical_type {
         UnifiedLogicalType::Bool => {
+            let mut out = Vec::new();
             out.resize(values.len().div_ceil(8), 0);
             for (i, value) in values.iter().enumerate() {
                 let UnifiedPayloadValue::Bool(v) = value else {
@@ -744,8 +829,10 @@ fn encode_non_null_payload_values(
                     out[i / 8] |= 1u8 << (i % 8);
                 }
             }
+            Ok((UnifiedCodec::Bitset, out))
         }
         UnifiedLogicalType::Int64 => {
+            let mut typed = Vec::with_capacity(values.len());
             for value in values {
                 let UnifiedPayloadValue::Int64(v) = value else {
                     return Err(io::Error::new(
@@ -753,10 +840,12 @@ fn encode_non_null_payload_values(
                         "payload int64 field received wrong value type",
                     ));
                 };
-                out.write_i64::<LittleEndian>(*v)?;
+                typed.push(*v);
             }
+            Ok((UnifiedCodec::ForBitpack, encode_for_bitpacked_i64(&typed)?))
         }
         UnifiedLogicalType::Float32 => {
+            let mut typed = Vec::with_capacity(values.len());
             for value in values {
                 let UnifiedPayloadValue::Float32(v) = value else {
                     return Err(io::Error::new(
@@ -764,10 +853,12 @@ fn encode_non_null_payload_values(
                         "payload float32 field received wrong value type",
                     ));
                 };
-                out.write_f32::<LittleEndian>(*v)?;
+                typed.push(*v);
             }
+            Ok((UnifiedCodec::AlpRd, alp_rd_encode(&typed)))
         }
         UnifiedLogicalType::Float64 => {
+            let mut typed = Vec::with_capacity(values.len());
             for value in values {
                 let UnifiedPayloadValue::Float64(v) = value else {
                     return Err(io::Error::new(
@@ -775,10 +866,12 @@ fn encode_non_null_payload_values(
                         "payload float64 field received wrong value type",
                     ));
                 };
-                out.write_f64::<LittleEndian>(*v)?;
+                typed.push(*v);
             }
+            Ok((UnifiedCodec::AlpRd, alp_rd_encode(&typed)))
         }
         UnifiedLogicalType::TimestampMicros => {
+            let mut typed = Vec::with_capacity(values.len());
             for value in values {
                 let UnifiedPayloadValue::TimestampMicros(v) = value else {
                     return Err(io::Error::new(
@@ -786,25 +879,47 @@ fn encode_non_null_payload_values(
                         "payload timestamp field received wrong value type",
                     ));
                 };
-                out.write_i64::<LittleEndian>(*v)?;
+                typed.push(*v);
             }
+            Ok((UnifiedCodec::ForBitpack, encode_for_bitpacked_i64(&typed)?))
         }
-        UnifiedLogicalType::Keyword | UnifiedLogicalType::Text => {
+        UnifiedLogicalType::Keyword => {
+            let mut raw_values = Vec::with_capacity(values.len());
             for value in values {
-                let raw = match value {
-                    UnifiedPayloadValue::Keyword(v) | UnifiedPayloadValue::Text(v) => v.as_bytes(),
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "payload string field received wrong value type",
-                        ));
-                    }
+                let UnifiedPayloadValue::Keyword(v) = value else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "payload keyword field received wrong value type",
+                    ));
                 };
-                out.write_u32::<LittleEndian>(raw.len() as u32)?;
-                out.extend_from_slice(raw);
+                raw_values.push(v.as_bytes().to_vec());
+            }
+            Ok((
+                UnifiedCodec::DictBitpack,
+                encode_dictionary_bitpacked_values(&raw_values)?,
+            ))
+        }
+        UnifiedLogicalType::Text => {
+            let mut raw_values = Vec::with_capacity(values.len());
+            for value in values {
+                let UnifiedPayloadValue::Text(v) = value else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "payload text field received wrong value type",
+                    ));
+                };
+                raw_values.push(v.as_bytes().to_vec());
+            }
+            let plain = encode_varlen_values(&raw_values)?;
+            let dict = encode_dictionary_bitpacked_values(&raw_values)?;
+            if dict.len() < plain.len() {
+                Ok((UnifiedCodec::DictBitpack, dict))
+            } else {
+                Ok((UnifiedCodec::VarLen, plain))
             }
         }
         UnifiedLogicalType::Bytes => {
+            let mut raw_values = Vec::with_capacity(values.len());
             for value in values {
                 let UnifiedPayloadValue::Bytes(raw) = value else {
                     return Err(io::Error::new(
@@ -812,11 +927,18 @@ fn encode_non_null_payload_values(
                         "payload bytes field received wrong value type",
                     ));
                 };
-                out.write_u32::<LittleEndian>(raw.len() as u32)?;
-                out.extend_from_slice(raw);
+                raw_values.push(raw.clone());
+            }
+            let plain = encode_varlen_values(&raw_values)?;
+            let dict = encode_dictionary_bitpacked_values(&raw_values)?;
+            if dict.len() < plain.len() {
+                Ok((UnifiedCodec::DictBitpack, dict))
+            } else {
+                Ok((UnifiedCodec::VarLen, plain))
             }
         }
         UnifiedLogicalType::LobRef => {
+            let mut out = Vec::new();
             for value in values {
                 let UnifiedPayloadValue::LobRef(v) = value else {
                     return Err(io::Error::new(
@@ -829,6 +951,136 @@ fn encode_non_null_payload_values(
                 out.write_u32::<LittleEndian>(encoded.len() as u32)?;
                 out.extend_from_slice(&encoded);
             }
+            Ok((UnifiedCodec::VarLen, out))
+        }
+    }
+}
+
+fn encode_for_bitpacked_i64(values: &[i64]) -> io::Result<Vec<u8>> {
+    let base = values.iter().copied().min().unwrap_or(0);
+    let mut deltas = Vec::with_capacity(values.len());
+    let mut max_delta = 0u64;
+    for &value in values {
+        let delta = (value as i128)
+            .checked_sub(base as i128)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bitpack delta underflow"))?;
+        let delta = u64::try_from(delta).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bitpack delta conversion overflow",
+            )
+        })?;
+        max_delta = max_delta.max(delta);
+        deltas.push(delta);
+    }
+
+    let bit_width = bit_width_u64(max_delta);
+    let packed = pack_u64_values(&deltas, bit_width)?;
+    let mut out = Vec::with_capacity(9 + packed.len());
+    out.write_i64::<LittleEndian>(base)?;
+    out.write_u8(bit_width)?;
+    out.extend_from_slice(&packed);
+    Ok(out)
+}
+
+fn encode_varlen_values(values: &[Vec<u8>]) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for value in values {
+        let len = u32::try_from(value.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "varlen payload value is too large",
+            )
+        })?;
+        out.write_u32::<LittleEndian>(len)?;
+        out.extend_from_slice(value);
+    }
+    Ok(out)
+}
+
+fn encode_dictionary_bitpacked_values(values: &[Vec<u8>]) -> io::Result<Vec<u8>> {
+    let mut dictionary_index: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+    let mut dictionary_values: Vec<Vec<u8>> = Vec::new();
+    let mut ids = Vec::with_capacity(values.len());
+
+    for value in values {
+        if let Some(&idx) = dictionary_index.get(value) {
+            ids.push(idx as u64);
+            continue;
+        }
+        let idx = u32::try_from(dictionary_values.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dictionary cardinality exceeds u32",
+            )
+        })?;
+        dictionary_values.push(value.clone());
+        dictionary_index.insert(value.clone(), idx);
+        ids.push(idx as u64);
+    }
+
+    let mut out = Vec::new();
+    out.write_u32::<LittleEndian>(u32::try_from(dictionary_values.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dictionary cardinality exceeds u32",
+        )
+    })?)?;
+    for value in &dictionary_values {
+        let len = u32::try_from(value.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dictionary entry exceeds u32 length",
+            )
+        })?;
+        out.write_u32::<LittleEndian>(len)?;
+        out.extend_from_slice(value);
+    }
+
+    let max_id = ids.iter().copied().max().unwrap_or(0);
+    let bit_width = bit_width_u64(max_id);
+    out.write_u8(bit_width)?;
+    out.extend_from_slice(&pack_u64_values(&ids, bit_width)?);
+    Ok(out)
+}
+
+fn bit_width_u64(max_value: u64) -> u8 {
+    if max_value == 0 {
+        0
+    } else {
+        (64 - max_value.leading_zeros()) as u8
+    }
+}
+
+fn pack_u64_values(values: &[u64], bit_width: u8) -> io::Result<Vec<u8>> {
+    if bit_width > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bit width exceeds 64",
+        ));
+    }
+    if bit_width == 0 {
+        return Ok(Vec::new());
+    }
+
+    let total_bits = values
+        .len()
+        .checked_mul(bit_width as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bitpack length overflow"))?;
+    let mut out = vec![0u8; total_bits.div_ceil(8)];
+    let mut bit_cursor = 0usize;
+    for &value in values {
+        let mut current = if bit_width == 64 {
+            value
+        } else {
+            value & ((1u64 << bit_width) - 1)
+        };
+        for _ in 0..bit_width {
+            if (current & 1) != 0 {
+                out[bit_cursor / 8] |= 1u8 << (bit_cursor % 8);
+            }
+            current >>= 1;
+            bit_cursor += 1;
         }
     }
     Ok(out)
@@ -1091,9 +1343,9 @@ mod tests {
     }
 
     #[test]
-    fn test_unified_local_append_rejects_when_payload_columns_exist() {
+    fn test_unified_local_append_rejects_when_payload_rows_missing_for_payload_file() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("bucket_payload_append_unsupported.driftu");
+        let path = dir.path().join("bucket_payload_append_missing_rows.driftu");
         let schema = UnifiedPayloadSchema::new(vec![crate::unified_format::UnifiedFieldSchema {
             field_id: 1,
             name: "tenant".to_string(),
@@ -1126,7 +1378,94 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string()
-                .contains("append with payload columns/indexes is not yet supported")
+                .contains("append payload rows required for file with payload columns")
         );
+    }
+
+    #[tokio::test]
+    async fn test_unified_local_append_with_payload_rows_merges_exact_indexes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bucket_payload_append_supported.driftu");
+        let schema = UnifiedPayloadSchema::new(vec![crate::unified_format::UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+        let rows_a: Vec<UnifiedPayloadRow> = vec![
+            BTreeMap::from([(
+                1,
+                crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+            )]),
+            BTreeMap::from([(
+                1,
+                crate::unified_format::UnifiedPayloadValue::Keyword("globex".to_string()),
+            )]),
+        ];
+
+        UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
+            &path,
+            &[1, 2],
+            &[0.1, 0.2, 0.3, 0.4],
+            2,
+            Some(&schema),
+            Some(&rows_a),
+        )
+        .unwrap();
+
+        let rows_b: Vec<UnifiedPayloadRow> = vec![
+            BTreeMap::from([(
+                1,
+                crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+            )]),
+            BTreeMap::from([(
+                1,
+                crate::unified_format::UnifiedPayloadValue::Keyword("initech".to_string()),
+            )]),
+        ];
+        UnifiedLocalWriter::append_vector_chunk_with_payload_to_path(
+            &path,
+            &[3, 4],
+            &[0.5, 0.6, 0.7, 0.8],
+            2,
+            Some(&schema),
+            Some(&rows_b),
+        )
+        .unwrap();
+
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let reader = UnifiedReader::open(op, "bucket_payload_append_supported.driftu")
+            .await
+            .unwrap();
+
+        let payload_rows = reader.read_payload_rows().await.unwrap();
+        let expected_rows: Vec<UnifiedPayloadRow> = rows_a
+            .iter()
+            .cloned()
+            .chain(rows_b.iter().cloned())
+            .collect();
+        assert_eq!(payload_rows, expected_rows);
+
+        let acme = reader
+            .filter_ids_exact(
+                1,
+                &crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acme, vec![1, 3]);
+
+        let initech = reader
+            .filter_ids_exact(
+                1,
+                &crate::unified_format::UnifiedPayloadValue::Keyword("initech".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initech, vec![4]);
     }
 }
