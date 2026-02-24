@@ -69,6 +69,8 @@ impl Drift for DriftService {
                 mismatches_detected: recovery_guard.mismatches_detected,
                 invalidations_performed: recovery_guard.invalidations_performed,
                 fail_fast_aborts: recovery_guard.fail_fast_aborts,
+                payload_index_mismatches_detected: recovery_guard.payload_index_mismatches_detected,
+                payload_index_validation_errors: recovery_guard.payload_index_validation_errors,
             }),
         }))
     }
@@ -127,7 +129,7 @@ impl Drift for DriftService {
         // The Janitor will see the volume and trigger training automatically.
         collection
             .index
-            .insert_batch(&batch)
+            .insert_batch_with_payload(&batch, None, None)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(TrainResponse { success: true }))
@@ -151,7 +153,7 @@ impl Drift for DriftService {
         if let Some(vec) = req.vector {
             collection
                 .index
-                .insert(vec.id, &vec.values)
+                .insert_with_payload(vec.id, &vec.values, None, None)
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
 
@@ -177,7 +179,7 @@ impl Drift for DriftService {
 
         collection
             .index
-            .insert_batch(&batch)
+            .insert_batch_with_payload(&batch, None, None)
             .map_err(|e| Status::internal(e.to_string()))?;
 
         Ok(Response::new(InsertResponse { success: true }))

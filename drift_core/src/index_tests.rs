@@ -3,6 +3,9 @@ mod tests {
     use crate::index::VectorIndex;
     use crate::manifest::pb::Centroid;
     use crate::math::Metric;
+    use crate::payload::{
+        PayloadFieldSchema, PayloadLogicalType, PayloadRow, PayloadSchema, PayloadValue,
+    };
     use crate::router::Router;
     use crate::wal::WalEntry;
     use crate::wal::WalManager;
@@ -12,8 +15,7 @@ mod tests {
     use drift_traits::BucketStats;
     use drift_traits::StorageEngine; // Removed SearchCandidate
     use parking_lot::{Mutex, RwLock};
-    use std::collections::HashMap;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -547,6 +549,49 @@ mod tests {
         // Actually flush_frozen() snapshots. The previous call returned Some.
         // Calling it again immediately should still return Some unless we acknowledged the specific WAL IDs.
         // The mock flush_frozen implementation in the test might differ from reality if we don't have WAL IDs.
+    }
+
+    #[test]
+    fn test_flush_frozen_preserves_payload_rows() {
+        let dir = tempdir().unwrap();
+        let (index, _) = create_index(&dir, 2);
+        let schema = PayloadSchema::new(vec![PayloadFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: PayloadLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+        let batch: Vec<(u64, Vec<f32>)> = vec![(1, vec![-9.0, -9.0]), (2, vec![9.0, 9.0])];
+        let rows: Vec<PayloadRow> = vec![
+            BTreeMap::from([(1, PayloadValue::Keyword("acme".to_string()))]),
+            BTreeMap::from([(1, PayloadValue::Keyword("globex".to_string()))]),
+        ];
+
+        let rotated = index
+            .insert_batch_with_payload(&batch, Some(&schema), Some(&rows))
+            .unwrap();
+        assert!(rotated, "insert should trigger rotation");
+
+        let (partitions, _) = index.flush_frozen().expect("frozen table should exist");
+        let b0 = partitions.get(&0).expect("bucket 0 partition missing");
+        let b1 = partitions.get(&1).expect("bucket 1 partition missing");
+
+        assert_eq!(b0.payload_schema, Some(schema.clone()));
+        assert_eq!(b1.payload_schema, Some(schema));
+
+        let b0_rows = b0.payload_rows.as_ref().unwrap();
+        let b1_rows = b1.payload_rows.as_ref().unwrap();
+        assert_eq!(b0_rows.len(), 1);
+        assert_eq!(b1_rows.len(), 1);
+        assert_eq!(
+            b0_rows[0].get(&1),
+            Some(&PayloadValue::Keyword("acme".to_string()))
+        );
+        assert_eq!(
+            b1_rows[0].get(&1),
+            Some(&PayloadValue::Keyword("globex".to_string()))
+        );
     }
 
     // --- Mock Storage Engine ---

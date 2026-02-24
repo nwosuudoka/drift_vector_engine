@@ -1,15 +1,19 @@
+use crate::payload::{PayloadRow, PayloadSchema};
 use crate::{math::Metric, metric_strategy::strategy_for};
 use drift_traits::TombstoneView;
 use parking_lot::{RwLock, RwLockReadGuard};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::io;
 
 /// Level 0: High-Density In-Memory Buffer.
 /// Used for both Active Ingestion and Frozen Flushing.
 pub struct MemTable {
     ids: RwLock<Vec<u64>>,
     data: RwLock<Vec<f32>>,
+    payload_schema: RwLock<Option<PayloadSchema>>,
+    payload_rows: RwLock<Option<Vec<PayloadRow>>>,
     options: MemTableOptions,
 }
 
@@ -23,11 +27,17 @@ impl MemTable {
         Self {
             ids: RwLock::new(Vec::with_capacity(options.capacity)),
             data: RwLock::new(Vec::with_capacity(options.capacity * options.dim)),
+            payload_schema: RwLock::new(None),
+            payload_rows: RwLock::new(None),
             options,
         }
     }
 
     pub fn insert(&self, id: u64, vector: &[f32]) -> bool {
+        assert!(
+            self.payload_schema.read().is_none(),
+            "payload-enabled memtable requires payload rows on insert"
+        );
         assert!(
             vector.len() == self.options.dim,
             "mismatch dims {} != {}",
@@ -46,6 +56,10 @@ impl MemTable {
 
     /// Batch insert. Returns `true` if capacity is reached/exceeded.
     pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) -> bool {
+        assert!(
+            self.payload_schema.read().is_none(),
+            "payload-enabled memtable requires payload rows on batch insert"
+        );
         let batch_len = batch.len();
         if batch_len == 0 {
             return false;
@@ -67,6 +81,122 @@ impl MemTable {
         }; // 🔓 Locks released
 
         new_len >= self.options.capacity
+    }
+
+    pub fn insert_with_payload(
+        &self,
+        id: u64,
+        vector: &[f32],
+        payload_schema: Option<&PayloadSchema>,
+        payload_row: Option<&PayloadRow>,
+    ) -> io::Result<bool> {
+        if vector.len() != self.options.dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("mismatch dims {} != {}", self.options.dim, vector.len()),
+            ));
+        }
+
+        let batch = vec![(id, vector.to_vec())];
+        let rows_buf = payload_row.cloned().map(|row| vec![row]);
+        self.insert_batch_with_payload(&batch, payload_schema, rows_buf.as_deref())
+    }
+
+    pub fn insert_batch_with_payload(
+        &self,
+        batch: &[(u64, Vec<f32>)],
+        payload_schema: Option<&PayloadSchema>,
+        payload_rows: Option<&[PayloadRow]>,
+    ) -> io::Result<bool> {
+        let batch_len = batch.len();
+        if batch_len == 0 {
+            return Ok(false);
+        }
+
+        let normalized_schema = payload_schema.filter(|schema| !schema.is_empty());
+        if payload_rows.is_some() && normalized_schema.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload rows provided without payload schema",
+            ));
+        }
+        if normalized_schema.is_some() && payload_rows.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload schema provided without payload rows",
+            ));
+        }
+        if let Some(rows) = payload_rows
+            && rows.len() != batch_len
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "payload row count mismatch: batch={}, payload_rows={}",
+                    batch_len,
+                    rows.len()
+                ),
+            ));
+        }
+        for (_, vector) in batch {
+            if vector.len() != self.options.dim {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("mismatch dims {} != {}", self.options.dim, vector.len()),
+                ));
+            }
+        }
+
+        let mut schema_guard = self.payload_schema.write();
+        let mut row_guard = self.payload_rows.write();
+        match (&*schema_guard, normalized_schema) {
+            (Some(existing), Some(requested)) => {
+                if existing != requested {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "payload schema mismatch for memtable insert",
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "payload-enabled memtable requires payload rows",
+                ));
+            }
+            (None, Some(requested)) => {
+                *schema_guard = Some(requested.clone());
+                *row_guard = Some(Vec::new());
+            }
+            (None, None) => {}
+        }
+
+        if schema_guard.is_some() {
+            let Some(rows) = payload_rows else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "payload-enabled memtable requires payload rows",
+                ));
+            };
+            let target_rows = row_guard.get_or_insert_with(Vec::new);
+            target_rows.reserve(rows.len());
+            target_rows.extend(rows.iter().cloned());
+        }
+
+        let new_len = {
+            let mut ids = self.ids.write();
+            let mut data = self.data.write();
+
+            ids.reserve(batch_len);
+            data.reserve(batch_len * self.options.dim);
+            for (id, vector) in batch {
+                ids.push(*id);
+                data.extend_from_slice(vector);
+            }
+            ids.len()
+        };
+
+        Ok(new_len >= self.options.capacity)
     }
 
     pub fn len(&self) -> usize {
@@ -170,6 +300,21 @@ impl MemTable {
         let ids = self.ids.read().clone();
         let data = self.data.read().clone();
         (ids, data)
+    }
+
+    pub fn snapshot_with_payload(
+        &self,
+    ) -> (
+        Vec<u64>,
+        Vec<f32>,
+        Option<PayloadSchema>,
+        Option<Vec<PayloadRow>>,
+    ) {
+        let ids = self.ids.read().clone();
+        let data = self.data.read().clone();
+        let schema = self.payload_schema.read().clone();
+        let rows = self.payload_rows.read().clone();
+        (ids, data, schema, rows)
     }
 }
 

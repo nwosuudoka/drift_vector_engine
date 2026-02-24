@@ -9,6 +9,25 @@ pub mod pb {
 use crate::math::Metric;
 use pb::{Bucket, Centroid, Manifest};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BucketPayloadIndexMeta {
+    pub has_payload_columns: bool,
+    pub has_exact_index: bool,
+    pub has_payload_stats: bool,
+    pub payload_schema_hash: u64,
+}
+
+impl BucketPayloadIndexMeta {
+    pub fn from_bucket(bucket: &Bucket) -> Self {
+        Self {
+            has_payload_columns: bucket.has_payload_columns,
+            has_exact_index: bucket.has_exact_index,
+            has_payload_stats: bucket.has_payload_stats,
+            payload_schema_hash: bucket.payload_schema_hash,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ManifestWrapper {
     pub inner: Manifest,
@@ -79,6 +98,10 @@ impl ManifestWrapper {
             radius: 0.0,
             object_path,
             object_fingerprint: String::new(),
+            has_payload_columns: false,
+            has_exact_index: false,
+            has_payload_stats: false,
+            payload_schema_hash: 0,
         });
 
         // 2. Update Routing Table (if centroid provided)
@@ -125,6 +148,19 @@ impl ManifestWrapper {
             b.run_id = new_run_id;
             b.object_path = Self::default_object_path(id, &b.run_id);
             b.object_fingerprint.clear();
+            b.has_payload_columns = false;
+            b.has_exact_index = false;
+            b.has_payload_stats = false;
+            b.payload_schema_hash = 0;
+        }
+    }
+
+    pub fn update_bucket_payload_index_meta(&mut self, id: u32, meta: BucketPayloadIndexMeta) {
+        if let Some(b) = self.inner.buckets.iter_mut().find(|b| b.id == id) {
+            b.has_payload_columns = meta.has_payload_columns;
+            b.has_exact_index = meta.has_exact_index;
+            b.has_payload_stats = meta.has_payload_stats;
+            b.payload_schema_hash = meta.payload_schema_hash;
         }
     }
 
@@ -139,6 +175,25 @@ impl ManifestWrapper {
             b.run_id = run_id;
             b.object_path = object_path;
             b.object_fingerprint = object_fingerprint;
+        }
+    }
+
+    pub fn update_bucket_remote_meta_with_payload_index(
+        &mut self,
+        id: u32,
+        run_id: String,
+        object_path: String,
+        object_fingerprint: String,
+        payload_index_meta: BucketPayloadIndexMeta,
+    ) {
+        if let Some(b) = self.inner.buckets.iter_mut().find(|b| b.id == id) {
+            b.run_id = run_id;
+            b.object_path = object_path;
+            b.object_fingerprint = object_fingerprint;
+            b.has_payload_columns = payload_index_meta.has_payload_columns;
+            b.has_exact_index = payload_index_meta.has_exact_index;
+            b.has_payload_stats = payload_index_meta.has_payload_stats;
+            b.payload_schema_hash = payload_index_meta.payload_schema_hash;
         }
     }
 }

@@ -8,6 +8,7 @@ pub mod math;
 pub mod memtable;
 pub mod metric_strategy;
 pub mod partitioner;
+pub mod payload;
 pub mod quantizer;
 pub mod router;
 pub mod tombstone;

@@ -175,8 +175,9 @@ mod tests {
 mod persistence_integration_tests {
     use crate::persistence::PersistenceManager;
     use drift_storage::unified_format::{
-        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadRow, UnifiedPayloadSchema,
-        UnifiedPayloadValue,
+        UNIFIED_FLAG_HAS_EXACT_INDEX, UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS,
+        UNIFIED_FLAG_HAS_PAYLOAD_STATS, UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadRow,
+        UnifiedPayloadSchema, UnifiedPayloadValue,
     };
     use drift_storage::unified_reader::UnifiedReader;
     use opendal::{Operator, services};
@@ -350,6 +351,67 @@ mod persistence_integration_tests {
             .await
             .unwrap();
         assert_eq!(payload_rows, rows);
+    }
+
+    #[tokio::test]
+    async fn test_persistence_write_result_exposes_payload_index_meta() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op.clone());
+        let bucket_id = 9;
+        let dim = 2;
+
+        let ids = vec![101, 102];
+        let flat = vec![0.1, 0.2, 0.3, 0.4];
+        let schema = UnifiedPayloadSchema::new(vec![UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+        let rows: Vec<UnifiedPayloadRow> = vec![
+            std::collections::BTreeMap::from([(1, UnifiedPayloadValue::Keyword("a".to_string()))]),
+            std::collections::BTreeMap::from([(1, UnifiedPayloadValue::Keyword("b".to_string()))]),
+        ];
+
+        let result = persistence
+            .write_remote_bucket_unified_flat_with_payload_result(
+                bucket_id,
+                &ids,
+                &flat,
+                dim,
+                Some(&schema),
+                Some(&rows),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.row_count, ids.len() as u64);
+        assert!(result.payload_index_meta.has_payload_columns);
+        assert!(result.payload_index_meta.has_exact_index);
+        assert!(result.payload_index_meta.has_payload_stats);
+        assert!(result.payload_index_meta.payload_schema_hash != 0);
+
+        let reader = UnifiedReader::open(op.clone(), &result.object_path)
+            .await
+            .unwrap();
+        assert!(
+            (reader.header.flags & UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS) != 0,
+            "header should advertise payload columns"
+        );
+        assert!(
+            (reader.header.flags & UNIFIED_FLAG_HAS_EXACT_INDEX) != 0,
+            "header should advertise exact index"
+        );
+        assert!(
+            (reader.header.flags & UNIFIED_FLAG_HAS_PAYLOAD_STATS) != 0,
+            "header should advertise payload stats"
+        );
+        assert_eq!(
+            result.payload_index_meta.payload_schema_hash,
+            reader.header.payload_schema_hash
+        );
     }
 }
 

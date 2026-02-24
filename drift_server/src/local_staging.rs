@@ -1,5 +1,5 @@
 use drift_core::partitioner::PartitionGroup;
-use drift_storage::unified_format::UnifiedPayloadSchema;
+use drift_storage::unified_format::{UnifiedBlockType, UnifiedPayloadRow, UnifiedPayloadSchema};
 use drift_storage::unified_reader::UnifiedReader;
 use drift_storage::unified_writer::UnifiedLocalWriter;
 use drift_traits::IoContext;
@@ -93,7 +93,8 @@ impl LocalStagingManager {
     }
 
     pub async fn append_batch(&self, bucket_id: u32, batch: &PartitionGroup) -> io::Result<u64> {
-        self.append_batch_with_schema(bucket_id, batch, None).await
+        self.append_batch_with_payload(bucket_id, batch, None, None)
+            .await
     }
 
     pub async fn append_batch_with_schema(
@@ -101,6 +102,17 @@ impl LocalStagingManager {
         bucket_id: u32,
         batch: &PartitionGroup,
         payload_schema: Option<&UnifiedPayloadSchema>,
+    ) -> io::Result<u64> {
+        self.append_batch_with_payload(bucket_id, batch, payload_schema, None)
+            .await
+    }
+
+    pub async fn append_batch_with_payload(
+        &self,
+        bucket_id: u32,
+        batch: &PartitionGroup,
+        payload_schema: Option<&UnifiedPayloadSchema>,
+        payload_rows: Option<&[UnifiedPayloadRow]>,
     ) -> io::Result<u64> {
         if batch.count == 0 {
             return Ok(0);
@@ -112,12 +124,13 @@ impl LocalStagingManager {
         // Resolve Dynamic Filename
         let filename = self.get_active_filename(bucket_id);
         let path = self.base_path.join(&filename);
-        let stats = UnifiedLocalWriter::append_vector_chunk_with_schema_to_path(
+        let stats = UnifiedLocalWriter::append_vector_chunk_with_payload_to_path(
             &path,
             &batch.ids,
             &batch.flat_vectors,
             dim,
             payload_schema,
+            payload_rows,
         )?;
         Ok(stats.row_count)
     }
@@ -155,6 +168,26 @@ impl LocalStagingManager {
         reader.read_payload_schema().await
     }
 
+    pub async fn read_file_payload_rows(
+        &self,
+        filename: &str,
+    ) -> io::Result<Option<Vec<UnifiedPayloadRow>>> {
+        let path = self.base_path.join(filename);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let op = self.create_local_op()?;
+        let reader = UnifiedReader::open(op, filename).await?;
+        let has_payload_columns = reader
+            .blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadColumn);
+        if !has_payload_columns {
+            return Ok(None);
+        }
+        Ok(Some(reader.read_payload_rows().await?))
+    }
+
     /// Reads the current active file for the bucket.
     /// ⚡ This method is lock-free (unsafe if concurrent writes happen, but fine for tests).
     pub async fn read_full_bucket(&self, bucket_id: u32) -> io::Result<(Vec<u64>, Vec<Vec<f32>>)> {
@@ -173,6 +206,14 @@ impl LocalStagingManager {
     ) -> io::Result<Option<UnifiedPayloadSchema>> {
         let filename = self.get_active_filename(bucket_id);
         self.read_file_payload_schema(&filename).await
+    }
+
+    pub async fn read_full_bucket_payload_rows(
+        &self,
+        bucket_id: u32,
+    ) -> io::Result<Option<Vec<UnifiedPayloadRow>>> {
+        let filename = self.get_active_filename(bucket_id);
+        self.read_file_payload_rows(&filename).await
     }
 
     pub async fn delete_file(&self, filename: &str) -> io::Result<()> {
@@ -234,7 +275,8 @@ impl LocalStagingManager {
     /// NEW: Writes a fresh file for a bucket (CoW support).
     /// Used during Scatter-Merge to rewrite a neighbor bucket with new data.
     pub async fn write_new_file(&self, filename: &str, group: &PartitionGroup) -> io::Result<u64> {
-        self.write_new_file_with_schema(filename, group, None).await
+        self.write_new_file_with_payload(filename, group, None, None)
+            .await
     }
 
     pub async fn write_new_file_with_schema(
@@ -243,14 +285,26 @@ impl LocalStagingManager {
         group: &PartitionGroup,
         payload_schema: Option<&UnifiedPayloadSchema>,
     ) -> io::Result<u64> {
+        self.write_new_file_with_payload(filename, group, payload_schema, None)
+            .await
+    }
+
+    pub async fn write_new_file_with_payload(
+        &self,
+        filename: &str,
+        group: &PartitionGroup,
+        payload_schema: Option<&UnifiedPayloadSchema>,
+        payload_rows: Option<&[UnifiedPayloadRow]>,
+    ) -> io::Result<u64> {
         let path = self.base_path.join(filename);
         let dim = group.flat_vectors.len() / group.ids.len();
-        let stats = UnifiedLocalWriter::write_vector_with_schema_flat_to_path(
+        let stats = UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
             &path,
             &group.ids,
             &group.flat_vectors,
             dim,
             payload_schema,
+            payload_rows,
         )?;
         Ok(stats.row_count)
     }

@@ -41,12 +41,45 @@
   - [x] Janitor periodic + lifecycle `kv.sync()` policy.
   - [x] Startup KV validation with rebuild on missing/stale mappings.
 
-## Next Major Step: Payload and Secondary Index Expansion
+## Next Major Step: Unified Payload and Secondary Index Expansion
 
-- [ ] Sidecar payload format for metadata and full text values.
-- [ ] Query planner for hybrid vector + filter execution.
-- [ ] Pluggable index trait for metadata/text/range fields.
-- [ ] First production secondary index implementation (exact match + range baseline).
+### Phase A: Storage Wire Contract Hardening (`drift_storage`)
+
+- [x] Extend unified header/footer with metric + payload schema hash.
+- [x] Add row-group stats metadata (`null_count`, `min`, `max`, `cardinality_hint`) for payload pruning.
+- [x] Switch exact-index postings from raw vectors to delta + bitpacked wire encoding.
+- [ ] Define and implement range-index block format for numeric/time payload fields.
+- [x] Add malformed-input test matrix for all new codec/index paths.
+
+### Phase B: Data Path Wiring for Payload Preservation (`drift_core` + `drift_server`)
+
+- [x] Extend ingest/partition structures to carry payload rows along with vectors.
+- [x] Wire payload rows through staging append path (not schema-only).
+- [x] Preserve payload rows during promotion merge/rewrite (local + remote + tombstone purge).
+- [ ] Preserve payload rows during split/merge/scatter rewrite flows.
+- [ ] Add end-to-end tests that verify payload survives flush -> promote -> recover.
+
+### Phase C: Manifest and Recovery Metadata (`manifest.proto` + server recovery)
+
+- [x] Extend manifest bucket metadata for payload/index capabilities and schema hash consistency checks.
+- [x] Record payload/index state atomically with run metadata updates.
+- [x] Validate payload/index metadata during startup recovery and expose degraded-state diagnostics.
+
+### Phase D: API and Query Surface (`drift.proto` + server handlers)
+
+- [ ] Add payload schema management API (create/update/validate field definitions).
+- [ ] Add insert/insert-batch payload fields in protobuf API.
+- [ ] Add filter DSL to search request (`exact`, `in`, `range`, boolean composition baseline).
+- [ ] Add optional payload projection in search response (late materialization path).
+- [ ] Keep vector-only API behavior fully backward compatible.
+
+### Phase E: Planner and Execution
+
+- [ ] Implement filter-first vs vector-first planning heuristics using index/stats selectivity.
+- [ ] Integrate exact-index candidate pruning into query execution.
+- [ ] Integrate range-index candidate pruning and fallback scan behavior.
+- [ ] Add instrumentation for candidate reduction, filter latency, and decode costs.
+- [ ] Validate p95 latency/regression and selective-filter win targets.
 
 ## Deferred (Post-Expansion Hardening)
 

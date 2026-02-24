@@ -7,14 +7,21 @@ mod tests {
     use drift_core::index::VectorIndex;
     use drift_core::lock_manager::BucketCoordinator;
     use drift_core::math::Metric;
+    use drift_core::payload::{
+        PayloadFieldSchema, PayloadLogicalType, PayloadRow, PayloadSchema, PayloadValue,
+    };
     use drift_core::router::Router;
     use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
     use drift_storage::bucket_manager::BucketManager;
+    use drift_storage::unified_format::{
+        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadSchema, UnifiedPayloadValue,
+    };
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
     fn create_fs_operator(path: &std::path::Path) -> Operator {
@@ -79,7 +86,7 @@ mod tests {
             bucket_manager: bucket_manager.clone(),
             coordinator: coordinator.clone(),
             vars: JanitorVars {
-                promotion_threshold_bytes: 100,
+                promotion_threshold_bytes: u64::MAX,
                 check_interval: Duration::from_millis(10),
                 ..Default::default()
             },
@@ -98,7 +105,24 @@ mod tests {
 
         // 5. Run Janitor (Flushes Frozen)
         let handle = tokio::spawn(async move { janitor.run().await });
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let flushed = manifest
+                .get_state()
+                .get_buckets()
+                .iter()
+                .find(|b| b.id == 0)
+                .map(|b| b.vector_count)
+                .unwrap_or(0);
+            if flushed >= 10 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for janitor flush"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         handle.abort();
 
         // 6. Verify Persistence
@@ -121,6 +145,135 @@ mod tests {
         // 1 Frozen WAL was deleted. 1 Active WAL should remain.
         let files = std::fs::read_dir(&wal_dir).unwrap().count();
         assert_eq!(files, 1, "Should have exactly 1 active WAL file remaining");
+    }
+
+    #[tokio::test]
+    async fn test_janitor_flush_preserves_payload_rows_from_ingest() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let dim = 2;
+        let bucket_id = 0;
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
+        let staging = Arc::new(LocalStagingManager::new(&data_dir).unwrap());
+        let op = create_fs_operator(&data_dir);
+        let persistence = Arc::new(PersistenceManager::new(op.clone()));
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let bucket_manager = Arc::new(BucketManager::new(
+            op.clone(),
+            op.clone(),
+            8,
+            coordinator.clone(),
+            Metric::L2,
+        ));
+
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(bucket_id, "run_init".to_string(), Some(vec![0.0; dim]));
+            })
+            .unwrap();
+
+        let wal_dir = dir.path().join("wal");
+        let wal_mgr = Arc::new(Mutex::new(WalManager::new(&wal_dir).unwrap()));
+        let centroids = vec![drift_core::manifest::pb::Centroid {
+            id: bucket_id,
+            vector: vec![0.0; dim],
+        }];
+        let router = Arc::new(RwLock::new(
+            Router::new(&centroids, &[0], dim, Metric::L2).unwrap(),
+        ));
+        let kv = Arc::new(BitStore::new(dir.path().join("kv")).unwrap());
+        let index = Arc::new(VectorIndex::new(
+            dim,
+            10,
+            router,
+            wal_mgr,
+            bucket_manager.clone(),
+            kv,
+        ));
+
+        let janitor = Janitor::new(JanitorConfig {
+            index: index.clone(),
+            manifest: manifest.clone(),
+            staging: staging.clone(),
+            persistence,
+            bucket_manager: bucket_manager.clone(),
+            coordinator,
+            vars: JanitorVars {
+                promotion_threshold_bytes: u64::MAX,
+                check_interval: Duration::from_millis(10),
+                ..Default::default()
+            },
+        });
+
+        let schema = PayloadSchema::new(vec![PayloadFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: PayloadLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+        let batch: Vec<(u64, Vec<f32>)> = (0..10).map(|i| (i, vec![0.0; dim])).collect();
+        let rows: Vec<PayloadRow> = (0..10)
+            .map(|i| BTreeMap::from([(1, PayloadValue::Keyword(format!("tenant_{i}")))]))
+            .collect();
+
+        let rotated = index
+            .insert_batch_with_payload(&batch, Some(&schema), Some(&rows))
+            .unwrap();
+        assert!(rotated, "batch should fill capacity and rotate");
+
+        let handle = tokio::spawn(async move { janitor.run().await });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let flushed = manifest
+                .get_state()
+                .get_buckets()
+                .iter()
+                .find(|b| b.id == bucket_id)
+                .map(|b| b.vector_count)
+                .unwrap_or(0);
+            if flushed >= 10 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for janitor flush"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+
+        let staged_schema = staging
+            .read_full_bucket_payload_schema(bucket_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            staged_schema,
+            Some(UnifiedPayloadSchema::new(vec![UnifiedFieldSchema {
+                field_id: 1,
+                name: "tenant".to_string(),
+                logical_type: UnifiedLogicalType::Keyword,
+                nullable: false,
+                indexed: true,
+            }]))
+        );
+
+        let staged_rows = staging
+            .read_full_bucket_payload_rows(bucket_id)
+            .await
+            .unwrap()
+            .expect("payload rows should be present");
+        assert_eq!(staged_rows.len(), 10);
+        assert_eq!(
+            staged_rows[0].get(&1),
+            Some(&UnifiedPayloadValue::Keyword("tenant_0".to_string()))
+        );
+        assert_eq!(
+            staged_rows[9].get(&1),
+            Some(&UnifiedPayloadValue::Keyword("tenant_9".to_string()))
+        );
     }
 }
 
@@ -1015,7 +1168,8 @@ mod janitor_promotion_test {
     use drift_kv::bitstore::BitStore;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
     use drift_storage::unified_format::{
-        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadSchema,
+        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadRow, UnifiedPayloadSchema,
+        UnifiedPayloadValue,
     };
     use drift_storage::unified_writer::UnifiedLocalWriter;
     use drift_traits::StorageEngine;
@@ -1038,11 +1192,14 @@ mod janitor_promotion_test {
         vecs: &[Vec<f32>],
         dim: usize,
         schema: Option<&UnifiedPayloadSchema>,
+        rows: Option<&[UnifiedPayloadRow]>,
     ) {
         let path = dir.join(filename);
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
-        UnifiedLocalWriter::write_vector_with_schema_flat_to_path(&path, ids, &flat, dim, schema)
-            .unwrap();
+        UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
+            &path, ids, &flat, dim, schema, rows,
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1092,6 +1249,15 @@ mod janitor_promotion_test {
         // We simulate a previous run "run_OLD"
         let remote_ids: Vec<u64> = (0..10).collect();
         let remote_vecs = vec![vec![1.0, 1.0]; 10];
+        let remote_rows: Vec<UnifiedPayloadRow> = remote_ids
+            .iter()
+            .map(|id| {
+                std::collections::BTreeMap::from([(
+                    1,
+                    UnifiedPayloadValue::Keyword(format!("remote_{id}")),
+                )])
+            })
+            .collect();
         create_s3_segment(
             &data_dir,
             "bucket_1_run_OLD.driftu",
@@ -1099,6 +1265,7 @@ mod janitor_promotion_test {
             &remote_vecs,
             dim,
             Some(&schema),
+            Some(&remote_rows),
         )
         .await;
 
@@ -1110,10 +1277,19 @@ mod janitor_promotion_test {
             group.flat_vectors.extend_from_slice(&[2.0, 2.0]);
         }
         group.count = 10;
+        let local_rows: Vec<UnifiedPayloadRow> = local_ids
+            .iter()
+            .map(|id| {
+                std::collections::BTreeMap::from([(
+                    1,
+                    UnifiedPayloadValue::Keyword(format!("local_{id}")),
+                )])
+            })
+            .collect();
 
         // Write to staging and register as Active
         staging
-            .append_batch_with_schema(bucket_id, &group, Some(&schema))
+            .append_batch_with_payload(bucket_id, &group, Some(&schema), Some(&local_rows))
             .await
             .unwrap();
 
@@ -1218,6 +1394,25 @@ mod janitor_promotion_test {
         assert!(!stored_ids.contains(&15), "ID 15 should be purged");
         assert!(stored_ids.contains(&0), "ID 0 should remain");
         assert!(stored_ids.contains(&19), "ID 19 should remain");
+
+        let stored_payload_rows = persistence
+            .read_remote_bucket_payload_rows(bucket_id, &b1.run_id)
+            .await
+            .unwrap();
+        assert_eq!(stored_payload_rows.len(), 18);
+        let mut expected_rows: Vec<UnifiedPayloadRow> = Vec::with_capacity(18);
+        for (id, row) in local_ids.iter().zip(local_rows.iter()) {
+            if *id != 15 {
+                expected_rows.push(row.clone());
+            }
+        }
+        for (id, row) in remote_ids.iter().zip(remote_rows.iter()) {
+            if *id != 5 {
+                expected_rows.push(row.clone());
+            }
+        }
+        assert_eq!(stored_payload_rows, expected_rows);
+
         let decoded_schema = persistence
             .read_remote_bucket_payload_schema(bucket_id, &b1.run_id)
             .await

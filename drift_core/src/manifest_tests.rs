@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::{manifest::ManifestWrapper, math::Metric};
+    use crate::{
+        manifest::{BucketPayloadIndexMeta, ManifestWrapper},
+        math::Metric,
+    };
 
     #[test]
     fn test_manifest_lifecycle() {
@@ -56,6 +59,10 @@ mod tests {
         assert_eq!(buckets[0].run_id, "run_A");
         assert_eq!(buckets[0].object_path, "bucket_100_run_A.driftu");
         assert!(buckets[0].object_fingerprint.is_empty());
+        assert!(!buckets[0].has_payload_columns);
+        assert!(!buckets[0].has_exact_index);
+        assert!(!buckets[0].has_payload_stats);
+        assert_eq!(buckets[0].payload_schema_hash, 0);
 
         let centroids = manifest.get_centroids();
         assert_eq!(centroids.len(), 1);
@@ -157,17 +164,27 @@ mod tests {
         let mut manifest = ManifestWrapper::new(8, metric);
         manifest.add_bucket(42, "run_old".to_string(), Some(vec![0.0; 8]));
 
-        manifest.update_bucket_remote_meta(
+        manifest.update_bucket_remote_meta_with_payload_index(
             42,
             "run_new".to_string(),
             "remote/custom/path_42.driftu".to_string(),
             "len=123|etag=abc".to_string(),
+            BucketPayloadIndexMeta {
+                has_payload_columns: true,
+                has_exact_index: true,
+                has_payload_stats: true,
+                payload_schema_hash: 0x1234_5678_9abc_def0,
+            },
         );
 
         let bucket = manifest.get_buckets().iter().find(|b| b.id == 42).unwrap();
         assert_eq!(bucket.run_id, "run_new");
         assert_eq!(bucket.object_path, "remote/custom/path_42.driftu");
         assert_eq!(bucket.object_fingerprint, "len=123|etag=abc");
+        assert!(bucket.has_payload_columns);
+        assert!(bucket.has_exact_index);
+        assert!(bucket.has_payload_stats);
+        assert_eq!(bucket.payload_schema_hash, 0x1234_5678_9abc_def0);
     }
 
     #[test]

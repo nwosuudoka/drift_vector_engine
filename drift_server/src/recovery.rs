@@ -1,8 +1,14 @@
 use crate::manifest::ServerManifestManager;
+use drift_core::manifest::BucketPayloadIndexMeta;
 use drift_core::router::Router;
 use drift_core::wal::{WalEntry, WalReader};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
 use drift_storage::disk_manager::DiskManager;
+use drift_storage::unified_format::{
+    UNIFIED_FLAG_HAS_EXACT_INDEX, UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS, UNIFIED_FLAG_HAS_PAYLOAD_STATS,
+    UNIFIED_HEADER_SIZE, UnifiedHeader,
+};
+use opendal::Operator;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
@@ -22,6 +28,8 @@ pub struct RecoveryGuardMetricsSnapshot {
     pub mismatches_detected: u64,
     pub invalidations_performed: u64,
     pub fail_fast_aborts: u64,
+    pub payload_index_mismatches_detected: u64,
+    pub payload_index_validation_errors: u64,
 }
 
 #[derive(Default)]
@@ -29,6 +37,8 @@ struct RecoveryGuardMetrics {
     mismatches_detected: AtomicU64,
     invalidations_performed: AtomicU64,
     fail_fast_aborts: AtomicU64,
+    payload_index_mismatches_detected: AtomicU64,
+    payload_index_validation_errors: AtomicU64,
 }
 
 impl RecoveryGuardMetrics {
@@ -37,6 +47,12 @@ impl RecoveryGuardMetrics {
             mismatches_detected: self.mismatches_detected.load(Ordering::Relaxed),
             invalidations_performed: self.invalidations_performed.load(Ordering::Relaxed),
             fail_fast_aborts: self.fail_fast_aborts.load(Ordering::Relaxed),
+            payload_index_mismatches_detected: self
+                .payload_index_mismatches_detected
+                .load(Ordering::Relaxed),
+            payload_index_validation_errors: self
+                .payload_index_validation_errors
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -45,6 +61,10 @@ impl RecoveryGuardMetrics {
         self.mismatches_detected.store(0, Ordering::Relaxed);
         self.invalidations_performed.store(0, Ordering::Relaxed);
         self.fail_fast_aborts.store(0, Ordering::Relaxed);
+        self.payload_index_mismatches_detected
+            .store(0, Ordering::Relaxed);
+        self.payload_index_validation_errors
+            .store(0, Ordering::Relaxed);
     }
 }
 
@@ -269,6 +289,46 @@ impl RecoveryManager {
                 }
             }
 
+            if let Some(remote_path) = &remote_filename {
+                let expected_meta = BucketPayloadIndexMeta::from_bucket(b);
+                let expects_payload_index_meta = expected_meta != BucketPayloadIndexMeta::default();
+                match Self::read_remote_bucket_payload_index_meta(&remote_op, remote_path).await {
+                    Ok(Some(actual_meta)) => {
+                        if expected_meta != actual_meta {
+                            recovery_guard_metrics()
+                                .payload_index_mismatches_detected
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "Recovery: payload/index metadata mismatch for bucket {} (path={}): manifest={:?} actual={:?}",
+                                b.id, remote_path, expected_meta, actual_meta
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        if expects_payload_index_meta {
+                            recovery_guard_metrics()
+                                .payload_index_validation_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "Recovery: remote object missing while validating payload/index metadata for bucket {} (path={})",
+                                b.id, remote_path
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if expects_payload_index_meta {
+                            recovery_guard_metrics()
+                                .payload_index_validation_errors
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                "Recovery: failed to validate payload/index metadata for bucket {} (path={}): {}",
+                                b.id, remote_path, err
+                            );
+                        }
+                    }
+                }
+            }
+
             if let Some(remote_path) = remote_filename {
                 bucket_manager.register_bucket(b.id, remote_path, StorageClass::Remote);
             } else {
@@ -317,5 +377,53 @@ impl RecoveryManager {
         );
 
         Ok((router, ReplayData { inserts, deletes }))
+    }
+
+    async fn read_remote_bucket_payload_index_meta(
+        op: &Operator,
+        path: &str,
+    ) -> io::Result<Option<BucketPayloadIndexMeta>> {
+        if !op.exists(path).await.map_err(io::Error::other)? {
+            return Ok(None);
+        }
+
+        let meta = op.stat(path).await.map_err(io::Error::other)?;
+        if meta.content_length() < UNIFIED_HEADER_SIZE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "remote object too small for unified header: path={} len={}",
+                    path,
+                    meta.content_length()
+                ),
+            ));
+        }
+
+        let header_bytes = op
+            .read_with(path)
+            .range(0..UNIFIED_HEADER_SIZE as u64)
+            .await
+            .map_err(io::Error::other)?;
+
+        if header_bytes.len() != UNIFIED_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "short header read for {}: expected {} bytes, got {}",
+                    path,
+                    UNIFIED_HEADER_SIZE,
+                    header_bytes.len()
+                ),
+            ));
+        }
+
+        let header_vec = header_bytes.to_vec();
+        let header = UnifiedHeader::decode(&header_vec)?;
+        Ok(Some(BucketPayloadIndexMeta {
+            has_payload_columns: (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS) != 0,
+            has_exact_index: (header.flags & UNIFIED_FLAG_HAS_EXACT_INDEX) != 0,
+            has_payload_stats: (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_STATS) != 0,
+            payload_schema_hash: header.payload_schema_hash,
+        }))
     }
 }

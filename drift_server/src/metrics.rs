@@ -106,6 +106,12 @@ pub fn render_prometheus_metrics(
             "# HELP drift_recovery_guard_fail_fast_aborts_total Recovery startup aborts caused by fail-fast mismatch policy.\n",
             "# TYPE drift_recovery_guard_fail_fast_aborts_total counter\n",
             "drift_recovery_guard_fail_fast_aborts_total {}\n",
+            "# HELP drift_recovery_guard_payload_index_mismatches_detected_total Manifest/file payload-index metadata mismatches detected during recovery.\n",
+            "# TYPE drift_recovery_guard_payload_index_mismatches_detected_total counter\n",
+            "drift_recovery_guard_payload_index_mismatches_detected_total {}\n",
+            "# HELP drift_recovery_guard_payload_index_validation_errors_total Recovery payload-index metadata validation errors.\n",
+            "# TYPE drift_recovery_guard_payload_index_validation_errors_total counter\n",
+            "drift_recovery_guard_payload_index_validation_errors_total {}\n",
         ),
         u8::from(cache_enabled),
         cache_snapshot.hits,
@@ -120,7 +126,9 @@ pub fn render_prometheus_metrics(
         cache_snapshot.recovered_entries,
         recovery_snapshot.mismatches_detected,
         recovery_snapshot.invalidations_performed,
-        recovery_snapshot.fail_fast_aborts
+        recovery_snapshot.fail_fast_aborts,
+        recovery_snapshot.payload_index_mismatches_detected,
+        recovery_snapshot.payload_index_validation_errors
     )
 }
 
@@ -205,6 +213,8 @@ mod tests {
                 mismatches_detected: 20,
                 invalidations_performed: 21,
                 fail_fast_aborts: 22,
+                payload_index_mismatches_detected: 23,
+                payload_index_validation_errors: 24,
             },
         );
 
@@ -215,6 +225,10 @@ mod tests {
         assert!(payload.contains("drift_recovery_guard_mismatches_detected_total 20"));
         assert!(payload.contains("drift_recovery_guard_invalidations_performed_total 21"));
         assert!(payload.contains("drift_recovery_guard_fail_fast_aborts_total 22"));
+        assert!(
+            payload.contains("drift_recovery_guard_payload_index_mismatches_detected_total 23")
+        );
+        assert!(payload.contains("drift_recovery_guard_payload_index_validation_errors_total 24"));
     }
 
     #[test]

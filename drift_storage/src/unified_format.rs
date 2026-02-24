@@ -10,12 +10,13 @@ pub const UNIFIED_HEADER_SIZE: usize = 128;
 pub const UNIFIED_FOOTER_SIZE: usize = 64;
 pub const UNIFIED_BLOCK_DESC_SIZE: usize = 56;
 
-const HEADER_RESERVED_BYTES: usize = 40;
-const FOOTER_RESERVED_BYTES: usize = 24;
+const HEADER_RESERVED_BYTES: usize = 32;
+const FOOTER_RESERVED_BYTES: usize = 12;
 
 pub const UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA: u32 = 1 << 0;
 pub const UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS: u32 = 1 << 1;
 pub const UNIFIED_FLAG_HAS_EXACT_INDEX: u32 = 1 << 2;
+pub const UNIFIED_FLAG_HAS_PAYLOAD_STATS: u32 = 1 << 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -26,6 +27,7 @@ pub enum UnifiedBlockType {
     PayloadSchema = 10,
     PayloadColumn = 11,
     PayloadExactIndex = 12,
+    PayloadStats = 13,
 }
 
 impl UnifiedBlockType {
@@ -37,6 +39,7 @@ impl UnifiedBlockType {
             10 => Ok(Self::PayloadSchema),
             11 => Ok(Self::PayloadColumn),
             12 => Ok(Self::PayloadExactIndex),
+            13 => Ok(Self::PayloadStats),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported block type: {v}"),
@@ -57,6 +60,7 @@ pub enum UnifiedCodec {
     ForBitpack = 7,
     AlpRd = 8,
     DictBitpack = 9,
+    DictPostingsBitpack = 10,
 }
 
 impl UnifiedCodec {
@@ -71,9 +75,31 @@ impl UnifiedCodec {
             7 => Ok(Self::ForBitpack),
             8 => Ok(Self::AlpRd),
             9 => Ok(Self::DictBitpack),
+            10 => Ok(Self::DictPostingsBitpack),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported codec: {v}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, Default)]
+#[repr(u16)]
+pub enum UnifiedMetric {
+    #[default]
+    L2 = 0,
+    Cosine = 1,
+}
+
+impl UnifiedMetric {
+    fn from_u16(v: u16) -> io::Result<Self> {
+        match v {
+            0 => Ok(Self::L2),
+            1 => Ok(Self::Cosine),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported unified metric: {v}"),
             )),
         }
     }
@@ -128,11 +154,44 @@ pub struct UnifiedPayloadColumnChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct UnifiedPayloadFieldStats {
+    pub field_id: u32,
+    pub logical_type: UnifiedLogicalType,
+    pub null_count: u32,
+    pub min: Option<UnifiedPayloadValue>,
+    pub max: Option<UnifiedPayloadValue>,
+    pub cardinality_hint: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+pub struct UnifiedPayloadStatsChunk {
+    pub row_start: u64,
+    pub row_count: u32,
+    pub fields: Vec<UnifiedPayloadFieldStats>,
+}
+
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct UnifiedExactIndex {
     pub field_id: u32,
     pub logical_type: UnifiedLogicalType,
     pub dictionary: Vec<Vec<u8>>,
     pub postings: Vec<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+struct UnifiedExactIndexBitpacked {
+    field_id: u32,
+    logical_type: UnifiedLogicalType,
+    dictionary: Vec<Vec<u8>>,
+    postings: Vec<UnifiedBitpackedPostingList>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+struct UnifiedBitpackedPostingList {
+    row_count: u32,
+    base: u64,
+    bit_width: u8,
+    deltas: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -164,7 +223,9 @@ impl UnifiedPayloadSchema {
 pub struct UnifiedHeader {
     pub flags: u32,
     pub dim: u32,
+    pub metric: UnifiedMetric,
     pub row_count: u64,
+    pub payload_schema_hash: u64,
     pub quantizer_offset: u64,
     pub quantizer_length: u64,
     pub block_dir_offset: u64,
@@ -193,8 +254,10 @@ impl UnifiedHeader {
         cursor.write_u32::<LittleEndian>(0)?; // reserved align
         cursor.write_u64::<LittleEndian>(self.footer_offset)?;
         cursor.write_u32::<LittleEndian>(self.footer_length)?;
-        cursor.write_u32::<LittleEndian>(0)?; // reserved align
+        cursor.write_u16::<LittleEndian>(self.metric as u16)?;
+        cursor.write_u16::<LittleEndian>(0)?; // reserved align
         cursor.write_u64::<LittleEndian>(self.created_at_unix_secs)?;
+        cursor.write_u64::<LittleEndian>(self.payload_schema_hash)?;
         cursor.write_all(&[0u8; HEADER_RESERVED_BYTES])?;
 
         if cursor.position() as usize != UNIFIED_HEADER_SIZE {
@@ -248,15 +311,19 @@ impl UnifiedHeader {
         let _reserved2 = cursor.read_u32::<LittleEndian>()?;
         let footer_offset = cursor.read_u64::<LittleEndian>()?;
         let footer_length = cursor.read_u32::<LittleEndian>()?;
-        let _reserved3 = cursor.read_u32::<LittleEndian>()?;
+        let metric = UnifiedMetric::from_u16(cursor.read_u16::<LittleEndian>()?)?;
+        let _reserved3 = cursor.read_u16::<LittleEndian>()?;
         let created_at_unix_secs = cursor.read_u64::<LittleEndian>()?;
+        let payload_schema_hash = cursor.read_u64::<LittleEndian>()?;
         let mut reserved = [0u8; HEADER_RESERVED_BYTES];
         cursor.read_exact(&mut reserved)?;
 
         Ok(Self {
             flags,
             dim,
+            metric,
             row_count,
+            payload_schema_hash,
             quantizer_offset,
             quantizer_length,
             block_dir_offset,
@@ -272,6 +339,8 @@ impl UnifiedHeader {
 pub struct UnifiedFooter {
     pub flags: u32,
     pub row_count: u64,
+    pub metric: UnifiedMetric,
+    pub payload_schema_hash: u64,
     pub block_dir_offset: u64,
     pub block_count: u32,
     pub directory_crc32: u32,
@@ -290,6 +359,9 @@ impl UnifiedFooter {
         cursor.write_u64::<LittleEndian>(self.block_dir_offset)?;
         cursor.write_u32::<LittleEndian>(self.block_count)?;
         cursor.write_u32::<LittleEndian>(self.directory_crc32)?;
+        cursor.write_u16::<LittleEndian>(self.metric as u16)?;
+        cursor.write_u16::<LittleEndian>(0)?; // reserved align
+        cursor.write_u64::<LittleEndian>(self.payload_schema_hash)?;
         cursor.write_all(&[0u8; FOOTER_RESERVED_BYTES])?;
 
         if cursor.position() as usize != UNIFIED_FOOTER_SIZE {
@@ -337,17 +409,40 @@ impl UnifiedFooter {
         let block_dir_offset = cursor.read_u64::<LittleEndian>()?;
         let block_count = cursor.read_u32::<LittleEndian>()?;
         let directory_crc32 = cursor.read_u32::<LittleEndian>()?;
+        let metric = UnifiedMetric::from_u16(cursor.read_u16::<LittleEndian>()?)?;
+        let _reserved2 = cursor.read_u16::<LittleEndian>()?;
+        let payload_schema_hash = cursor.read_u64::<LittleEndian>()?;
         let mut reserved = [0u8; FOOTER_RESERVED_BYTES];
         cursor.read_exact(&mut reserved)?;
 
         Ok(Self {
             flags,
             row_count,
+            metric,
+            payload_schema_hash,
             block_dir_offset,
             block_count,
             directory_crc32,
         })
     }
+}
+
+pub fn compute_payload_schema_hash(schema: &UnifiedPayloadSchema) -> io::Result<u64> {
+    let bytes = bincode::encode_to_vec(schema, bincode::config::standard())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(fnv1a64(&bytes))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    let mut hash = OFFSET;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,6 +601,224 @@ pub fn encode_exact_key(
     Ok(Some(out))
 }
 
+pub fn encode_exact_index_bitpacked(index: &UnifiedExactIndex) -> io::Result<Vec<u8>> {
+    if index.dictionary.len() != index.postings.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "exact index dictionary/postings length mismatch",
+        ));
+    }
+
+    let mut packed_postings = Vec::with_capacity(index.postings.len());
+    for rows in &index.postings {
+        let row_count = u32::try_from(rows.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "exact index postings length exceeds u32",
+            )
+        })?;
+        if rows.is_empty() {
+            packed_postings.push(UnifiedBitpackedPostingList {
+                row_count,
+                base: 0,
+                bit_width: 0,
+                deltas: Vec::new(),
+            });
+            continue;
+        }
+
+        let base = rows[0];
+        let mut prev = base;
+        let mut deltas = Vec::with_capacity(rows.len());
+        deltas.push(0);
+        for &row in rows.iter().skip(1) {
+            if row <= prev {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exact index postings must be strictly increasing",
+                ));
+            }
+            let delta = row.checked_sub(prev).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exact index posting delta underflow",
+                )
+            })?;
+            deltas.push(delta);
+            prev = row;
+        }
+
+        let max_delta = deltas.iter().copied().max().unwrap_or(0);
+        let bit_width = bit_width_u64(max_delta);
+        let packed = pack_u64_values(&deltas, bit_width)?;
+        packed_postings.push(UnifiedBitpackedPostingList {
+            row_count,
+            base,
+            bit_width,
+            deltas: packed,
+        });
+    }
+
+    let encoded = UnifiedExactIndexBitpacked {
+        field_id: index.field_id,
+        logical_type: index.logical_type.clone(),
+        dictionary: index.dictionary.clone(),
+        postings: packed_postings,
+    };
+    bincode::encode_to_vec(&encoded, bincode::config::standard())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+pub fn decode_exact_index_bitpacked(bytes: &[u8]) -> io::Result<UnifiedExactIndex> {
+    let (encoded, consumed): (UnifiedExactIndexBitpacked, usize) =
+        bincode::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if consumed != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact index bitpacked payload has trailing bytes",
+        ));
+    }
+    if encoded.dictionary.len() != encoded.postings.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact index dictionary/postings length mismatch",
+        ));
+    }
+
+    let mut postings = Vec::with_capacity(encoded.postings.len());
+    for entry in &encoded.postings {
+        let row_count = entry.row_count as usize;
+        let deltas = unpack_u64_values(&entry.deltas, row_count, entry.bit_width)?;
+        let mut rows = Vec::with_capacity(row_count);
+        let mut prev = entry.base;
+        for (i, delta) in deltas.into_iter().enumerate() {
+            let row = if i == 0 {
+                entry.base.checked_add(delta).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "exact index posting overflow on first row",
+                    )
+                })?
+            } else {
+                prev.checked_add(delta).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "exact index posting overflow on delta application",
+                    )
+                })?
+            };
+            if i > 0 && row <= prev {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact index postings are not strictly increasing",
+                ));
+            }
+            rows.push(row);
+            prev = row;
+        }
+        postings.push(rows);
+    }
+
+    Ok(UnifiedExactIndex {
+        field_id: encoded.field_id,
+        logical_type: encoded.logical_type,
+        dictionary: encoded.dictionary,
+        postings,
+    })
+}
+
+fn bit_width_u64(max_value: u64) -> u8 {
+    if max_value == 0 {
+        0
+    } else {
+        (64 - max_value.leading_zeros()) as u8
+    }
+}
+
+fn pack_u64_values(values: &[u64], bit_width: u8) -> io::Result<Vec<u8>> {
+    if bit_width > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bit width exceeds 64",
+        ));
+    }
+    if bit_width == 0 {
+        if values.iter().any(|&v| v != 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero-width bitpack cannot encode non-zero values",
+            ));
+        }
+        return Ok(Vec::new());
+    }
+
+    let total_bits = values
+        .len()
+        .checked_mul(bit_width as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bitpack length overflow"))?;
+    let mut out = vec![0u8; total_bits.div_ceil(8)];
+    let mut bit_cursor = 0usize;
+    for &value in values {
+        let masked = if bit_width == 64 {
+            value
+        } else {
+            value & ((1u64 << bit_width) - 1)
+        };
+        let mut current = masked;
+        for _ in 0..bit_width {
+            if (current & 1) != 0 {
+                out[bit_cursor / 8] |= 1u8 << (bit_cursor % 8);
+            }
+            current >>= 1;
+            bit_cursor += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn unpack_u64_values(data: &[u8], count: usize, bit_width: u8) -> io::Result<Vec<u64>> {
+    if bit_width > 64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bit width exceeds 64",
+        ));
+    }
+    if bit_width == 0 {
+        if !data.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zero-width bitpack has unexpected payload",
+            ));
+        }
+        return Ok(vec![0; count]);
+    }
+
+    let total_bits = count
+        .checked_mul(bit_width as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bit unpack length overflow"))?;
+    let expected_bytes = total_bits.div_ceil(8);
+    if data.len() != expected_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bitpacked postings length mismatch",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(count);
+    let mut bit_cursor = 0usize;
+    for _ in 0..count {
+        let mut value = 0u64;
+        for bit in 0..bit_width {
+            let raw = (data[bit_cursor / 8] >> (bit_cursor % 8)) & 1;
+            value |= (raw as u64) << bit;
+            bit_cursor += 1;
+        }
+        out.push(value);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,7 +828,9 @@ mod tests {
         let header = UnifiedHeader {
             flags: 7,
             dim: 768,
+            metric: UnifiedMetric::Cosine,
             row_count: 1000,
+            payload_schema_hash: 0xdead_beef_cafe_f00d,
             quantizer_offset: 128,
             quantizer_length: 4096,
             block_dir_offset: 9000,
@@ -535,6 +850,8 @@ mod tests {
         let footer = UnifiedFooter {
             flags: 1,
             row_count: 55,
+            metric: UnifiedMetric::L2,
+            payload_schema_hash: 0x0102_0304_0506_0708,
             block_dir_offset: 1024,
             block_count: 3,
             directory_crc32: 99,
@@ -606,5 +923,71 @@ mod tests {
         let encoded =
             encode_exact_key(&UnifiedLogicalType::Int64, &UnifiedPayloadValue::Int64(42)).unwrap();
         assert_eq!(encoded.unwrap().len(), 8);
+    }
+
+    #[test]
+    fn unified_exact_index_bitpacked_roundtrip() {
+        let index = UnifiedExactIndex {
+            field_id: 7,
+            logical_type: UnifiedLogicalType::Keyword,
+            dictionary: vec![b"acme".to_vec(), b"globex".to_vec()],
+            postings: vec![vec![10, 20, 40], vec![30]],
+        };
+        let bytes = encode_exact_index_bitpacked(&index).unwrap();
+        let decoded = decode_exact_index_bitpacked(&bytes).unwrap();
+        assert_eq!(decoded, index);
+    }
+
+    #[test]
+    fn unified_exact_index_bitpacked_rejects_trailing_bytes() {
+        let index = UnifiedExactIndex {
+            field_id: 1,
+            logical_type: UnifiedLogicalType::Int64,
+            dictionary: vec![vec![1]],
+            postings: vec![vec![42]],
+        };
+        let mut bytes = encode_exact_index_bitpacked(&index).unwrap();
+        bytes.push(0xff);
+        let err = decode_exact_index_bitpacked(&bytes).unwrap_err();
+        assert!(err.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn unified_exact_index_bitpacked_rejects_invalid_bit_width() {
+        let malformed = UnifiedExactIndexBitpacked {
+            field_id: 2,
+            logical_type: UnifiedLogicalType::Keyword,
+            dictionary: vec![b"acme".to_vec()],
+            postings: vec![UnifiedBitpackedPostingList {
+                row_count: 1,
+                base: 10,
+                bit_width: 65,
+                deltas: Vec::new(),
+            }],
+        };
+        let bytes = bincode::encode_to_vec(&malformed, bincode::config::standard()).unwrap();
+        let err = decode_exact_index_bitpacked(&bytes).unwrap_err();
+        assert!(err.to_string().contains("bit width exceeds 64"));
+    }
+
+    #[test]
+    fn unified_exact_index_bitpacked_rejects_truncated_deltas() {
+        let malformed = UnifiedExactIndexBitpacked {
+            field_id: 3,
+            logical_type: UnifiedLogicalType::Keyword,
+            dictionary: vec![b"acme".to_vec()],
+            postings: vec![UnifiedBitpackedPostingList {
+                row_count: 16,
+                base: 7,
+                bit_width: 1,
+                deltas: vec![0u8], // should be 2 bytes for 16 one-bit deltas
+            }],
+        };
+        let bytes = bincode::encode_to_vec(&malformed, bincode::config::standard()).unwrap();
+        let err = decode_exact_index_bitpacked(&bytes).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bitpacked postings length mismatch")
+        );
     }
 }

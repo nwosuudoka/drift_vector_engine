@@ -38,6 +38,8 @@ mod tests {
             flat_vectors: vecs,
             count,
             centroid: Some(vec![0.0; dim]),
+            payload_schema: None,
+            payload_rows: None,
         }
     }
 

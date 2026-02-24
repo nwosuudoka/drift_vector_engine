@@ -34,4 +34,8 @@ message Bucket {
   float radius = 5;         // Max distance in bucket (for pruning optimization)
   string object_path = 6;   // Provider-agnostic object key/path
   string object_fingerprint = 7; // Provider-agnostic object version fingerprint
+  bool has_payload_columns = 8; // Unified payload column blocks present
+  bool has_exact_index = 9; // Unified exact-index blocks present
+  bool has_payload_stats = 10; // Unified payload stats blocks present
+  uint64 payload_schema_hash = 11; // Unified payload schema hash (0 means absent)
 }

@@ -4,8 +4,16 @@ use crate::manifest::ServerManifestManager;
 use crate::persistence::PersistenceManager;
 use crate::reaper::Reaper;
 use drift_core::partitioner::PartitionGroup;
+use drift_core::payload::{
+    PayloadLogicalType as CorePayloadLogicalType, PayloadRow as CorePayloadRow,
+    PayloadSchema as CorePayloadSchema, PayloadValue as CorePayloadValue,
+};
 use drift_core::{index::VectorIndex, lock_manager::BucketCoordinator};
 use drift_storage::bucket_manager::{BucketManager, StorageClass};
+use drift_storage::unified_format::{
+    UnifiedFieldSchema, UnifiedLobRef, UnifiedLogicalType, UnifiedPayloadRow, UnifiedPayloadSchema,
+    UnifiedPayloadValue,
+};
 use drift_traits::StorageEngine;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,6 +40,68 @@ fn kv_sync_interval_from_env() -> Duration {
             }
         },
         Err(_) => default,
+    }
+}
+
+fn core_payload_schema_to_unified(schema: &CorePayloadSchema) -> UnifiedPayloadSchema {
+    UnifiedPayloadSchema::new(
+        schema
+            .fields
+            .iter()
+            .map(|field| UnifiedFieldSchema {
+                field_id: field.field_id,
+                name: field.name.clone(),
+                logical_type: core_payload_logical_type_to_unified(&field.logical_type),
+                nullable: field.nullable,
+                indexed: field.indexed,
+            })
+            .collect(),
+    )
+}
+
+fn core_payload_rows_to_unified(rows: &[CorePayloadRow]) -> Vec<UnifiedPayloadRow> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|(field_id, value)| (*field_id, core_payload_value_to_unified(value)))
+                .collect()
+        })
+        .collect()
+}
+
+fn core_payload_value_to_unified(value: &CorePayloadValue) -> UnifiedPayloadValue {
+    match value {
+        CorePayloadValue::Bool(v) => UnifiedPayloadValue::Bool(*v),
+        CorePayloadValue::Int64(v) => UnifiedPayloadValue::Int64(*v),
+        CorePayloadValue::Float32(v) => UnifiedPayloadValue::Float32(*v),
+        CorePayloadValue::Float64(v) => UnifiedPayloadValue::Float64(*v),
+        CorePayloadValue::Keyword(v) => UnifiedPayloadValue::Keyword(v.clone()),
+        CorePayloadValue::Text(v) => UnifiedPayloadValue::Text(v.clone()),
+        CorePayloadValue::Bytes(v) => UnifiedPayloadValue::Bytes(v.clone()),
+        CorePayloadValue::TimestampMicros(v) => UnifiedPayloadValue::TimestampMicros(*v),
+        CorePayloadValue::LobRef(v) => UnifiedPayloadValue::LobRef(UnifiedLobRef {
+            blob_key: v.blob_key.clone(),
+            offset: v.offset,
+            length: v.length,
+            fingerprint: v.fingerprint.clone(),
+        }),
+        CorePayloadValue::Null => UnifiedPayloadValue::Null,
+    }
+}
+
+fn core_payload_logical_type_to_unified(
+    logical_type: &CorePayloadLogicalType,
+) -> UnifiedLogicalType {
+    match logical_type {
+        CorePayloadLogicalType::Bool => UnifiedLogicalType::Bool,
+        CorePayloadLogicalType::Int64 => UnifiedLogicalType::Int64,
+        CorePayloadLogicalType::Float32 => UnifiedLogicalType::Float32,
+        CorePayloadLogicalType::Float64 => UnifiedLogicalType::Float64,
+        CorePayloadLogicalType::Keyword => UnifiedLogicalType::Keyword,
+        CorePayloadLogicalType::Text => UnifiedLogicalType::Text,
+        CorePayloadLogicalType::Bytes => UnifiedLogicalType::Bytes,
+        CorePayloadLogicalType::TimestampMicros => UnifiedLogicalType::TimestampMicros,
+        CorePayloadLogicalType::LobRef => UnifiedLogicalType::LobRef,
     }
 }
 
@@ -175,8 +245,25 @@ impl Janitor {
         let mut router_updates = Vec::new();
 
         for (bucket_id, group) in &partitions {
+            let payload_schema = group
+                .payload_schema
+                .as_ref()
+                .map(core_payload_schema_to_unified);
+            let payload_rows = group
+                .payload_rows
+                .as_ref()
+                .map(|rows| core_payload_rows_to_unified(rows));
+
             // A. Append to Local Staging
-            let new_count = self.staging.append_batch(*bucket_id, group).await?;
+            let new_count = self
+                .staging
+                .append_batch_with_payload(
+                    *bucket_id,
+                    group,
+                    payload_schema.as_ref(),
+                    payload_rows.as_deref(),
+                )
+                .await?;
 
             // A1. Update KV (VectorID -> BucketID)
             self.update_kv_mapping(*bucket_id, &group.ids);
@@ -297,7 +384,23 @@ impl Janitor {
 
         let mut updates = Vec::new();
         for (bucket_id, group) in &partitions {
-            let new_count = self.staging.append_batch(*bucket_id, group).await?;
+            let payload_schema = group
+                .payload_schema
+                .as_ref()
+                .map(core_payload_schema_to_unified);
+            let payload_rows = group
+                .payload_rows
+                .as_ref()
+                .map(|rows| core_payload_rows_to_unified(rows));
+            let new_count = self
+                .staging
+                .append_batch_with_payload(
+                    *bucket_id,
+                    group,
+                    payload_schema.as_ref(),
+                    payload_rows.as_deref(),
+                )
+                .await?;
             updates.push((*bucket_id, new_count, group.centroid.clone()));
 
             // Keep router counts in sync with actual bucket size.
@@ -475,11 +578,28 @@ impl Janitor {
                 .staging
                 .read_file_payload_schema(&staging_filename)
                 .await?;
+            let mut merged_payload_rows = self
+                .staging
+                .read_file_payload_rows(&staging_filename)
+                .await?;
             if merged_ids.is_empty() {
                 self.cleanup
                     .delete_local_best_effort(&staging_filename, "promotion-empty-staging")
                     .await;
                 continue;
+            }
+            if let Some(rows) = merged_payload_rows.as_ref() {
+                if rows.len() != merged_ids.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "promotion staging payload row mismatch for bucket {}: ids={}, payload_rows={}",
+                            bucket_id,
+                            merged_ids.len(),
+                            rows.len()
+                        ),
+                    ));
+                }
             }
 
             // B. Read Remote (if exists)
@@ -488,6 +608,10 @@ impl Janitor {
                 let r_schema = self
                     .persistence
                     .read_remote_bucket_payload_schema_path(path)
+                    .await?;
+                let r_payload_rows = self
+                    .persistence
+                    .read_remote_bucket_payload_rows_path_optional(path)
                     .await?;
                 if let Some(remote_schema) = r_schema {
                     if let Some(local_schema) = &merged_schema {
@@ -502,6 +626,36 @@ impl Janitor {
                         }
                     } else {
                         merged_schema = Some(remote_schema);
+                    }
+                }
+
+                if let Some(rows) = r_payload_rows.as_ref()
+                    && rows.len() != r_ids.len()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "promotion remote payload row mismatch for bucket {}: ids={}, payload_rows={}",
+                            bucket_id,
+                            r_ids.len(),
+                            rows.len()
+                        ),
+                    ));
+                }
+
+                match (&mut merged_payload_rows, r_payload_rows) {
+                    (Some(local_rows), Some(mut remote_rows)) => {
+                        local_rows.append(&mut remote_rows);
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "promotion payload row presence mismatch for bucket {}",
+                                bucket_id
+                            ),
+                        ));
                     }
                 }
                 merged_ids.extend(r_ids);
@@ -519,11 +673,17 @@ impl Janitor {
                 );
                 merged_ids.truncate(rows_from_vectors);
                 merged_flat.truncate(rows_from_vectors * dim);
+                if let Some(rows) = merged_payload_rows.as_mut() {
+                    rows.truncate(rows_from_vectors);
+                }
             }
 
             // D. Filter (Purge)
             let mut final_ids = Vec::with_capacity(merged_ids.len());
             let mut final_flat = Vec::with_capacity(merged_flat.len());
+            let mut final_payload_rows: Option<Vec<UnifiedPayloadRow>> = merged_payload_rows
+                .as_ref()
+                .map(|rows| Vec::with_capacity(rows.len()));
 
             for (row_idx, id) in merged_ids.into_iter().enumerate() {
                 if !tombstone_snapshot.contains(&id) {
@@ -534,27 +694,56 @@ impl Janitor {
                     }
                     final_ids.push(id);
                     final_flat.extend_from_slice(&merged_flat[start..end]);
+                    if let Some(rows) = merged_payload_rows.as_ref() {
+                        if row_idx >= rows.len() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "promotion payload row index out of bounds for bucket {}",
+                                    bucket_id
+                                ),
+                            ));
+                        }
+                        if let Some(target_rows) = final_payload_rows.as_mut() {
+                            target_rows.push(rows[row_idx].clone());
+                        }
+                    }
                 }
+            }
+            if final_payload_rows.is_some() && merged_schema.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "promotion payload rows present without schema for bucket {}",
+                        bucket_id
+                    ),
+                ));
             }
 
             let final_count = final_ids.len() as u32;
 
             // E. Write to S3
-            let (new_run_id, _) = self
+            let write_result = self
                 .persistence
-                .write_remote_bucket_unified_flat_with_schema(
+                .write_remote_bucket_unified_flat_with_payload_result(
                     bucket_id,
                     &final_ids,
                     &final_flat,
                     dim,
                     merged_schema.as_ref(),
+                    final_payload_rows.as_deref(),
                 )
                 .await?;
 
             // --- END EXPLICIT LOGIC ---
 
             // 3. Finalize Registry (Tiered)
-            let new_remote_path = format!("bucket_{}_{}.driftu", bucket_id, new_run_id);
+            let crate::persistence::RemoteUnifiedWriteResult {
+                run_id: new_run_id,
+                object_path: new_remote_path,
+                payload_index_meta,
+                ..
+            } = write_result;
             let new_remote_fingerprint = match self
                 .persistence
                 .object_fingerprint_for_path(&new_remote_path)
@@ -592,11 +781,12 @@ impl Janitor {
             // Get fresh stats for atomic update (retains any NEW tombstones that arrived during upload)
             if let Some(stats) = self.bucket_manager.get_bucket_stats(bucket_id) {
                 self.manifest.apply_atomic(|m| {
-                    m.update_bucket_remote_meta(
+                    m.update_bucket_remote_meta_with_payload_index(
                         bucket_id,
                         new_run_id.clone(),
                         new_remote_path.clone(),
                         new_remote_fingerprint.clone(),
+                        payload_index_meta,
                     );
                     m.update_bucket_stats(bucket_id, final_count as u64, stats.tombstone_count);
                 })?;

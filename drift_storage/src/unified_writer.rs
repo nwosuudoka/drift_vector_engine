@@ -1,16 +1,18 @@
 use crate::compression::alp_rd::alp_rd_encode;
 use crate::unified_format::{
     UNIFIED_FLAG_HAS_EXACT_INDEX, UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS,
-    UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA, UNIFIED_FOOTER_SIZE, UNIFIED_HEADER_SIZE, UnifiedBlockDesc,
-    UnifiedBlockType, UnifiedCodec, UnifiedExactIndex, UnifiedFieldSchema, UnifiedFooter,
-    UnifiedHeader, UnifiedLogicalType, UnifiedPayloadColumnChunk, UnifiedPayloadRow,
-    UnifiedPayloadSchema, UnifiedPayloadValue, decode_block_directory, encode_block_directory,
-    encode_exact_key,
+    UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA, UNIFIED_FLAG_HAS_PAYLOAD_STATS, UNIFIED_FOOTER_SIZE,
+    UNIFIED_HEADER_SIZE, UnifiedBlockDesc, UnifiedBlockType, UnifiedCodec, UnifiedExactIndex,
+    UnifiedFieldSchema, UnifiedFooter, UnifiedHeader, UnifiedLogicalType, UnifiedMetric,
+    UnifiedPayloadColumnChunk, UnifiedPayloadFieldStats, UnifiedPayloadRow, UnifiedPayloadSchema,
+    UnifiedPayloadStatsChunk, UnifiedPayloadValue, compute_payload_schema_hash,
+    decode_block_directory, encode_block_directory, encode_exact_index_bitpacked, encode_exact_key,
 };
 use byteorder::{LittleEndian, WriteBytesExt};
 use crc32fast::Hasher;
 use drift_core::quantizer::Quantizer;
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{self, Cursor, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -65,6 +67,9 @@ impl UnifiedRemoteWriter {
         payload_rows: Option<&[UnifiedPayloadRow]>,
     ) -> io::Result<UnifiedWriteStats> {
         validate_input_flat(ids, flat_vectors, dim)?;
+        let normalized_schema = payload_schema.filter(|schema| !schema.is_empty());
+        let payload_schema_hash = schema_hash_or_zero(normalized_schema)?;
+        let metric = UnifiedMetric::L2;
 
         let row_count = ids.len() as u64;
         let blocks_and_payload = build_chunk_blocks(
@@ -72,8 +77,9 @@ impl UnifiedRemoteWriter {
             ids,
             flat_vectors,
             dim,
-            payload_schema,
+            normalized_schema,
             payload_rows,
+            true,
             true,
         )?;
         let (blocks, mut payload) = blocks_and_payload;
@@ -96,6 +102,12 @@ impl UnifiedRemoteWriter {
         {
             flags |= UNIFIED_FLAG_HAS_EXACT_INDEX;
         }
+        if blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadStats)
+        {
+            flags |= UNIFIED_FLAG_HAS_PAYLOAD_STATS;
+        }
 
         writer.seek(SeekFrom::Start(0))?;
         writer.write_all(&[0u8; UNIFIED_HEADER_SIZE])?;
@@ -109,6 +121,8 @@ impl UnifiedRemoteWriter {
         let footer = UnifiedFooter {
             flags,
             row_count,
+            metric,
+            payload_schema_hash,
             block_dir_offset,
             block_count: blocks.len() as u32,
             directory_crc32: checksum32(&block_dir_bytes),
@@ -120,7 +134,9 @@ impl UnifiedRemoteWriter {
         let header = UnifiedHeader {
             flags,
             dim: dim as u32,
+            metric,
             row_count,
+            payload_schema_hash,
             quantizer_offset: blocks[0].offset,
             quantizer_length: blocks[0].compressed_len,
             block_dir_offset,
@@ -350,6 +366,18 @@ impl UnifiedLocalWriter {
                 "append header/footer directory mismatch",
             ));
         }
+        if footer.metric != header.metric {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append header/footer metric mismatch",
+            ));
+        }
+        if footer.payload_schema_hash != header.payload_schema_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append header/footer payload schema hash mismatch",
+            ));
+        }
 
         let dir_len = 4usize
             .checked_add(
@@ -382,6 +410,9 @@ impl UnifiedLocalWriter {
         let has_exact_index = blocks
             .iter()
             .any(|b| b.block_type == UnifiedBlockType::PayloadExactIndex);
+        let has_payload_stats = blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadStats);
         let flag_has_schema = (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA) != 0;
         if flag_has_schema != has_schema_block {
             return Err(io::Error::new(
@@ -401,6 +432,19 @@ impl UnifiedLocalWriter {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "append exact index flag mismatch",
+            ));
+        }
+        let flag_has_payload_stats = (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_STATS) != 0;
+        if flag_has_payload_stats != has_payload_stats {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append payload stats flag mismatch",
+            ));
+        }
+        if flag_has_payload_stats && !flag_has_payload_columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "append payload stats require payload columns",
             ));
         }
 
@@ -428,6 +472,7 @@ impl UnifiedLocalWriter {
         }
 
         let append_schema = requested_schema.or(existing_schema.as_ref());
+        let payload_schema_hash = schema_hash_or_zero(append_schema)?;
         if payload_rows.is_some() && append_schema.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -459,6 +504,7 @@ impl UnifiedLocalWriter {
             append_schema,
             payload_rows,
             false,
+            flag_has_payload_stats,
         )?;
 
         // Shift the new chunk block offsets to where we append in this file.
@@ -498,9 +544,17 @@ impl UnifiedLocalWriter {
         {
             flags |= UNIFIED_FLAG_HAS_EXACT_INDEX;
         }
+        if blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadStats)
+        {
+            flags |= UNIFIED_FLAG_HAS_PAYLOAD_STATS;
+        }
         let footer = UnifiedFooter {
             flags,
             row_count: new_row_count,
+            metric: header.metric,
+            payload_schema_hash,
             block_dir_offset,
             block_count: blocks.len() as u32,
             directory_crc32: checksum32(&block_dir_bytes),
@@ -514,6 +568,7 @@ impl UnifiedLocalWriter {
 
         header.flags = flags;
         header.row_count = new_row_count;
+        header.payload_schema_hash = payload_schema_hash;
         header.block_dir_offset = block_dir_offset;
         header.block_count = blocks.len() as u32;
         header.footer_offset = block_dir_offset + block_dir_bytes.len() as u64;
@@ -624,6 +679,13 @@ fn decode_existing_payload_schema(
     Ok(schema)
 }
 
+fn schema_hash_or_zero(schema: Option<&UnifiedPayloadSchema>) -> io::Result<u64> {
+    if let Some(schema) = schema {
+        return compute_payload_schema_hash(schema);
+    }
+    Ok(0)
+}
+
 fn build_chunk_blocks(
     row_start: u64,
     ids: &[u64],
@@ -632,6 +694,7 @@ fn build_chunk_blocks(
     payload_schema: Option<&UnifiedPayloadSchema>,
     payload_rows: Option<&[UnifiedPayloadRow]>,
     include_schema_block: bool,
+    include_payload_stats_block: bool,
 ) -> io::Result<(Vec<UnifiedBlockDesc>, Vec<u8>)> {
     if let Some(rows) = payload_rows
         && rows.len() != ids.len()
@@ -731,6 +794,7 @@ fn build_chunk_blocks(
 
     if let Some(rows) = payload_rows {
         let schema = normalized_schema.expect("validated above");
+        let mut field_stats = Vec::with_capacity(schema.fields.len());
         for field in &schema.fields {
             let mut column_values = Vec::with_capacity(rows.len());
             for row in rows {
@@ -746,6 +810,7 @@ fn build_chunk_blocks(
                 }
                 column_values.push(value);
             }
+            field_stats.push(build_payload_field_stats(field, &column_values)?);
 
             let (codec, data, validity) =
                 encode_payload_column_data(&field.logical_type, &column_values)?;
@@ -782,6 +847,27 @@ fn build_chunk_blocks(
                 blocks.push(index_desc);
                 offset += index_bytes.len() as u64;
             }
+        }
+
+        if include_payload_stats_block {
+            let stats_chunk = UnifiedPayloadStatsChunk {
+                row_start,
+                row_count: rows.len() as u32,
+                fields: field_stats,
+            };
+            let stats_bytes = bincode::encode_to_vec(&stats_chunk, bincode::config::standard())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            payload.extend_from_slice(&stats_bytes);
+            blocks.push(UnifiedBlockDesc {
+                block_type: UnifiedBlockType::PayloadStats,
+                codec: UnifiedCodec::Bincode,
+                row_start,
+                row_count: rows.len() as u32,
+                offset,
+                compressed_len: stats_bytes.len() as u64,
+                raw_len: stats_bytes.len() as u64,
+                crc32: checksum32(&stats_bytes),
+            });
         }
     }
 
@@ -953,6 +1039,119 @@ fn encode_non_null_payload_values(
             }
             Ok((UnifiedCodec::VarLen, out))
         }
+    }
+}
+
+fn build_payload_field_stats(
+    field: &UnifiedFieldSchema,
+    values: &[UnifiedPayloadValue],
+) -> io::Result<UnifiedPayloadFieldStats> {
+    let mut null_count = 0u32;
+    let mut min: Option<UnifiedPayloadValue> = None;
+    let mut max: Option<UnifiedPayloadValue> = None;
+    let mut cardinality = BTreeSet::new();
+
+    for value in values {
+        if matches!(value, UnifiedPayloadValue::Null) {
+            null_count = null_count.saturating_add(1);
+            continue;
+        }
+
+        if let Some(key) = encode_exact_key(&field.logical_type, value)? {
+            cardinality.insert(key);
+        }
+
+        if let Some(existing) = min.as_ref() {
+            if compare_payload_values_for_stats(&field.logical_type, value, existing)?
+                == Ordering::Less
+            {
+                min = Some(value.clone());
+            }
+        } else {
+            min = Some(value.clone());
+        }
+
+        if let Some(existing) = max.as_ref() {
+            if compare_payload_values_for_stats(&field.logical_type, value, existing)?
+                == Ordering::Greater
+            {
+                max = Some(value.clone());
+            }
+        } else {
+            max = Some(value.clone());
+        }
+    }
+
+    let cardinality_hint = u32::try_from(cardinality.len()).unwrap_or(u32::MAX);
+    Ok(UnifiedPayloadFieldStats {
+        field_id: field.field_id,
+        logical_type: field.logical_type.clone(),
+        null_count,
+        min,
+        max,
+        cardinality_hint,
+    })
+}
+
+fn compare_payload_values_for_stats(
+    logical_type: &UnifiedLogicalType,
+    lhs: &UnifiedPayloadValue,
+    rhs: &UnifiedPayloadValue,
+) -> io::Result<Ordering> {
+    match (logical_type, lhs, rhs) {
+        (UnifiedLogicalType::Bool, UnifiedPayloadValue::Bool(a), UnifiedPayloadValue::Bool(b)) => {
+            Ok(a.cmp(b))
+        }
+        (
+            UnifiedLogicalType::Int64,
+            UnifiedPayloadValue::Int64(a),
+            UnifiedPayloadValue::Int64(b),
+        ) => Ok(a.cmp(b)),
+        (
+            UnifiedLogicalType::Float32,
+            UnifiedPayloadValue::Float32(a),
+            UnifiedPayloadValue::Float32(b),
+        ) => Ok(a.total_cmp(b)),
+        (
+            UnifiedLogicalType::Float64,
+            UnifiedPayloadValue::Float64(a),
+            UnifiedPayloadValue::Float64(b),
+        ) => Ok(a.total_cmp(b)),
+        (
+            UnifiedLogicalType::TimestampMicros,
+            UnifiedPayloadValue::TimestampMicros(a),
+            UnifiedPayloadValue::TimestampMicros(b),
+        ) => Ok(a.cmp(b)),
+        (
+            UnifiedLogicalType::Keyword,
+            UnifiedPayloadValue::Keyword(a),
+            UnifiedPayloadValue::Keyword(b),
+        ) => Ok(a.cmp(b)),
+        (UnifiedLogicalType::Text, UnifiedPayloadValue::Text(a), UnifiedPayloadValue::Text(b)) => {
+            Ok(a.cmp(b))
+        }
+        (
+            UnifiedLogicalType::Bytes,
+            UnifiedPayloadValue::Bytes(a),
+            UnifiedPayloadValue::Bytes(b),
+        ) => Ok(a.cmp(b)),
+        (
+            UnifiedLogicalType::LobRef,
+            UnifiedPayloadValue::LobRef(_),
+            UnifiedPayloadValue::LobRef(_),
+        ) => {
+            let lhs_bytes = encode_exact_key(logical_type, lhs)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "lob_ref stats lhs is null")
+            })?;
+            let rhs_bytes = encode_exact_key(logical_type, rhs)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "lob_ref stats rhs is null")
+            })?;
+            Ok(lhs_bytes.cmp(&rhs_bytes))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "payload stats value type mismatch",
+        )),
     }
 }
 
@@ -1135,11 +1334,10 @@ fn build_exact_index_block(
         dictionary,
         postings,
     };
-    let bytes = bincode::encode_to_vec(&exact_index, bincode::config::standard())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let bytes = encode_exact_index_bitpacked(&exact_index)?;
     let desc = UnifiedBlockDesc {
         block_type: UnifiedBlockType::PayloadExactIndex,
-        codec: UnifiedCodec::DictPostings,
+        codec: UnifiedCodec::DictPostingsBitpack,
         row_start,
         row_count: ids.len() as u32,
         offset,
@@ -1196,6 +1394,7 @@ mod tests {
     use crate::unified_reader::UnifiedReader;
     use opendal::{Operator, services};
     use std::collections::BTreeMap;
+    use std::time::Instant;
     use tempfile::tempdir;
 
     #[test]
@@ -1441,6 +1640,13 @@ mod tests {
         let reader = UnifiedReader::open(op, "bucket_payload_append_supported.driftu")
             .await
             .unwrap();
+        for block in reader
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == UnifiedBlockType::PayloadExactIndex)
+        {
+            assert_eq!(block.codec, UnifiedCodec::DictPostingsBitpack);
+        }
 
         let payload_rows = reader.read_payload_rows().await.unwrap();
         let expected_rows: Vec<UnifiedPayloadRow> = rows_a
@@ -1449,6 +1655,13 @@ mod tests {
             .chain(rows_b.iter().cloned())
             .collect();
         assert_eq!(payload_rows, expected_rows);
+
+        let payload_stats = reader.read_payload_stats().await.unwrap();
+        assert_eq!(payload_stats.len(), 2);
+        assert_eq!(payload_stats[0].row_start, 0);
+        assert_eq!(payload_stats[0].row_count, 2);
+        assert_eq!(payload_stats[1].row_start, 2);
+        assert_eq!(payload_stats[1].row_count, 2);
 
         let acme = reader
             .filter_ids_exact(
@@ -1467,5 +1680,468 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(initech, vec![4]);
+    }
+
+    #[tokio::test]
+    async fn test_unified_local_append_null_heavy_payload_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bucket_payload_append_null_heavy.driftu");
+        let schema = UnifiedPayloadSchema::new(vec![
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 1,
+                name: "tenant".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+                nullable: true,
+                indexed: true,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 2,
+                name: "score".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Int64,
+                nullable: false,
+                indexed: false,
+            },
+        ]);
+
+        let rows_a: Vec<UnifiedPayloadRow> = vec![
+            BTreeMap::from([(2, crate::unified_format::UnifiedPayloadValue::Int64(10))]),
+            BTreeMap::from([(2, crate::unified_format::UnifiedPayloadValue::Int64(20))]),
+            BTreeMap::from([
+                (
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+                ),
+                (2, crate::unified_format::UnifiedPayloadValue::Int64(30)),
+            ]),
+            BTreeMap::from([(2, crate::unified_format::UnifiedPayloadValue::Int64(40))]),
+        ];
+        UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
+            &path,
+            &[1, 2, 3, 4],
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+            2,
+            Some(&schema),
+            Some(&rows_a),
+        )
+        .unwrap();
+
+        let rows_b: Vec<UnifiedPayloadRow> = vec![
+            BTreeMap::from([(2, crate::unified_format::UnifiedPayloadValue::Int64(50))]),
+            BTreeMap::from([
+                (
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("globex".to_string()),
+                ),
+                (2, crate::unified_format::UnifiedPayloadValue::Int64(60)),
+            ]),
+            BTreeMap::from([(2, crate::unified_format::UnifiedPayloadValue::Int64(70))]),
+            BTreeMap::from([(2, crate::unified_format::UnifiedPayloadValue::Int64(80))]),
+        ];
+        UnifiedLocalWriter::append_vector_chunk_with_payload_to_path(
+            &path,
+            &[5, 6, 7, 8],
+            &[0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6],
+            2,
+            Some(&schema),
+            Some(&rows_b),
+        )
+        .unwrap();
+
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let reader = UnifiedReader::open(op, "bucket_payload_append_null_heavy.driftu")
+            .await
+            .unwrap();
+
+        let expected_rows: Vec<UnifiedPayloadRow> = rows_a
+            .iter()
+            .cloned()
+            .chain(rows_b.iter().cloned())
+            .collect();
+        let payload_rows = reader.read_payload_rows().await.unwrap();
+        assert_eq!(payload_rows, expected_rows);
+
+        let acme = reader
+            .filter_ids_exact(
+                1,
+                &crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acme, vec![3]);
+        let globex = reader
+            .filter_ids_exact(
+                1,
+                &crate::unified_format::UnifiedPayloadValue::Keyword("globex".to_string()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(globex, vec![6]);
+
+        let stats = reader.read_payload_stats().await.unwrap();
+        assert_eq!(stats.len(), 2);
+        let tenant_chunk_0 = stats[0].fields.iter().find(|f| f.field_id == 1).unwrap();
+        let tenant_chunk_1 = stats[1].fields.iter().find(|f| f.field_id == 1).unwrap();
+        assert_eq!(tenant_chunk_0.null_count, 3);
+        assert_eq!(tenant_chunk_0.cardinality_hint, 1);
+        assert_eq!(tenant_chunk_1.null_count, 3);
+        assert_eq!(tenant_chunk_1.cardinality_hint, 1);
+    }
+
+    #[tokio::test]
+    async fn test_unified_local_append_handles_mixed_dictionary_cardinality_growth() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("bucket_payload_append_cardinality_growth.driftu");
+        let schema = UnifiedPayloadSchema::new(vec![crate::unified_format::UnifiedFieldSchema {
+            field_id: 1,
+            name: "body".to_string(),
+            logical_type: crate::unified_format::UnifiedLogicalType::Text,
+            nullable: false,
+            indexed: false,
+        }]);
+
+        let repeated = "repeatable_payload_text".to_string();
+        let rows_a: Vec<UnifiedPayloadRow> = (0..4)
+            .map(|_| {
+                BTreeMap::from([(
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Text(repeated.clone()),
+                )])
+            })
+            .collect();
+        UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
+            &path,
+            &[10, 11, 12, 13],
+            &[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+            2,
+            Some(&schema),
+            Some(&rows_a),
+        )
+        .unwrap();
+
+        let rows_b: Vec<UnifiedPayloadRow> = (0..4)
+            .map(|i| {
+                BTreeMap::from([(
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Text(format!(
+                        "unique_payload_text_row_{}_{}",
+                        i,
+                        i * 17
+                    )),
+                )])
+            })
+            .collect();
+        UnifiedLocalWriter::append_vector_chunk_with_payload_to_path(
+            &path,
+            &[14, 15, 16, 17],
+            &[0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6],
+            2,
+            Some(&schema),
+            Some(&rows_b),
+        )
+        .unwrap();
+
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let reader = UnifiedReader::open(op, "bucket_payload_append_cardinality_growth.driftu")
+            .await
+            .unwrap();
+
+        let mut saw_dict = false;
+        let mut saw_varlen = false;
+        for block in reader
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == UnifiedBlockType::PayloadColumn)
+        {
+            if block.codec == UnifiedCodec::DictBitpack {
+                saw_dict = true;
+            } else if block.codec == UnifiedCodec::VarLen {
+                saw_varlen = true;
+            }
+        }
+        assert!(saw_dict, "expected at least one DictBitpack payload chunk");
+        assert!(saw_varlen, "expected at least one VarLen payload chunk");
+
+        let expected_rows: Vec<UnifiedPayloadRow> = rows_a
+            .iter()
+            .cloned()
+            .chain(rows_b.iter().cloned())
+            .collect();
+        let decoded_rows = reader.read_payload_rows().await.unwrap();
+        assert_eq!(decoded_rows, expected_rows);
+    }
+
+    #[tokio::test]
+    async fn test_unified_local_append_respects_schema_optionality() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bucket_payload_append_optionality.driftu");
+        let schema = UnifiedPayloadSchema::new(vec![
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 1,
+                name: "tenant".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+                nullable: false,
+                indexed: true,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 2,
+                name: "region".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+                nullable: true,
+                indexed: false,
+            },
+        ]);
+
+        let rows_a: Vec<UnifiedPayloadRow> = vec![
+            BTreeMap::from([
+                (
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+                ),
+                (
+                    2,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("us-east".to_string()),
+                ),
+            ]),
+            BTreeMap::from([(
+                1,
+                crate::unified_format::UnifiedPayloadValue::Keyword("globex".to_string()),
+            )]),
+        ];
+        UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
+            &path,
+            &[21, 22],
+            &[0.1, 0.2, 0.3, 0.4],
+            2,
+            Some(&schema),
+            Some(&rows_a),
+        )
+        .unwrap();
+
+        let rows_b: Vec<UnifiedPayloadRow> = vec![
+            BTreeMap::from([(
+                1,
+                crate::unified_format::UnifiedPayloadValue::Keyword("initech".to_string()),
+            )]),
+            BTreeMap::from([
+                (
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("umbrella".to_string()),
+                ),
+                (
+                    2,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("eu-west".to_string()),
+                ),
+            ]),
+        ];
+        UnifiedLocalWriter::append_vector_chunk_with_payload_to_path(
+            &path,
+            &[23, 24],
+            &[0.5, 0.6, 0.7, 0.8],
+            2,
+            Some(&schema),
+            Some(&rows_b),
+        )
+        .unwrap();
+
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let reader = UnifiedReader::open(op, "bucket_payload_append_optionality.driftu")
+            .await
+            .unwrap();
+        let expected_rows: Vec<UnifiedPayloadRow> = rows_a
+            .iter()
+            .cloned()
+            .chain(rows_b.iter().cloned())
+            .collect();
+        let decoded_rows = reader.read_payload_rows().await.unwrap();
+        assert_eq!(decoded_rows, expected_rows);
+    }
+
+    #[test]
+    fn test_unified_local_append_rejects_missing_non_nullable_field() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("bucket_payload_append_non_nullable_missing.driftu");
+        let schema = UnifiedPayloadSchema::new(vec![crate::unified_format::UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+        let rows_a: Vec<UnifiedPayloadRow> = vec![BTreeMap::from([(
+            1,
+            crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+        )])];
+        UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
+            &path,
+            &[1],
+            &[0.1, 0.2],
+            2,
+            Some(&schema),
+            Some(&rows_a),
+        )
+        .unwrap();
+
+        let rows_b: Vec<UnifiedPayloadRow> = vec![BTreeMap::new()];
+        let err = UnifiedLocalWriter::append_vector_chunk_with_payload_to_path(
+            &path,
+            &[2],
+            &[0.3, 0.4],
+            2,
+            Some(&schema),
+            Some(&rows_b),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("non-nullable field 'tenant' contains null")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "benchmark harness; run explicitly"]
+    async fn benchmark_payload_heavy_compression_and_read_latency() {
+        const ROWS: usize = 8000;
+        const DIM: usize = 24;
+
+        let ids: Vec<u64> = (0..ROWS as u64).map(|v| v + 1).collect();
+        let mut flat = Vec::with_capacity(ROWS * DIM);
+        for row in 0..ROWS {
+            for d in 0..DIM {
+                flat.push(((row * 31 + d * 17) % 1000) as f32 / 1000.0);
+            }
+        }
+
+        let schema = UnifiedPayloadSchema::new(vec![
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 1,
+                name: "tenant".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+                nullable: false,
+                indexed: true,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 2,
+                name: "body".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Text,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 3,
+                name: "blob".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Bytes,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 4,
+                name: "score".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Int64,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 5,
+                name: "active".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Bool,
+                nullable: false,
+                indexed: false,
+            },
+        ]);
+
+        let mut raw_payload_bytes = 0usize;
+        let mut rows = Vec::with_capacity(ROWS);
+        for i in 0..ROWS {
+            let tenant = format!("tenant_{:02}", i % 32);
+            let body = if i % 5 == 0 {
+                format!(
+                    "unique_payload_body_row_{}_{}_{}_{}",
+                    i,
+                    i * 13,
+                    i * 17,
+                    i * 19
+                )
+            } else {
+                "common_payload_body_repeated_for_compression".to_string()
+            };
+            let blob = vec![(i % 251) as u8; 96];
+            let score = ((i * 97) % 100_000) as i64;
+            let active = i % 2 == 0;
+
+            raw_payload_bytes += tenant.len() + body.len() + blob.len() + 8 + 1;
+
+            rows.push(BTreeMap::from([
+                (
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Keyword(tenant),
+                ),
+                (2, crate::unified_format::UnifiedPayloadValue::Text(body)),
+                (3, crate::unified_format::UnifiedPayloadValue::Bytes(blob)),
+                (4, crate::unified_format::UnifiedPayloadValue::Int64(score)),
+                (5, crate::unified_format::UnifiedPayloadValue::Bool(active)),
+            ]));
+        }
+
+        let write_start = Instant::now();
+        let bytes = UnifiedRemoteWriter::write_vector_with_payload_flat_to_bytes(
+            &ids,
+            &flat,
+            DIM,
+            Some(&schema),
+            Some(&rows),
+        )
+        .unwrap();
+        let write_elapsed = write_start.elapsed();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let name = "bench_payload_heavy.driftu";
+        op.write(name, bytes.clone()).await.unwrap();
+
+        let mut reader = UnifiedReader::open(op.clone(), name).await.unwrap();
+
+        let read_vectors_start = Instant::now();
+        let (decoded_ids, decoded_flat) = reader.read_all_vectors_flat().await.unwrap();
+        let read_vectors_elapsed = read_vectors_start.elapsed();
+        assert_eq!(decoded_ids.len(), ROWS);
+        assert_eq!(decoded_flat.len(), ROWS * DIM);
+
+        let read_payload_start = Instant::now();
+        let decoded_rows = reader.read_payload_rows().await.unwrap();
+        let read_payload_elapsed = read_payload_start.elapsed();
+        assert_eq!(decoded_rows.len(), ROWS);
+
+        let raw_vector_bytes = flat.len() * std::mem::size_of::<f32>();
+        let raw_total_bytes = raw_vector_bytes + raw_payload_bytes;
+        let file_bytes = bytes.len();
+        let compression_ratio = file_bytes as f64 / raw_total_bytes as f64;
+
+        println!(
+            "payload_bench rows={} dim={} file_bytes={} raw_estimate_bytes={} compression_ratio={:.4} write_ms={:.2} read_vectors_ms={:.2} read_payload_ms={:.2}",
+            ROWS,
+            DIM,
+            file_bytes,
+            raw_total_bytes,
+            compression_ratio,
+            write_elapsed.as_secs_f64() * 1000.0,
+            read_vectors_elapsed.as_secs_f64() * 1000.0,
+            read_payload_elapsed.as_secs_f64() * 1000.0
+        );
     }
 }

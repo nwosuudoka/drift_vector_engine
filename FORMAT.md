@@ -1,109 +1,91 @@
-# Drift Unified Bucket Format (`.driftu`) - Draft
+# Drift Unified Bucket Format (`.driftu`) - V1
 
-Status: Draft for discussion  
+Status: Active draft (canonical for implementation)  
 Owner: V3/VNext storage track  
-Goal: One unified immutable object format for vectors + payload + secondary indexes.
+Goal: one immutable object format for vectors, payload, and secondary indexes.
 
-## Execution Plan (Phase-by-Phase)
+## 1. Canonical Direction
 
-1. Phase 1 (now): Add payload schema metadata block to `.driftu` with read/write APIs.
-2. Phase 2: Add typed payload column blocks (BOOL/INT64/FLOAT/TEXT/BYTES/LOB_REF) without indexes.
-3. Phase 3: Add predicate planner and late materialization for payload filters.
-4. Phase 4: Add `EXACT` side index blocks (dictionary + postings) and planner integration.
-5. Phase 5: Add remote promotion compaction policies for payload/index rewrite and validation.
+This repository standardizes on a single unified file format:
 
-Current status:
-1. Phase 1 is in progress in `drift_storage` (schema block type + reader/writer support).
+1. One run object per bucket: `bucket_<id>_<run_id>.driftu`
+2. No payload/index sidecar files in the unified path
+3. Payload schema, payload columns, and secondary indexes are stored as typed blocks inside `.driftu`
 
-## 1. What We Optimize For
+If any older docs mention separate `.payload` or `.idx_*` sidecars, treat those as historical design notes.
 
-1. Fast vector-first scans (SQ8 path stays hot).
-2. High ingest throughput (append-only local flush path).
-3. Safe copy-on-write split/merge/promotion (no in-place remote mutation).
-4. Object-store source of truth with manifest CAS pointer swaps.
-5. Typed payload support without sidecar coordination complexity.
-6. Efficient handling of arbitrary large payloads (images/audio/video/docs/blobs).
+## 2. Design Objectives
 
-## 2. Architecture Decision
+1. Keep vector-first scan path hot (`SQ8` block contiguous and cheap to read).
+2. Support typed payload fields with strict validation and deterministic decode.
+3. Keep local flush append-safe and crash-safe.
+4. Keep remote promotion immutable and rewrite-based (no in-place mutation).
+5. Allow per-type and per-block codec choices.
+6. Preserve future extension for planner-driven filter pushdown and range indexes.
 
-Keep current architecture and evolve file format:
+## 3. File Lifecycle
 
-1. `WAL + MemTable + router + janitor` remains.
-2. Local staging remains append-oriented.
-3. Remote objects remain immutable per `run_id`.
-4. Split/merge/compaction remain rewrite jobs (create new object(s), then manifest swap).
+1. Local active file: `bucket_<id>_active.driftu`
+2. Local rotated staging snapshot: `bucket_<id>_staging_<uuid>.driftu`
+3. Remote immutable run file: `bucket_<id>_<run_id>.driftu`
 
-Do not mutate remote objects in place.
+Lifecycle rules:
 
-## 3. Core Strategy for Fast Encoding/Scanning
-
-Two-level design:
-
-1. Physical layout is vector-first contiguous superblocks.
-2. Logical row groups are metadata ranges in footer (for pruning and parallel scheduling).
-3. Keep large payload bytes off the hot vector scan path.
-
-Implication:
-
-1. Vector scan reads contiguous bytes (low IO overhead, SIMD-friendly).
-2. Payload/index reads are selective and columnar.
-3. Row-group-level stats and postings reduce unnecessary payload decoding.
-4. Large object fetch is explicit and lazy (only when requested).
-
-## 4. File Naming and Lifecycle
-
-1. Local active: `bucket_<id>_active.driftu`
-2. Local rotated snapshot: `bucket_<id>_staging_<uuid>.driftu`
-3. Remote immutable: `bucket_<id>_<run_id>.driftu`
-
-Lifecycle:
-
-1. Flush appends to local active file.
-2. Promotion/split/merge writes brand new object(s).
-3. Manifest CAS publishes new object path/fingerprint.
+1. Flush appends chunk-aligned blocks to local active files.
+2. Promotion/split/merge rewrites new immutable `.driftu` object(s).
+3. Manifest CAS swap publishes the new run object path/fingerprint.
 4. Old objects are reaped asynchronously.
 
-## 5. Physical File Layout (V1 draft)
+## 4. Physical Layout
 
 ```text
-+-------------------------------+
-| Header (fixed)                |
-+-------------------------------+
-| Block: Quantizer              |
-+-------------------------------+
-| Block: IDs                    |
-+-------------------------------+
-| Block: Vector Codes (SQ8)     |
-+-------------------------------+
-| Block: Optional Norms         |
-+-------------------------------+
-| Block: Payload Columns...     |
-+-------------------------------+
-| Block: LOB Pointer Columns... |
-+-------------------------------+
-| Block: Secondary Indexes...   |
-+-------------------------------+
-| Footer (directory + stats)    |
-+-------------------------------+
++-----------------------------------+
+| Header (fixed 128 bytes)          |
++-----------------------------------+
+| Payload Region (framed blocks)    |
+|   - Quantizer                     |
+|   - IDs                           |
+|   - Vector Codes                  |
+|   - Optional Payload Schema       |
+|   - Optional Payload Columns      |
+|   - Optional Secondary Indexes    |
++-----------------------------------+
+| Block Directory                   |
++-----------------------------------+
+| Footer (fixed 64 bytes)           |
++-----------------------------------+
 ```
+
+Current fixed constants are in `drift_storage/src/unified_format.rs`.
+
+## 5. Header, Footer, and Block Framing
 
 ### 5.1 Header (fixed)
 
-Fields (conceptual):
+Header includes:
 
-1. magic/version
+1. magic/version/header_len
 2. flags
-3. dim
-4. metric (`L2`, `COSINE`)
-5. row_count
-6. payload_schema_hash
-7. created_at
-8. footer_offset/footer_length
-9. checksum mode
+3. dimension (`dim`)
+4. total `row_count`
+5. quantizer location metadata
+6. block directory location/count
+7. footer location/length
+8. creation timestamp
 
-### 5.2 Block Framing
+### 5.2 Footer (fixed)
 
-Every block is framed:
+Footer includes:
+
+1. magic/version/footer_len
+2. flags (must match header)
+3. total `row_count` (must match header)
+4. block directory offset/count (must match header)
+5. block directory CRC32
+
+### 5.3 Block Descriptor
+
+Each block descriptor contains:
 
 1. `block_type`
 2. `codec`
@@ -114,189 +96,146 @@ Every block is framed:
 7. `raw_len`
 8. `crc32`
 
-This gives uniform validation and easier future extension.
+This descriptor applies uniformly to vectors, payload columns, and index blocks.
 
-### 5.3 Footer
+## 6. Logical Row-Group Model
 
-Footer contains:
+1. A chunk is defined by `(row_start, row_count)` and includes quantizer + ids + vector-codes blocks.
+2. Payload and index blocks reference the same row ranges.
+3. Chunks must form contiguous row coverage from `0..row_count`.
+4. File must remain readable after each successful append.
 
-1. row-group directory (`row_start`, `row_count`, block refs)
-2. payload field schema (typed, nullable, codec hints)
-3. column stats per row group (min/max/null_count/cardinality_hint)
-4. index directory (EXACT now, others later)
-5. manifest consistency fields (schema hash, optional object fingerprint hint)
-6. footer checksum + magic
+## 7. Payload Type System
 
-## 6. Logical Row Group Model
+Supported logical payload types:
 
-Row groups are logical row ranges, not necessarily independent vector blobs.
+1. `Bool`
+2. `Int64`
+3. `Float32`
+4. `Float64`
+5. `TimestampMicros`
+6. `Keyword`
+7. `Text`
+8. `Bytes`
+9. `LobRef`
 
-Each row group tracks:
+Nullability is represented by per-column validity bitmaps.
 
-1. row range (`start`, `count`)
-2. payload block references for that range
-3. stats for predicate pruning
-4. optional local postings pointers
+## 8. Encoding Policy (Per Type)
 
-Vector blocks may remain global contiguous blocks while row groups map ranges into them.
+Codec selection is per column-chunk and may differ between chunks.
 
-## 7. Type System and Codec Policy (V1)
+### 8.1 Current Default Matrix
 
-### 7.1 Supported Logical Types
-
-V1 payload types:
-
-1. `BOOL`
-2. `INT64` (canonical integer type; narrower ints normalize to this)
-3. `FLOAT32`
-4. `FLOAT64` (optional for precision-sensitive collections)
-5. `TIMESTAMP_MICROS` (physical `INT64`)
-6. `KEYWORD` (exact string)
-7. `TEXT` (stored text, no ranking in V1)
-8. `BYTES` (opaque binary payload)
-9. `LOB_REF` (logical external large object reference)
-
-Nullability for all nullable fields is represented via a dedicated validity bitmap block.
-
-### 7.2 Vortex/FastLanes-Inspired Principles
-
-1. Block-local encoding decisions (Vortex style): choose codecs per block/column chunk, not globally for the file.
-2. Lane-friendly integer blocks (FastLanes style): fixed-size integer blocks for SIMD-friendly decode and predictable scans.
-3. Keep encoded blocks self-describing: each block carries codec id + lengths + checksum.
-4. Separate write profiles:
-   - local flush profile favors low CPU overhead.
-   - remote promotion profile favors compactness and scan efficiency.
-
-### 7.3 Default Codec Matrix
-
-| Logical Type | Local Flush (append path) | Remote Promotion (rewrite path) | Notes |
+| Logical Type | Local Append Profile | Remote Rewrite Profile | Current Implementation |
 |---|---|---|---|
-| `BOOL` | bitset | bitset or RLE-bitset | choose RLE when runs are long |
-| `INT64` | FOR + bitpack | FOR + bitpack (or FastLanes block for low-card runs) | block size fixed for SIMD decode |
-| `TIMESTAMP_MICROS` | FOR + bitpack | FOR + bitpack | same as `INT64` |
-| `FLOAT32` | plain/fixed | ALP_RD (fallback plain/fixed) | remote rewrite pays CPU once |
-| `FLOAT64` | plain/fixed | ALP_RD (fallback plain/fixed) | optional type in V1 |
-| `KEYWORD` | dictionary + bitpacked ids | dictionary + bitpacked ids (optional zstd on dict payload) | supports `EXACT` index well |
-| `TEXT` | plain + lz4 | plain + zstd | V1 stores/retrieves; no BM25 |
-| `BYTES` | length-delimited + lz4 | length-delimited + zstd | no semantic indexing in V1 |
-| `LOB_REF` | plain/fixed ref tuple | plain/fixed ref tuple | points to external blob/chunk object(s) |
+| `Bool` | `Bitset` | `Bitset` (RLE candidate later) | Implemented |
+| `Int64` | `ForBitpack` | `ForBitpack` (lane variants later) | Implemented |
+| `TimestampMicros` | `ForBitpack` | `ForBitpack` | Implemented |
+| `Float32` | `AlpRd` | `AlpRd` (plain fallback policy pending) | Implemented |
+| `Float64` | `AlpRd` | `AlpRd` (plain fallback policy pending) | Implemented |
+| `Keyword` | `DictBitpack` | `DictBitpack` | Implemented |
+| `Text` | `VarLen` or `DictBitpack` by size | same policy for now | Implemented |
+| `Bytes` | `VarLen` or `DictBitpack` by size | same policy for now | Implemented |
+| `LobRef` | `VarLen` | `VarLen` | Implemented |
 
-### 7.4 Secondary Index Encoding (V1)
+### 8.2 Rules
 
-1. `EXACT` first:
-   - value dictionary
-   - postings lists of row ids (delta + bitpack)
-2. `RANGE` later:
-   - sorted `(value, row_id)` blocks
-   - sparse min/max directory for pruning
+1. Codec is always stored in both block descriptor and column chunk.
+2. Reader must reject codec/type mismatch.
+3. Dictionary encodings must fail on invalid dictionary IDs.
+4. Bitpacked encodings must fail on width/length mismatch.
 
-### 7.5 Adaptive Fallback Rules
+## 9. Payload and Index Blocks
 
-1. If dictionary cardinality is too high for a block, fallback from dictionary to plain compressed block.
-2. If ALP_RD does not beat plain by a minimum ratio threshold, store plain/fixed block.
-3. If integer blocks are highly irregular, stay on FOR + bitpack rather than forcing advanced lane encodings.
+### 9.1 Payload Schema Block
 
-### 7.6 Arbitrary Large Input Strategy (images/audio/video/docs)
+Stores schema (`field_id`, name, logical type, nullability, indexed flag).
 
-For big payloads, the unified bucket file stores references, not full raw bytes:
+### 9.2 Payload Column Block
 
-1. Inline only lightweight metadata in payload columns:
-   - mime/content type
-   - byte size
-   - width/height/duration (if available)
-   - hash/fingerprint
-2. Store heavy bytes in external immutable blob objects:
-   - content-addressed key (hash-based), or
-   - run-scoped chunk object key
-3. `LOB_REF` physical tuple:
-   - `blob_key`
-   - `offset`
-   - `length`
-   - `fingerprint` (optional)
-4. Query/search path never reads blob bytes unless explicitly requested.
+Stores one field chunk for one row range:
 
-This preserves vector/filter latency while still supporting arbitrary binary inputs.
+1. `field_id`
+2. `logical_type`
+3. `codec`
+4. `row_start`
+5. `row_count`
+6. optional `validity`
+7. encoded `data`
 
-### 7.7 Why This Is Better for Big Data Inputs
+### 9.3 Exact Index Block
 
-1. Prevents read amplification in vector scans.
-2. Avoids repeatedly rewriting huge media bytes during split/merge/compaction.
-3. Keeps copy-on-write object churn bounded to vector/index data.
-4. Enables deduplication via content-addressed blob keys.
+Current V1 exact index stores:
 
-## 8. Write Path Stages
+1. normalized value dictionary (`Vec<Vec<u8>>`)
+2. postings encoded as delta + bitpack payloads
+3. one block per indexed field per chunk as needed
 
-### 8.1 Flush (MemTable -> local active file)
+Block codec:
 
-1. Partition by bucket.
-2. Append new logical row group data.
-3. Update local footer/checkpoint atomically.
-4. Keep file readable after each append.
+1. `DictPostingsBitpack` only
+2. older exact-index postings must be rewritten by current writer
 
-Local goal: write throughput and crash safety.
+### 9.4 Payload Stats Block
 
-### 8.2 Promotion (local + remote -> new remote object)
+Stores one stats payload per chunk row range:
 
-1. Read remote run + rotated local snapshot.
-2. Apply tombstones and dedupe.
-3. Rewrite into one new immutable remote `.driftu`.
-4. Build payload/index blocks during rewrite.
-5. Upload object.
-6. Commit manifest CAS to point to new run.
+1. `row_start`
+2. `row_count`
+3. per-field stats entries:
+   - `field_id`
+   - `logical_type`
+   - `null_count`
+   - `min` (optional, absent for all-null chunk field)
+   - `max` (optional, absent for all-null chunk field)
+   - `cardinality_hint`
 
-Remote goal: read efficiency and compactness.
+Reader validates:
 
-### 8.3 Split/Merge
+1. one stats block per vector chunk when stats flag is set
+2. field coverage matches schema
+3. logical types and min/max ordering are consistent
 
-1. Compute output partitions.
-2. Write child/merged objects as fresh `.driftu` files.
-3. CAS update manifest topology and pointers.
-4. Reap old objects asynchronously.
+### 9.5 Range Index
 
-## 9. Read Path
+Range index is not yet implemented in `.driftu` V1 runtime. It remains planned next for numeric/time predicates.
 
-1. Load header + footer first.
-2. Plan scan using metric + row-group stats + available indexes.
-3. For vector-first query:
-   - scan SQ8 contiguous vector block
-   - apply tombstones
-   - refine candidates
-4. For filtered query:
-   - apply EXACT/RANGE pruning first
-   - evaluate vector only on survivors
-   - late materialize payload values
+## 10. Append and Rewrite Semantics
 
-## 10. Consistency and Failure Semantics
+### 10.1 Local Append
 
-1. Data object upload happens before manifest swap.
-2. Manifest CAS is the publication boundary.
-3. Crash before CAS: new object is orphan, safe to reap.
-4. Crash after CAS: new object is authoritative.
-5. Recovery validates:
-   - manifest path/fingerprint
-   - header/footer checksums
-   - schema hash consistency
+1. Validate incoming shape (`ids`, vectors, `dim`, payload rows).
+2. Validate schema compatibility with existing file schema.
+3. Append chunk blocks.
+4. Rebuild block directory and footer.
+5. Rewrite header/footer metadata atomically.
 
-## 11. What We Are Explicitly Not Doing Now
+### 10.2 Remote Rewrite (Promotion/Split/Merge)
 
-1. No sidecar payload/index artifacts.
-2. No in-place remote patching.
-3. No query-path row-group checkpointing overhead.
-4. No broad codec auto-tuning in first cut (start with stable defaults).
+1. Read source runs and apply tombstones/dedupe.
+2. Re-emit unified blocks in a new immutable object.
+3. Publish object by manifest CAS.
 
-## 12. Implementation Milestones
+## 11. Read-Path Guarantees
 
-1. Add `drift_storage::unified_format` structs + encoder/decoder + validators.
-2. Add local append writer (`AppendLocal`) with checkpoint footer updates.
-3. Add remote rewrite writer (`RewriteRemote`) for janitor promotion/split/merge.
-4. Wire persistence manager to read/write `.driftu`.
-5. Wire manifest bucket metadata to track format version/object fingerprint.
-6. Add corruption/recovery/integration tests for flush/promotion/split/merge.
+1. Header/footer and block directory are validated before scan.
+2. Block CRC32 is verified on read.
+3. Payload schema flag/block consistency is enforced.
+4. Payload columns decode only when requested.
+5. Exact index blocks for the same field are mergeable across chunks.
 
-## 13. Open Decisions (for next discussion)
+## 12. Open Work
 
-1. Target row-group row count / byte target defaults.
-2. Norm block required vs optional for cosine.
-3. Exact posting format (`u64 delta+bitpack` vs hybrid).
-4. Whether to keep bloom in unified footer for cheap negative checks.
-5. Final magic/version naming (`V3 unified` vs `V4` bump).
+1. Header extensions for metric and schema hash.
+2. Exact postings compressed wire format (delta + bitpack).
+3. Range index block type and codec contract.
+4. Stats-aware planner heuristics and pruning strategy wiring.
+5. Explicit local-vs-remote codec policy object in writer path.
+
+## 13. Implementation Milestones
+
+1. Keep `drift_storage::unified_format` as single source of wire contracts.
+2. Keep append writer and reader validation strict.
+3. Add corruption matrix tests for each new codec/index addition.
+4. Wire unified format into persistence/manifest flows end-to-end.

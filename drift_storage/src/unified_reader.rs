@@ -2,16 +2,19 @@ use crate::compression::alp_rd::alp_rd_decode;
 use crate::disk_manager::DiskManager;
 use crate::unified_format::{
     UNIFIED_BLOCK_DESC_SIZE, UNIFIED_FLAG_HAS_EXACT_INDEX, UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS,
-    UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA, UNIFIED_FOOTER_SIZE, UNIFIED_HEADER_SIZE, UnifiedBlockDesc,
-    UnifiedBlockType, UnifiedCodec, UnifiedExactIndex, UnifiedFooter, UnifiedHeader,
-    UnifiedLogicalType, UnifiedPayloadColumnChunk, UnifiedPayloadRow, UnifiedPayloadSchema,
-    UnifiedPayloadValue, decode_block_directory, encode_exact_key,
+    UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA, UNIFIED_FLAG_HAS_PAYLOAD_STATS, UNIFIED_FOOTER_SIZE,
+    UNIFIED_HEADER_SIZE, UnifiedBlockDesc, UnifiedBlockType, UnifiedCodec, UnifiedExactIndex,
+    UnifiedFooter, UnifiedHeader, UnifiedLogicalType, UnifiedPayloadColumnChunk,
+    UnifiedPayloadFieldStats, UnifiedPayloadRow, UnifiedPayloadSchema, UnifiedPayloadStatsChunk,
+    UnifiedPayloadValue, compute_payload_schema_hash, decode_block_directory,
+    decode_exact_index_bitpacked, encode_exact_key,
 };
 use byteorder::{LittleEndian, ReadBytesExt};
 use crc32fast::Hasher;
 use drift_core::quantizer::Quantizer;
 use opendal::Operator;
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{self, Cursor};
 
 #[derive(Clone)]
@@ -73,6 +76,18 @@ impl UnifiedReader {
                 "header/footer flags mismatch",
             ));
         }
+        if footer.metric != header.metric {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "header/footer metric mismatch",
+            ));
+        }
+        if footer.payload_schema_hash != header.payload_schema_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "header/footer payload schema hash mismatch",
+            ));
+        }
 
         let block_dir_len = 4usize
             .checked_add((header.block_count as usize).saturating_mul(UNIFIED_BLOCK_DESC_SIZE))
@@ -111,11 +126,20 @@ impl UnifiedReader {
         let has_exact_index = blocks
             .iter()
             .any(|b| b.block_type == UnifiedBlockType::PayloadExactIndex);
+        let has_payload_stats = blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadStats);
         let flag_has_schema = (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_SCHEMA) != 0;
         if flag_has_schema != has_schema_block {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "payload schema flag mismatch",
+            ));
+        }
+        if !flag_has_schema && header.payload_schema_hash != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload schema hash set without payload schema block",
             ));
         }
         let flag_has_payload_columns = (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS) != 0;
@@ -130,6 +154,19 @@ impl UnifiedReader {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "exact index flag mismatch",
+            ));
+        }
+        let flag_has_payload_stats = (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_STATS) != 0;
+        if flag_has_payload_stats != has_payload_stats {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload stats flag mismatch",
+            ));
+        }
+        if flag_has_payload_stats && !flag_has_payload_columns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload stats require payload columns",
             ));
         }
 
@@ -265,6 +302,16 @@ impl UnifiedReader {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "multiple payload schema blocks disagree",
+                ));
+            }
+        }
+
+        if self.header.payload_schema_hash != 0 {
+            let actual_hash = compute_payload_schema_hash(&first_schema)?;
+            if actual_hash != self.header.payload_schema_hash {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload schema hash mismatch",
                 ));
             }
         }
@@ -409,6 +456,79 @@ impl UnifiedReader {
         Ok(out)
     }
 
+    pub async fn read_payload_stats(&self) -> io::Result<Vec<UnifiedPayloadStatsChunk>> {
+        let stats_blocks: Vec<&UnifiedBlockDesc> = self
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == UnifiedBlockType::PayloadStats)
+            .collect();
+        if stats_blocks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(schema) = self.read_payload_schema().await? else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload stats present without payload schema",
+            ));
+        };
+
+        let chunks = self.chunk_refs()?;
+        let expected_ranges: BTreeSet<(u64, u32)> =
+            chunks.iter().map(|c| (c.row_start, c.row_count)).collect();
+        let mut seen_ranges: HashSet<(u64, u32)> = HashSet::new();
+
+        let mut out = Vec::with_capacity(stats_blocks.len());
+        for block in stats_blocks {
+            if block.codec != UnifiedCodec::Bincode {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats block has invalid codec",
+                ));
+            }
+
+            let bytes = self.read_block_bytes(block).await?;
+            let (stats_chunk, _): (UnifiedPayloadStatsChunk, usize) =
+                bincode::decode_from_slice(&bytes, bincode::config::standard())
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            if stats_chunk.row_start != block.row_start || stats_chunk.row_count != block.row_count
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats row range mismatch",
+                ));
+            }
+
+            let range = (stats_chunk.row_start, stats_chunk.row_count);
+            if !expected_ranges.contains(&range) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats references unknown chunk range",
+                ));
+            }
+            if !seen_ranges.insert(range) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate payload stats block for chunk",
+                ));
+            }
+
+            validate_payload_stats_chunk(&schema, &stats_chunk)?;
+            out.push(stats_chunk);
+        }
+
+        if seen_ranges.len() != expected_ranges.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing payload stats block for one or more chunks",
+            ));
+        }
+
+        out.sort_by_key(|chunk| chunk.row_start);
+        Ok(out)
+    }
+
     pub async fn read_payload_rows(&self) -> io::Result<Vec<UnifiedPayloadRow>> {
         let columns = self.read_payload_columns().await?;
         let row_count = self.header.row_count as usize;
@@ -445,17 +565,15 @@ impl UnifiedReader {
             .filter(|b| b.block_type == UnifiedBlockType::PayloadExactIndex)
         {
             let bytes = self.read_block_bytes(block).await?;
-            let (index, _): (UnifiedExactIndex, usize) =
-                bincode::decode_from_slice(&bytes, bincode::config::standard())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if index.field_id != field_id {
-                continue;
-            }
-            if block.codec != UnifiedCodec::DictPostings {
+            if block.codec != UnifiedCodec::DictPostingsBitpack {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "exact index block has invalid codec",
+                    "unsupported exact index codec; rewrite run with current writer",
                 ));
+            }
+            let index = decode_exact_index_bitpacked(&bytes)?;
+            if index.field_id != field_id {
+                continue;
             }
             if index.dictionary.len() != index.postings.len() {
                 return Err(io::Error::new(
@@ -629,7 +747,8 @@ fn build_chunk_refs(
             }
             UnifiedBlockType::PayloadSchema
             | UnifiedBlockType::PayloadColumn
-            | UnifiedBlockType::PayloadExactIndex => {}
+            | UnifiedBlockType::PayloadExactIndex
+            | UnifiedBlockType::PayloadStats => {}
         }
     }
 
@@ -681,6 +800,203 @@ fn checksum32(bytes: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(bytes);
     hasher.finalize()
+}
+
+fn validate_payload_stats_chunk(
+    schema: &UnifiedPayloadSchema,
+    chunk: &UnifiedPayloadStatsChunk,
+) -> io::Result<()> {
+    let mut seen_field_ids = HashSet::new();
+    for field_stats in &chunk.fields {
+        if !seen_field_ids.insert(field_stats.field_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "duplicate payload stats field entry",
+            ));
+        }
+
+        let schema_field = schema
+            .fields
+            .iter()
+            .find(|field| field.field_id == field_stats.field_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "payload stats references unknown field_id={}",
+                        field_stats.field_id
+                    ),
+                )
+            })?;
+
+        if schema_field.logical_type != field_stats.logical_type {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload stats logical type mismatch",
+            ));
+        }
+
+        validate_payload_field_stats(field_stats, chunk.row_count, &schema_field.logical_type)?;
+    }
+
+    if seen_field_ids.len() != schema.fields.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload stats field coverage mismatch",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_payload_field_stats(
+    stats: &UnifiedPayloadFieldStats,
+    row_count: u32,
+    logical_type: &UnifiedLogicalType,
+) -> io::Result<()> {
+    if stats.null_count > row_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload stats null_count exceeds row_count",
+        ));
+    }
+    let non_null_count = row_count - stats.null_count;
+    if stats.cardinality_hint > non_null_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload stats cardinality_hint exceeds non-null row count",
+        ));
+    }
+
+    match (&stats.min, &stats.max) {
+        (None, None) => {
+            if non_null_count != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats missing min/max for non-null rows",
+                ));
+            }
+        }
+        (Some(min), Some(max)) => {
+            if non_null_count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats min/max present for all-null rows",
+                ));
+            }
+            if !payload_value_matches_type(logical_type, min)
+                || !payload_value_matches_type(logical_type, max)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats min/max type mismatch",
+                ));
+            }
+            if compare_payload_values_for_stats(logical_type, min, max)? == Ordering::Greater {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats min/max ordering invalid",
+                ));
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "payload stats min/max must both be present or absent",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn payload_value_matches_type(
+    logical_type: &UnifiedLogicalType,
+    value: &UnifiedPayloadValue,
+) -> bool {
+    matches!(
+        (logical_type, value),
+        (UnifiedLogicalType::Bool, UnifiedPayloadValue::Bool(_))
+            | (UnifiedLogicalType::Int64, UnifiedPayloadValue::Int64(_))
+            | (UnifiedLogicalType::Float32, UnifiedPayloadValue::Float32(_))
+            | (UnifiedLogicalType::Float64, UnifiedPayloadValue::Float64(_))
+            | (
+                UnifiedLogicalType::TimestampMicros,
+                UnifiedPayloadValue::TimestampMicros(_)
+            )
+            | (UnifiedLogicalType::Keyword, UnifiedPayloadValue::Keyword(_))
+            | (UnifiedLogicalType::Text, UnifiedPayloadValue::Text(_))
+            | (UnifiedLogicalType::Bytes, UnifiedPayloadValue::Bytes(_))
+            | (UnifiedLogicalType::LobRef, UnifiedPayloadValue::LobRef(_))
+    )
+}
+
+fn compare_payload_values_for_stats(
+    logical_type: &UnifiedLogicalType,
+    lhs: &UnifiedPayloadValue,
+    rhs: &UnifiedPayloadValue,
+) -> io::Result<Ordering> {
+    match (logical_type, lhs, rhs) {
+        (UnifiedLogicalType::Bool, UnifiedPayloadValue::Bool(a), UnifiedPayloadValue::Bool(b)) => {
+            Ok(a.cmp(b))
+        }
+        (
+            UnifiedLogicalType::Int64,
+            UnifiedPayloadValue::Int64(a),
+            UnifiedPayloadValue::Int64(b),
+        ) => Ok(a.cmp(b)),
+        (
+            UnifiedLogicalType::Float32,
+            UnifiedPayloadValue::Float32(a),
+            UnifiedPayloadValue::Float32(b),
+        ) => Ok(a.total_cmp(b)),
+        (
+            UnifiedLogicalType::Float64,
+            UnifiedPayloadValue::Float64(a),
+            UnifiedPayloadValue::Float64(b),
+        ) => Ok(a.total_cmp(b)),
+        (
+            UnifiedLogicalType::TimestampMicros,
+            UnifiedPayloadValue::TimestampMicros(a),
+            UnifiedPayloadValue::TimestampMicros(b),
+        ) => Ok(a.cmp(b)),
+        (
+            UnifiedLogicalType::Keyword,
+            UnifiedPayloadValue::Keyword(a),
+            UnifiedPayloadValue::Keyword(b),
+        ) => Ok(a.cmp(b)),
+        (UnifiedLogicalType::Text, UnifiedPayloadValue::Text(a), UnifiedPayloadValue::Text(b)) => {
+            Ok(a.cmp(b))
+        }
+        (
+            UnifiedLogicalType::Bytes,
+            UnifiedPayloadValue::Bytes(a),
+            UnifiedPayloadValue::Bytes(b),
+        ) => Ok(a.cmp(b)),
+        (
+            UnifiedLogicalType::LobRef,
+            UnifiedPayloadValue::LobRef(_),
+            UnifiedPayloadValue::LobRef(_),
+        ) => {
+            let lhs_bytes = encode_exact_key(logical_type, lhs)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats lhs cannot be null",
+                )
+            })?;
+            let rhs_bytes = encode_exact_key(logical_type, rhs)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "payload stats rhs cannot be null",
+                )
+            })?;
+            Ok(lhs_bytes.cmp(&rhs_bytes))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload stats value type mismatch",
+        )),
+    }
 }
 
 fn decode_payload_column_chunk_values(
@@ -1071,6 +1387,7 @@ fn unpack_u64_values(data: &[u8], count: usize, bit_width: u8) -> io::Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unified_format::UnifiedMetric;
     use crate::unified_writer::UnifiedRemoteWriter;
     use opendal::{Operator, services};
     use std::collections::BTreeMap;
@@ -1202,6 +1519,265 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unified_reader_rejects_header_footer_metric_mismatch() {
+        let ids = vec![1, 2];
+        let flat = vec![0.1, 0.2, 0.3, 0.4];
+        let mut bytes =
+            UnifiedRemoteWriter::write_vector_only_flat_to_bytes(&ids, &flat, 2).unwrap();
+
+        let header = UnifiedHeader::decode(&bytes[..UNIFIED_HEADER_SIZE]).unwrap();
+        let footer_start = header.footer_offset as usize;
+        let footer_end = footer_start + UNIFIED_FOOTER_SIZE;
+        let mut footer = UnifiedFooter::decode(&bytes[footer_start..footer_end]).unwrap();
+        footer.metric = UnifiedMetric::Cosine;
+        bytes[footer_start..footer_end].copy_from_slice(&footer.encode().unwrap());
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+
+        let name = "bucket_1_header_footer_metric_mismatch.driftu";
+        op.write(name, bytes).await.unwrap();
+
+        match UnifiedReader::open(op.clone(), name).await {
+            Ok(_) => panic!("expected header/footer metric mismatch to fail open"),
+            Err(err) => assert!(err.to_string().contains("header/footer metric mismatch")),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unified_reader_rejects_header_footer_schema_hash_mismatch() {
+        let ids = vec![1, 2];
+        let flat = vec![0.1, 0.2, 0.3, 0.4];
+        let mut bytes =
+            UnifiedRemoteWriter::write_vector_only_flat_to_bytes(&ids, &flat, 2).unwrap();
+
+        let header = UnifiedHeader::decode(&bytes[..UNIFIED_HEADER_SIZE]).unwrap();
+        let footer_start = header.footer_offset as usize;
+        let footer_end = footer_start + UNIFIED_FOOTER_SIZE;
+        let mut footer = UnifiedFooter::decode(&bytes[footer_start..footer_end]).unwrap();
+        footer.payload_schema_hash = 123;
+        bytes[footer_start..footer_end].copy_from_slice(&footer.encode().unwrap());
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+
+        let name = "bucket_1_header_footer_schema_hash_mismatch.driftu";
+        op.write(name, bytes).await.unwrap();
+
+        match UnifiedReader::open(op.clone(), name).await {
+            Ok(_) => panic!("expected header/footer payload schema hash mismatch to fail open"),
+            Err(err) => {
+                assert!(
+                    err.to_string()
+                        .contains("header/footer payload schema hash mismatch")
+                )
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unified_reader_rejects_payload_schema_hash_mismatch() {
+        let ids = vec![7, 8];
+        let flat = vec![0.1, 0.2, 0.3, 0.4];
+        let schema = crate::unified_format::UnifiedPayloadSchema::new(vec![
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 1,
+                name: "tenant".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+                nullable: false,
+                indexed: true,
+            },
+        ]);
+        let mut bytes = UnifiedRemoteWriter::write_vector_with_schema_flat_to_bytes(
+            &ids,
+            &flat,
+            2,
+            Some(&schema),
+        )
+        .unwrap();
+
+        let mut header = UnifiedHeader::decode(&bytes[..UNIFIED_HEADER_SIZE]).unwrap();
+        header.payload_schema_hash ^= 0x55aa;
+        bytes[..UNIFIED_HEADER_SIZE].copy_from_slice(&header.encode().unwrap());
+
+        let footer_start = header.footer_offset as usize;
+        let footer_end = footer_start + UNIFIED_FOOTER_SIZE;
+        let mut footer = UnifiedFooter::decode(&bytes[footer_start..footer_end]).unwrap();
+        footer.payload_schema_hash = header.payload_schema_hash;
+        bytes[footer_start..footer_end].copy_from_slice(&footer.encode().unwrap());
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+
+        let name = "bucket_1_payload_schema_hash_mismatch.driftu";
+        op.write(name, bytes).await.unwrap();
+
+        let reader = UnifiedReader::open(op.clone(), name).await.unwrap();
+        match reader.read_payload_schema().await {
+            Ok(_) => panic!("expected payload schema hash mismatch during schema read"),
+            Err(err) => assert!(err.to_string().contains("payload schema hash mismatch")),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unified_reader_rejects_payload_stats_flag_without_stats_block() {
+        let ids = vec![1, 2];
+        let flat = vec![0.1, 0.2, 0.3, 0.4];
+        let mut bytes =
+            UnifiedRemoteWriter::write_vector_only_flat_to_bytes(&ids, &flat, 2).unwrap();
+
+        let mut header = UnifiedHeader::decode(&bytes[..UNIFIED_HEADER_SIZE]).unwrap();
+        header.flags |= crate::unified_format::UNIFIED_FLAG_HAS_PAYLOAD_STATS;
+        bytes[..UNIFIED_HEADER_SIZE].copy_from_slice(&header.encode().unwrap());
+
+        let footer_start = header.footer_offset as usize;
+        let footer_end = footer_start + UNIFIED_FOOTER_SIZE;
+        let mut footer = UnifiedFooter::decode(&bytes[footer_start..footer_end]).unwrap();
+        footer.flags = header.flags;
+        bytes[footer_start..footer_end].copy_from_slice(&footer.encode().unwrap());
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let name = "bucket_1_payload_stats_flag_mismatch.driftu";
+        op.write(name, bytes).await.unwrap();
+
+        match UnifiedReader::open(op.clone(), name).await {
+            Ok(_) => panic!("expected payload stats flag mismatch to fail open"),
+            Err(err) => assert!(err.to_string().contains("payload stats flag mismatch")),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unified_reader_payload_stats_roundtrip() {
+        let ids = vec![101, 102, 103];
+        let flat = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let schema = UnifiedPayloadSchema::new(vec![
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 1,
+                name: "tenant".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+                nullable: true,
+                indexed: true,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 2,
+                name: "score".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Int64,
+                nullable: false,
+                indexed: false,
+            },
+            crate::unified_format::UnifiedFieldSchema {
+                field_id: 3,
+                name: "active".to_string(),
+                logical_type: crate::unified_format::UnifiedLogicalType::Bool,
+                nullable: true,
+                indexed: false,
+            },
+        ]);
+
+        let rows: Vec<crate::unified_format::UnifiedPayloadRow> = vec![
+            BTreeMap::from([
+                (
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("globex".to_string()),
+                ),
+                (2, crate::unified_format::UnifiedPayloadValue::Int64(10)),
+                (3, crate::unified_format::UnifiedPayloadValue::Bool(true)),
+            ]),
+            BTreeMap::from([
+                (
+                    1,
+                    crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+                ),
+                (2, crate::unified_format::UnifiedPayloadValue::Int64(5)),
+                (3, crate::unified_format::UnifiedPayloadValue::Null),
+            ]),
+            BTreeMap::from([
+                (1, crate::unified_format::UnifiedPayloadValue::Null),
+                (2, crate::unified_format::UnifiedPayloadValue::Int64(5)),
+                (3, crate::unified_format::UnifiedPayloadValue::Bool(false)),
+            ]),
+        ];
+
+        let bytes = UnifiedRemoteWriter::write_vector_with_payload_flat_to_bytes(
+            &ids,
+            &flat,
+            2,
+            Some(&schema),
+            Some(&rows),
+        )
+        .unwrap();
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+
+        let name = "bucket_payload_stats.driftu";
+        op.write(name, bytes).await.unwrap();
+
+        let reader = UnifiedReader::open(op.clone(), name).await.unwrap();
+        let stats = reader.read_payload_stats().await.unwrap();
+        assert_eq!(stats.len(), 1);
+        let chunk = &stats[0];
+        assert_eq!(chunk.row_start, 0);
+        assert_eq!(chunk.row_count, 3);
+
+        let tenant = chunk.fields.iter().find(|s| s.field_id == 1).unwrap();
+        assert_eq!(tenant.null_count, 1);
+        assert_eq!(tenant.cardinality_hint, 2);
+        assert_eq!(
+            tenant.min,
+            Some(crate::unified_format::UnifiedPayloadValue::Keyword(
+                "acme".to_string()
+            ))
+        );
+        assert_eq!(
+            tenant.max,
+            Some(crate::unified_format::UnifiedPayloadValue::Keyword(
+                "globex".to_string()
+            ))
+        );
+
+        let score = chunk.fields.iter().find(|s| s.field_id == 2).unwrap();
+        assert_eq!(score.null_count, 0);
+        assert_eq!(score.cardinality_hint, 2);
+        assert_eq!(
+            score.min,
+            Some(crate::unified_format::UnifiedPayloadValue::Int64(5))
+        );
+        assert_eq!(
+            score.max,
+            Some(crate::unified_format::UnifiedPayloadValue::Int64(10))
+        );
+
+        let active = chunk.fields.iter().find(|s| s.field_id == 3).unwrap();
+        assert_eq!(active.null_count, 1);
+        assert_eq!(active.cardinality_hint, 2);
+        assert_eq!(
+            active.min,
+            Some(crate::unified_format::UnifiedPayloadValue::Bool(false))
+        );
+        assert_eq!(
+            active.max,
+            Some(crate::unified_format::UnifiedPayloadValue::Bool(true))
+        );
+    }
+
+    #[tokio::test]
     async fn test_unified_reader_payload_rows_and_exact_index_roundtrip() {
         let ids = vec![101, 102, 103];
         let flat = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
@@ -1275,6 +1851,13 @@ mod tests {
         op.write(name, bytes).await.unwrap();
 
         let reader = UnifiedReader::open(op.clone(), name).await.unwrap();
+        for block in reader
+            .blocks
+            .iter()
+            .filter(|b| b.block_type == UnifiedBlockType::PayloadExactIndex)
+        {
+            assert_eq!(block.codec, UnifiedCodec::DictPostingsBitpack);
+        }
         let decoded_rows = reader.read_payload_rows().await.unwrap();
         assert_eq!(decoded_rows, rows);
 
@@ -1292,6 +1875,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(active_true, vec![101, 103]);
+    }
+
+    #[tokio::test]
+    async fn test_unified_reader_rejects_legacy_exact_index_codec() {
+        let ids = vec![1, 2];
+        let flat = vec![0.1, 0.2, 0.3, 0.4];
+        let schema = UnifiedPayloadSchema::new(vec![crate::unified_format::UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: crate::unified_format::UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+        let rows: Vec<crate::unified_format::UnifiedPayloadRow> = vec![
+            BTreeMap::from([(
+                1,
+                crate::unified_format::UnifiedPayloadValue::Keyword("acme".to_string()),
+            )]),
+            BTreeMap::from([(
+                1,
+                crate::unified_format::UnifiedPayloadValue::Keyword("globex".to_string()),
+            )]),
+        ];
+
+        let mut bytes = UnifiedRemoteWriter::write_vector_with_payload_flat_to_bytes(
+            &ids,
+            &flat,
+            2,
+            Some(&schema),
+            Some(&rows),
+        )
+        .unwrap();
+
+        let header = UnifiedHeader::decode(&bytes[..UNIFIED_HEADER_SIZE]).unwrap();
+        let dir_len =
+            4usize + header.block_count as usize * crate::unified_format::UNIFIED_BLOCK_DESC_SIZE;
+        let dir_start = header.block_dir_offset as usize;
+        let dir_end = dir_start + dir_len;
+        let mut blocks =
+            crate::unified_format::decode_block_directory(&bytes[dir_start..dir_end]).unwrap();
+        let exact = blocks
+            .iter_mut()
+            .find(|b| b.block_type == UnifiedBlockType::PayloadExactIndex)
+            .unwrap();
+        exact.codec = UnifiedCodec::DictPostings;
+        let dir_bytes = crate::unified_format::encode_block_directory(&blocks).unwrap();
+        bytes[dir_start..dir_end].copy_from_slice(&dir_bytes);
+
+        let footer_start = header.footer_offset as usize;
+        let footer_end = footer_start + UNIFIED_FOOTER_SIZE;
+        let mut footer = UnifiedFooter::decode(&bytes[footer_start..footer_end]).unwrap();
+        footer.directory_crc32 = checksum32(&dir_bytes);
+        bytes[footer_start..footer_end].copy_from_slice(&footer.encode().unwrap());
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let name = "bucket_legacy_exact_codec.driftu";
+        op.write(name, bytes).await.unwrap();
+
+        let reader = UnifiedReader::open(op.clone(), name).await.unwrap();
+        let err = reader.read_exact_index(1).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported exact index codec; rewrite run with current writer")
+        );
+    }
+
+    #[test]
+    fn test_malformed_payload_decoder_rejects_invalid_bit_width() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0i64.to_le_bytes());
+        data.push(65);
+        let err = decode_for_bitpacked_i64(&data, 1).unwrap_err();
+        assert!(err.to_string().contains("bit width exceeds 64"));
+    }
+
+    #[test]
+    fn test_malformed_payload_decoder_rejects_truncated_bitpack_header() {
+        let err = decode_for_bitpacked_i64(&[0u8; 8], 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("bitpacked payload header truncated")
+        );
+    }
+
+    #[test]
+    fn test_malformed_payload_decoder_rejects_out_of_range_dictionary_id() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // dict_len
+        data.extend_from_slice(&1u32.to_le_bytes()); // entry len
+        data.push(b'a');
+        data.push(1u8); // bit width
+        data.push(1u8); // packed id=1 (out of bounds for dict_len=1)
+        let err = decode_dictionary_bitpacked_values(&data, 1).unwrap_err();
+        assert!(err.to_string().contains("dictionary id out of bounds"));
+    }
+
+    #[test]
+    fn test_malformed_payload_decoder_rejects_varlen_trailing_bytes() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // value len
+        data.push(b'a');
+        data.push(0xff); // trailing byte
+        let err = decode_varlen_values(&data, 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("varlen payload has trailing bytes")
+        );
     }
 
     #[tokio::test]

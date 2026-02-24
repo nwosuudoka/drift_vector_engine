@@ -2,6 +2,7 @@ use crate::kmeans::KMeansAlgorithm;
 use crate::math::Metric;
 use crate::memtable::{MemTable, MemTableOptions};
 use crate::partitioner::{IncrementalPartitioner, PartitionGroup, PartitionResult};
+use crate::payload::{PayloadRow, PayloadSchema};
 use crate::router::Router;
 use crate::wal::WalManager;
 use drift_kv::bitstore::BitStore;
@@ -115,6 +116,16 @@ impl VectorIndex {
     }
 
     pub fn insert(&self, id: u64, vector: &[f32]) -> io::Result<bool> {
+        self.insert_with_payload(id, vector, None, None)
+    }
+
+    pub fn insert_with_payload(
+        &self,
+        id: u64,
+        vector: &[f32],
+        payload_schema: Option<&PayloadSchema>,
+        payload_row: Option<&PayloadRow>,
+    ) -> io::Result<bool> {
         // 1. WAL (Durability First)
         // If this fails, we return Error and state is unchanged.
         {
@@ -143,7 +154,8 @@ impl VectorIndex {
 
         // 3. MemTable (Visibility)
         let active_ptr = { self.active.read().clone() };
-        let needs_rotate = active_ptr.insert(id, vector);
+        let needs_rotate =
+            active_ptr.insert_with_payload(id, vector, payload_schema, payload_row)?;
 
         // Resurrection: Unmark L0 tombstone if present
         self.unmark_l0_delete(id);
@@ -193,6 +205,15 @@ impl VectorIndex {
     }
 
     pub fn insert_batch(&self, batch: &[(u64, Vec<f32>)]) -> io::Result<bool> {
+        self.insert_batch_with_payload(batch, None, None)
+    }
+
+    pub fn insert_batch_with_payload(
+        &self,
+        batch: &[(u64, Vec<f32>)],
+        payload_schema: Option<&PayloadSchema>,
+        payload_rows: Option<&[PayloadRow]>,
+    ) -> io::Result<bool> {
         if batch.is_empty() {
             return Ok(false);
         }
@@ -223,7 +244,8 @@ impl VectorIndex {
         self.unmark_l0_delete_batch(&ids);
 
         let active_ptr = { self.active.read().clone() };
-        let needs_rotate = active_ptr.insert_batch(batch);
+        let needs_rotate =
+            active_ptr.insert_batch_with_payload(batch, payload_schema, payload_rows)?;
 
         if needs_rotate {
             return self.rotate_active();
@@ -373,19 +395,54 @@ impl VectorIndex {
 
         for ft in tables_to_flush {
             wal_ids.push(ft.wal_id);
-            let (ids, flat_vecs) = ft.table.snapshot();
-            let part = IncrementalPartitioner::partition(&ids, &flat_vecs, self.dim, &router_guard);
+            let (ids, flat_vecs, payload_schema, payload_rows) = ft.table.snapshot_with_payload();
+            let part = IncrementalPartitioner::partition_with_payload(
+                &ids,
+                &flat_vecs,
+                self.dim,
+                &router_guard,
+                payload_schema.as_ref(),
+                payload_rows.as_deref(),
+            )
+            .expect("frozen payload partitioning invariants should hold");
 
             for (bucket_id, group) in part {
-                let entry = global_partition
-                    .entry(bucket_id)
-                    .or_insert_with(|| PartitionGroup::new(self.dim, group.centroid.clone()));
+                let PartitionGroup {
+                    ids,
+                    flat_vectors,
+                    count,
+                    centroid,
+                    payload_schema,
+                    payload_rows,
+                } = group;
+                let entry = global_partition.entry(bucket_id).or_insert_with(|| {
+                    PartitionGroup::new_with_payload(
+                        self.dim,
+                        centroid.clone(),
+                        payload_schema.clone(),
+                    )
+                });
                 if entry.centroid.is_none() {
-                    entry.centroid = group.centroid;
+                    entry.centroid = centroid;
                 }
-                entry.ids.extend(group.ids);
-                entry.flat_vectors.extend(group.flat_vectors);
-                entry.count += group.count;
+                if entry.payload_schema.is_none() {
+                    entry.payload_schema = payload_schema.clone();
+                } else if payload_schema.is_some() && entry.payload_schema != payload_schema {
+                    panic!("payload schema mismatch while merging frozen partition groups");
+                }
+                entry.ids.extend(ids);
+                entry.flat_vectors.extend(flat_vectors);
+                entry.count += count;
+                match (&mut entry.payload_rows, payload_rows) {
+                    (Some(existing), Some(mut incoming)) => existing.append(&mut incoming),
+                    (None, Some(incoming)) => entry.payload_rows = Some(incoming),
+                    (Some(_), None) => {
+                        panic!(
+                            "payload row presence mismatch while merging frozen partition groups"
+                        )
+                    }
+                    (None, None) => {}
+                }
             }
         }
         Some((global_partition, wal_ids))

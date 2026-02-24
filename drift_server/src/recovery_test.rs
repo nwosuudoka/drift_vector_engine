@@ -9,6 +9,10 @@ mod tests {
     use drift_core::wal::WalWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
     use drift_storage::disk_manager::DiskManager;
+    use drift_storage::unified_format::{
+        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadSchema, UnifiedPayloadValue,
+    };
+    use drift_storage::unified_writer::UnifiedRemoteWriter;
     use opendal::Operator;
     use opendal::services::{Fs, Memory};
     use std::sync::{Arc, OnceLock};
@@ -735,6 +739,74 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_recover_detects_payload_index_manifest_mismatch() {
+        RecoveryManager::reset_fingerprint_guard_metrics_for_tests();
+        let before = RecoveryManager::global_fingerprint_guard_metrics();
+
+        let dir = tempdir().unwrap();
+        let op = create_memory_operator();
+        let path = "custom/provider/object-30.driftu";
+        let ids = vec![1u64, 2u64];
+        let flat = vec![0.1f32, 0.2, 0.3, 0.4];
+        let schema = UnifiedPayloadSchema::new(vec![UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+        let rows = vec![
+            std::collections::BTreeMap::from([(1, UnifiedPayloadValue::Keyword("a".to_string()))]),
+            std::collections::BTreeMap::from([(1, UnifiedPayloadValue::Keyword("b".to_string()))]),
+        ];
+        let bytes = UnifiedRemoteWriter::write_vector_with_payload_flat_to_bytes(
+            &ids,
+            &flat,
+            2,
+            Some(&schema),
+            Some(&rows),
+        )
+        .unwrap();
+        op.write(path, bytes).await.unwrap();
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), 2).unwrap());
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(30, "run_remote".into(), Some(vec![0.0; 2]));
+                // Intentionally leave payload/index metadata at defaults.
+                m.update_bucket_remote_meta(30, "run_remote".into(), path.into(), String::new());
+            })
+            .unwrap();
+
+        let mgr = RecoveryManager::new_with_fingerprint_guard(
+            dir.path(),
+            manifest,
+            RecoveryFingerprintGuardConfig {
+                policy: FingerprintMismatchPolicy::InvalidateAndContinue,
+                max_mismatches: None,
+            },
+        );
+        let bucket_mgr = create_memory_manager(op.clone());
+        let wal_dir = dir.path().join("wal");
+        mgr.recover(&bucket_mgr, 2, &wal_dir).await.unwrap();
+
+        let after = RecoveryManager::global_fingerprint_guard_metrics();
+        assert!(
+            after
+                .payload_index_mismatches_detected
+                .saturating_sub(before.payload_index_mismatches_detected)
+                >= 1,
+            "recovery should surface payload/index metadata mismatch diagnostics"
+        );
+        assert_eq!(
+            after
+                .payload_index_validation_errors
+                .saturating_sub(before.payload_index_validation_errors),
+            0
+        );
     }
 
     #[tokio::test]

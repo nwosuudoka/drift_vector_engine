@@ -44,6 +44,8 @@ message RecoveryGuardMetrics {
   uint64 mismatches_detected = 1;
   uint64 invalidations_performed = 2;
   uint64 fail_fast_aborts = 3;
+  uint64 payload_index_mismatches_detected = 4;
+  uint64 payload_index_validation_errors = 5;
 }
 
 message HealthResponse {

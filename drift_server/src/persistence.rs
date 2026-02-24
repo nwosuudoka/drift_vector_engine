@@ -1,6 +1,10 @@
+use drift_core::manifest::BucketPayloadIndexMeta;
 use drift_core::tombstone::TombstoneFile;
 use drift_storage::disk_manager::DiskManager;
-use drift_storage::unified_format::{UnifiedPayloadRow, UnifiedPayloadSchema};
+use drift_storage::unified_format::{
+    UNIFIED_FLAG_HAS_EXACT_INDEX, UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS, UNIFIED_FLAG_HAS_PAYLOAD_STATS,
+    UNIFIED_HEADER_SIZE, UnifiedBlockType, UnifiedHeader, UnifiedPayloadRow, UnifiedPayloadSchema,
+};
 use drift_storage::unified_reader::UnifiedReader;
 use drift_storage::unified_writer::UnifiedRemoteWriter;
 use opendal::{Metadata, Operator};
@@ -10,6 +14,14 @@ use tracing::{info, warn};
 #[derive(Clone)]
 pub struct PersistenceManager {
     op: Operator,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteUnifiedWriteResult {
+    pub run_id: String,
+    pub object_path: String,
+    pub row_count: u64,
+    pub payload_index_meta: BucketPayloadIndexMeta,
 }
 
 impl PersistenceManager {
@@ -91,6 +103,26 @@ impl PersistenceManager {
         reader.read_payload_rows().await
     }
 
+    pub async fn read_remote_bucket_payload_rows_path_optional(
+        &self,
+        path: &str,
+    ) -> io::Result<Option<Vec<UnifiedPayloadRow>>> {
+        if !self.op.exists(path).await.map_err(io::Error::other)? {
+            return Ok(None);
+        }
+
+        info!("Persistence: Reading payload rows (optional) from {}", path);
+        let reader = UnifiedReader::open(self.op.clone(), path).await?;
+        let has_payload_columns = reader
+            .blocks
+            .iter()
+            .any(|b| b.block_type == UnifiedBlockType::PayloadColumn);
+        if !has_payload_columns {
+            return Ok(None);
+        }
+        Ok(Some(reader.read_payload_rows().await?))
+    }
+
     /// READ: Fetches raw vectors from an existing S3 segment.
     pub async fn read_remote_bucket(
         &self,
@@ -126,6 +158,16 @@ impl PersistenceManager {
     ) -> io::Result<Vec<UnifiedPayloadRow>> {
         let key = self.remote_bucket_path(bucket_id, run_id);
         self.read_remote_bucket_payload_rows_path(&key).await
+    }
+
+    pub async fn read_remote_bucket_payload_rows_optional(
+        &self,
+        bucket_id: u32,
+        run_id: &str,
+    ) -> io::Result<Option<Vec<UnifiedPayloadRow>>> {
+        let key = self.remote_bucket_path(bucket_id, run_id);
+        self.read_remote_bucket_payload_rows_path_optional(&key)
+            .await
     }
 
     /// WRITE: Persists vectors to a new unified immutable segment (`.driftu`).
@@ -211,8 +253,35 @@ impl PersistenceManager {
         payload_schema: Option<&UnifiedPayloadSchema>,
         payload_rows: Option<&[UnifiedPayloadRow]>,
     ) -> io::Result<(String, u64)> {
+        let result = self
+            .write_remote_bucket_unified_flat_with_payload_result(
+                bucket_id,
+                ids,
+                flat_vectors,
+                dim,
+                payload_schema,
+                payload_rows,
+            )
+            .await?;
+        Ok((result.run_id, result.row_count))
+    }
+
+    pub async fn write_remote_bucket_unified_flat_with_payload_result(
+        &self,
+        bucket_id: u32,
+        ids: &[u64],
+        flat_vectors: &[f32],
+        dim: usize,
+        payload_schema: Option<&UnifiedPayloadSchema>,
+        payload_rows: Option<&[UnifiedPayloadRow]>,
+    ) -> io::Result<RemoteUnifiedWriteResult> {
         if ids.is_empty() {
-            return Ok((String::new(), 0));
+            return Ok(RemoteUnifiedWriteResult {
+                run_id: String::new(),
+                object_path: String::new(),
+                row_count: 0,
+                payload_index_meta: BucketPayloadIndexMeta::default(),
+            });
         }
 
         let new_run_id = uuid::Uuid::new_v4().to_string();
@@ -224,6 +293,7 @@ impl PersistenceManager {
             payload_schema,
             payload_rows,
         )?;
+        let payload_index_meta = Self::payload_index_meta_from_bytes(&bytes)?;
 
         self.op
             .write(&new_key, bytes)
@@ -235,11 +305,16 @@ impl PersistenceManager {
             bucket_id,
             new_key,
             ids.len(),
-            payload_schema.is_some(),
+            payload_index_meta.has_payload_columns,
             payload_rows.is_some()
         );
 
-        Ok((new_run_id, ids.len() as u64))
+        Ok(RemoteUnifiedWriteResult {
+            run_id: new_run_id,
+            object_path: new_key,
+            row_count: ids.len() as u64,
+            payload_index_meta,
+        })
     }
 
     pub async fn delete_file(&self, path: &str) -> std::io::Result<()> {
@@ -304,5 +379,22 @@ impl PersistenceManager {
             }
         }
         Ok(all_deleted)
+    }
+
+    fn payload_index_meta_from_bytes(bytes: &[u8]) -> io::Result<BucketPayloadIndexMeta> {
+        if bytes.len() < UNIFIED_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unified object too small to decode header",
+            ));
+        }
+
+        let header = UnifiedHeader::decode(&bytes[..UNIFIED_HEADER_SIZE])?;
+        Ok(BucketPayloadIndexMeta {
+            has_payload_columns: (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS) != 0,
+            has_exact_index: (header.flags & UNIFIED_FLAG_HAS_EXACT_INDEX) != 0,
+            has_payload_stats: (header.flags & UNIFIED_FLAG_HAS_PAYLOAD_STATS) != 0,
+            payload_schema_hash: header.payload_schema_hash,
+        })
     }
 }

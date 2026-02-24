@@ -4,11 +4,12 @@ mod tests {
     use drift_core::lock_manager::BucketCoordinator; // ⚡ Import Coordinator
     use drift_core::partitioner::PartitionGroup;
     use drift_storage::unified_format::{
-        UnifiedBlockType, UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadSchema,
+        UnifiedBlockType, UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadRow,
+        UnifiedPayloadSchema, UnifiedPayloadValue,
     };
     use drift_storage::unified_reader::UnifiedReader;
     use opendal::{Operator, services};
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -33,6 +34,8 @@ mod tests {
             flat_vectors,
             count,
             centroid,
+            payload_schema: None,
+            payload_rows: None,
         }
     }
 
@@ -60,6 +63,16 @@ mod tests {
             .finish();
         let reader = UnifiedReader::open(op, &filename).await.unwrap();
         reader.read_payload_schema().await.unwrap()
+    }
+
+    async fn read_payload_rows(path: &std::path::Path) -> Vec<UnifiedPayloadRow> {
+        let root = path.parent().unwrap().to_str().unwrap().to_string();
+        let filename = path.file_name().unwrap().to_str().unwrap().to_string();
+        let op = Operator::new(services::Fs::default().root(&root))
+            .unwrap()
+            .finish();
+        let reader = UnifiedReader::open(op, &filename).await.unwrap();
+        reader.read_payload_rows().await.unwrap()
     }
 
     // --- TESTS ---
@@ -115,6 +128,52 @@ mod tests {
         let file_path = dir.path().join(format!("bucket_{}.driftu", bucket_id));
         let decoded_schema = read_payload_schema(&file_path).await;
         assert_eq!(decoded_schema, Some(schema));
+    }
+
+    #[tokio::test]
+    async fn test_staging_append_with_payload_preserves_rows() {
+        let dir = tempdir().unwrap();
+        let manager = LocalStagingManager::new(dir.path()).unwrap();
+        let bucket_id = 3;
+        let dim = 2;
+        let schema = UnifiedPayloadSchema::new(vec![UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+
+        let batch1 = create_batch(200, 2, dim, None);
+        let rows1: Vec<UnifiedPayloadRow> = vec![
+            BTreeMap::from([(1, UnifiedPayloadValue::Keyword("acme".to_string()))]),
+            BTreeMap::from([(1, UnifiedPayloadValue::Keyword("globex".to_string()))]),
+        ];
+        let size1 = manager
+            .append_batch_with_payload(bucket_id, &batch1, Some(&schema), Some(&rows1))
+            .await
+            .unwrap();
+        assert_eq!(size1, 2);
+
+        let batch2 = create_batch(202, 1, dim, None);
+        let rows2: Vec<UnifiedPayloadRow> = vec![BTreeMap::from([(
+            1,
+            UnifiedPayloadValue::Keyword("initech".to_string()),
+        )])];
+        let size2 = manager
+            .append_batch_with_payload(bucket_id, &batch2, Some(&schema), Some(&rows2))
+            .await
+            .unwrap();
+        assert_eq!(size2, 3);
+
+        let file_path = dir.path().join(format!("bucket_{}.driftu", bucket_id));
+        let decoded_schema = read_payload_schema(&file_path).await;
+        assert_eq!(decoded_schema, Some(schema));
+
+        let mut expected = rows1;
+        expected.extend(rows2);
+        let decoded_rows = read_payload_rows(&file_path).await;
+        assert_eq!(decoded_rows, expected);
     }
 
     #[tokio::test]
@@ -186,6 +245,8 @@ mod race_cond_tests {
             flat_vectors: vecs,
             count,
             centroid: None,
+            payload_schema: None,
+            payload_rows: None,
         }
     }
 

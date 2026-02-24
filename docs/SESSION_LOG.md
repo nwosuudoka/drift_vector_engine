@@ -1,0 +1,172 @@
+# Session Log
+
+## 2026-02-24 (continued)
+- Goal:
+  - Execute `docs/NEXT.md` item 11 (ingest/partition payload-row carrier).
+- Work completed:
+  - Added `drift_core` payload data model (`PayloadSchema`, `PayloadRow`, `PayloadValue`) in `drift_core/src/payload.rs`.
+  - Extended partitioning contract to carry optional payload schema/rows per partition group.
+  - Extended memtable with payload-aware insert APIs and payload snapshot support.
+  - Extended vector index with payload-aware insert APIs:
+    - `insert_with_payload(...)`
+    - `insert_batch_with_payload(...)`
+  - Updated frozen flush partitioning to preserve payload schema/rows into partition groups.
+  - Updated janitor flush path to stage payload rows/schema by converting core payload types to unified payload types.
+  - Updated server insert/train surfaces to call payload-aware index APIs (currently with `None` payload until protobuf payload fields are added).
+  - Added/updated tests:
+    - `partitioner_tests::test_partitioning_carries_payload_rows`
+    - `index_tests::test_flush_frozen_preserves_payload_rows`
+    - `janitor_tests::test_janitor_flush_preserves_payload_rows_from_ingest`
+- Files changed:
+  - `drift_core/src/payload.rs`
+  - `drift_core/src/lib.rs`
+  - `drift_core/src/memtable.rs`
+  - `drift_core/src/index.rs`
+  - `drift_core/src/partitioner.rs`
+  - `drift_core/src/partitioner_tests.rs`
+  - `drift_core/src/index_tests.rs`
+  - `drift_server/src/janitor.rs`
+  - `drift_server/src/server.rs`
+  - `drift_server/src/janitor_tests.rs`
+  - `drift_server/src/local_staging_test.rs`
+  - `drift_server/src/server_integration_tests.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+  - `TODO.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_core partitioner_tests::tests::test_partitioning_carries_payload_rows`
+  - `cargo test -p drift_core index_tests::tests::test_flush_frozen_preserves_payload_rows`
+  - `cargo test -p drift_server janitor_tests::tests::test_janitor_flush_preserves_payload_rows_from_ingest`
+  - `cargo test -p drift_core`
+  - `cargo test -p drift_server`
+  - `cargo test --workspace`
+- Open issues:
+  - Split/merge/scatter rewrite flows are not yet payload-preserving.
+  - Public protobuf insert API does not yet carry payload rows.
+- Next steps:
+  - Execute `docs/NEXT.md` item 13 (payload preservation in split/merge/scatter rewrites).
+  - Execute `docs/NEXT.md` item 14 (protobuf payload/filter surface).
+
+## 2026-02-24
+- Goal:
+  - Execute next phase after payload-preserving promotion: persist payload/index metadata in manifest and validate at recovery.
+- Work completed:
+  - Completed payload-preserving promotion wiring from prior phase and verified end-to-end.
+  - Added manifest bucket metadata contract fields:
+    - `has_payload_columns`
+    - `has_exact_index`
+    - `has_payload_stats`
+    - `payload_schema_hash`
+  - Added `BucketPayloadIndexMeta` in core manifest wrapper and new mutation helpers for remote meta updates.
+  - Extended persistence write path with `RemoteUnifiedWriteResult` so payload/index metadata is derived from unified header bytes at write time.
+  - Updated janitor promotion to persist payload/index metadata atomically with run/path/fingerprint updates.
+  - Added recovery-time payload/index metadata validation (manifest vs remote unified header) with non-fatal diagnostics counters.
+  - Exposed new recovery diagnostics in API health + Prometheus metrics:
+    - `payload_index_mismatches_detected`
+    - `payload_index_validation_errors`
+  - Added tests for:
+    - persistence write-result metadata correctness
+    - recovery mismatch detection
+    - metric rendering coverage for new counters
+- Files changed:
+  - `drift_core/proto/manifest.proto`
+  - `drift_core/src/manifest.rs`
+  - `drift_core/src/manifest_tests.rs`
+  - `drift_server/proto/drift.proto`
+  - `drift_server/src/persistence.rs`
+  - `drift_server/src/janitor.rs`
+  - `drift_server/src/recovery.rs`
+  - `drift_server/src/server.rs`
+  - `drift_server/src/metrics.rs`
+  - `drift_server/src/persistence_tests.rs`
+  - `drift_server/src/recovery_test.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_core manifest_tests::tests::test_remote_meta_update`
+  - `cargo test -p drift_server persistence_integration_tests::test_persistence_write_result_exposes_payload_index_meta`
+  - `cargo test -p drift_server recovery_test::tests::test_recover_detects_payload_index_manifest_mismatch`
+  - `cargo test -p drift_server metrics::tests::test_render_prometheus_metrics_contains_expected_counters`
+  - `cargo test -p drift_server`
+  - `cargo test --workspace`
+- Open issues:
+  - Ingest/partition does not yet carry payload rows into staging batches.
+  - Split/merge/scatter rewrite paths still need explicit payload-row preservation.
+  - API surface for payload insert + filter search is not yet implemented.
+- Next steps:
+  - Execute `docs/NEXT.md` item 11 (ingest/partition payload-row carrier).
+  - Execute `docs/NEXT.md` item 13 (split/merge/scatter payload preservation).
+  - Execute `docs/NEXT.md` item 14 (protobuf API payload/filter extensions).
+
+## 2026-02-23
+- Added persistent context system for this repo:
+  - `AGENTS.md`
+  - `docs/CONTEXT.md`
+  - `docs/PLAN.md`
+  - `docs/NEXT.md`
+  - `docs/DECISIONS.md`
+  - `docs/SESSION_LOG.md`
+- Captured current implementation focus and status:
+  - Branch `sidecar_payload_addition`
+  - Unified payload codec and append/index workstream
+- Validation observed this session:
+  - `cargo test -p drift_storage` passed (80 tests, 0 failures)
+  - Targeted tests for payload append and codec matrix passed
+- Unified spec alignment completed:
+  - Rewrote `FORMAT.md` to make unified `.driftu` the canonical storage model.
+  - Rewrote `PAYLOAD_INDEX_V1_SPEC.md` to remove sidecar assumptions and align payload/index semantics to unified blocks.
+  - Updated `docs/NEXT.md` priorities around encoding follow-up work (header/schema hash, row-group stats, postings wire compression).
+- Execution planning updated:
+  - Reworked `TODO.md` into phased execution (Phase A-E) across storage, data-path wiring, manifest/recovery, API, and planner integration.
+  - Synced `docs/PLAN.md` and `docs/NEXT.md` to match the new phased plan and immediate implementation queue.
+- Phase A implementation progress:
+  - Added `metric` and `payload_schema_hash` fields to unified header/footer wire contract.
+  - Added schema hashing helper in `unified_format`.
+  - Wired writer and append paths to persist/maintain schema hash and metric metadata.
+  - Wired reader open-time validation for header/footer metric + schema-hash consistency.
+  - Added reader tests for metric mismatch and schema-hash mismatch validation paths.
+- Validation observed:
+  - `cargo test -p drift_storage` passed (83 tests, 0 failures).
+  - `cargo test --workspace` passed.
+- Phase A implementation progress:
+  - Added unified payload row-group stats block (`PayloadStats`) with per-field `null_count`, `min`, `max`, and `cardinality_hint`.
+  - Added payload-stats flag wiring in header/footer parity checks for writer, append, and reader open validation.
+  - Added `read_payload_stats()` API with strict schema/type/range validation.
+  - Established rewrite-first policy for incompatible exact-index codec transitions.
+- Validation observed:
+  - `cargo test -p drift_storage payload_stats` passed.
+  - `cargo test -p drift_storage` passed (85 tests, 0 failures).
+  - `cargo test --workspace` passed.
+- Phase A implementation progress:
+  - Switched exact-index writer payload to delta+bitpack postings (`DictPostingsBitpack`).
+  - Added shared bitpacked exact-index encode/decode helpers in `unified_format`.
+  - Removed legacy exact-index `DictPostings` reader compatibility; reader now fails fast with rewrite-required error.
+  - Added exact-index bitpack roundtrip/trailing-byte tests and codec assertions in end-to-end payload index tests.
+- Validation observed:
+  - `cargo test -p drift_storage exact_index` passed.
+  - `cargo test -p drift_storage` passed (87 tests, 0 failures).
+  - `cargo test --workspace` passed.
+- Phase A implementation progress:
+  - Added malformed payload decoder tests for invalid bit width, truncated bitpack headers, out-of-range dictionary IDs, and varlen trailing bytes.
+  - Added exact-index bitpacked malformed tests for invalid bit width and truncated postings payload.
+  - Added append edge-case tests for null-heavy payload rows, mixed dictionary cardinality growth across chunks, schema optionality acceptance, and non-nullable field rejection.
+  - Added benchmark harness `benchmark_payload_heavy_compression_and_read_latency` (ignored by default) to capture payload-heavy compression and read-latency metrics.
+- Benchmark capture:
+  - Command: `cargo test -p drift_storage benchmark_payload_heavy_compression_and_read_latency -- --ignored --nocapture`
+  - Result: `rows=8000 dim=24 file_bytes=412015 raw_estimate_bytes=2035583 compression_ratio=0.2024 write_ms=147.59 read_vectors_ms=7.73 read_payload_ms=20.37`
+- Validation observed:
+  - `cargo test -p drift_storage malformed_payload` passed.
+  - `cargo test -p drift_storage unified_local_append` passed.
+  - `cargo test -p drift_storage` passed (98 passed, 1 ignored benchmark).
+  - `cargo test --workspace` passed.
+
+## Template For Future Entries
+- Date:
+- Goal:
+- Work completed:
+- Files changed:
+- Commands/tests run:
+- Open issues:
+- Next steps:
