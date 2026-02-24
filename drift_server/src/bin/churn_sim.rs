@@ -195,6 +195,8 @@ async fn measure_recall<R: Rng>(
                 target_confidence: args.target_confidence,
                 lambda: args.lambda,
                 tau: args.tau,
+                filters: vec![],
+                payload_projection_fields: vec![],
             }))
             .await?
             .into_inner();
@@ -404,6 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drift_server::drift_proto::InsertBatchRequest {
                     collection_name: collection.to_string(),
                     vectors: batch,
+                    payload_rows: vec![],
                 },
             ))
             .await?;
@@ -515,6 +518,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drift_server::drift_proto::InsertBatchRequest {
                     collection_name: collection.to_string(),
                     vectors: batch,
+                    payload_rows: vec![],
                 },
             ))
             .await?;

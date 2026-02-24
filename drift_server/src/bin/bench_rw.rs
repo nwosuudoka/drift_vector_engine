@@ -159,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .insert_batch(Request::new(InsertBatchRequest {
                 collection_name: collection.to_string(),
                 vectors: batch_vecs,
+                payload_rows: vec![],
             }))
             .await?;
         batch_latencies.push(batch_start.elapsed());
@@ -211,6 +212,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target_confidence: args.target_confidence,
                 lambda: args.lambda,
                 tau: args.tau,
+                filters: vec![],
+                payload_projection_fields: vec![],
             }))
             .await?;
     }
@@ -228,6 +231,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target_confidence: args.target_confidence,
                 lambda: args.lambda,
                 tau: args.tau,
+                filters: vec![],
+                payload_projection_fields: vec![],
             }))
             .await?;
         read_latencies.push(q_start.elapsed());

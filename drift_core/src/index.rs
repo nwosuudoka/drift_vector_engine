@@ -380,6 +380,40 @@ impl VectorIndex {
         self.router.read().metric()
     }
 
+    pub fn lookup_l0_payload_rows(&self, ids: &[u64]) -> HashMap<u64, PayloadRow> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let wanted: HashSet<u64> = ids.iter().copied().collect();
+        let mut rows_by_id: HashMap<u64, PayloadRow> = HashMap::new();
+
+        // Apply older frozen rows first, then let active rows override.
+        let frozen_tables = self.frozen.read().clone();
+        for frozen in frozen_tables {
+            let (table_ids, payload_rows) = frozen.table.snapshot_payload_rows();
+            if let Some(rows) = payload_rows {
+                for (id, row) in table_ids.into_iter().zip(rows.into_iter()) {
+                    if wanted.contains(&id) {
+                        rows_by_id.entry(id).or_insert(row);
+                    }
+                }
+            }
+        }
+
+        let active_table = self.active.read().clone();
+        let (active_ids, active_rows) = active_table.snapshot_payload_rows();
+        if let Some(rows) = active_rows {
+            for (id, row) in active_ids.into_iter().zip(rows.into_iter()) {
+                if wanted.contains(&id) {
+                    rows_by_id.insert(id, row);
+                }
+            }
+        }
+
+        rows_by_id
+    }
+
     pub fn flush_frozen(&self) -> Option<(PartitionResult, Vec<u64>)> {
         let tables_to_flush = {
             let f = self.frozen.read();

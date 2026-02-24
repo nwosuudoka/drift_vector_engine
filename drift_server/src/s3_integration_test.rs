@@ -138,6 +138,7 @@ mod s3_tests {
                 .insert(Request::new(InsertRequest {
                     collection_name: collection.to_string(),
                     vector: Some(random_vector(128)),
+                    payload: None,
                 }))
                 .await
                 .expect("Insert failed");
@@ -181,6 +182,8 @@ mod s3_tests {
                 target_confidence: 0.8,
                 lambda: 1.0,
                 tau: 100.0,
+                filters: vec![],
+                payload_projection_fields: vec![],
             }))
             .await;
 

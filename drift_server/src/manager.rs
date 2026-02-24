@@ -32,6 +32,9 @@ const KV_VALIDATE_IDS_PER_BUCKET_DEFAULT: usize = 4;
 pub struct Collection {
     pub index: Arc<VectorIndex>,
     pub name: String,
+    pub staging: Arc<LocalStagingManager>,
+    pub persistence: Arc<PersistenceManager>,
+    pub bucket_manager: Arc<BucketManager>,
     // We hold the handle so it runs in the background. Dropping this struct (e.g. shutdown) will abort it.
     pub janitor_task: tokio::task::JoinHandle<()>,
 }
@@ -497,8 +500,8 @@ impl CollectionManager {
         let janitor_config = JanitorConfig {
             index: index.clone(),
             manifest: manifest.clone(),
-            staging,
-            persistence,
+            staging: staging.clone(),
+            persistence: persistence.clone(),
             bucket_manager: bucket_manager.clone(),
             coordinator,
             vars: JanitorVars {
@@ -523,6 +526,9 @@ impl CollectionManager {
         let collection = Arc::new(Collection {
             index,
             name: name.to_string(),
+            staging,
+            persistence,
+            bucket_manager,
             janitor_task,
         });
 

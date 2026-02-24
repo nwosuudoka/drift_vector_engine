@@ -272,6 +272,8 @@ mod tests {
                     target_confidence: 0.9,
                     lambda: 1.0,
                     tau: 100.0,
+                    filters: vec![],
+                    payload_projection_fields: vec![],
                 }))
                 .await;
 
@@ -426,6 +428,7 @@ mod tests {
                     id: 999999,
                     values: vec![0.0; dim],
                 }),
+                payload: None,
             });
             match client.insert(warmup_insert).await {
                 Ok(_) => {
@@ -456,6 +459,7 @@ mod tests {
                         id,
                         values: vec![epoch_value; dim],
                     }),
+                    payload: None,
                 });
 
                 let f = client.insert(req);

@@ -316,6 +316,12 @@ impl MemTable {
         let rows = self.payload_rows.read().clone();
         (ids, data, schema, rows)
     }
+
+    pub fn snapshot_payload_rows(&self) -> (Vec<u64>, Option<Vec<PayloadRow>>) {
+        let ids = self.ids.read().clone();
+        let rows = self.payload_rows.read().clone();
+        (ids, rows)
+    }
 }
 
 #[derive(Debug, PartialEq)]

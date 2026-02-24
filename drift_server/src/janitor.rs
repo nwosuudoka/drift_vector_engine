@@ -17,7 +17,10 @@ use drift_storage::unified_format::{
 use drift_traits::StorageEngine;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{collections::HashMap, io};
+use std::{
+    collections::{HashMap, VecDeque},
+    io,
+};
 use tokio::sync::Mutex;
 use tokio::time;
 use tracing::{error, info, warn};
@@ -103,6 +106,242 @@ fn core_payload_logical_type_to_unified(
         CorePayloadLogicalType::TimestampMicros => UnifiedLogicalType::TimestampMicros,
         CorePayloadLogicalType::LobRef => UnifiedLogicalType::LobRef,
     }
+}
+
+fn unified_payload_schema_to_core(schema: &UnifiedPayloadSchema) -> CorePayloadSchema {
+    CorePayloadSchema::new(
+        schema
+            .fields
+            .iter()
+            .map(|field| drift_core::payload::PayloadFieldSchema {
+                field_id: field.field_id,
+                name: field.name.clone(),
+                logical_type: unified_payload_logical_type_to_core(&field.logical_type),
+                nullable: field.nullable,
+                indexed: field.indexed,
+            })
+            .collect(),
+    )
+}
+
+fn unified_payload_rows_to_core(rows: &[UnifiedPayloadRow]) -> Vec<CorePayloadRow> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|(field_id, value)| (*field_id, unified_payload_value_to_core(value)))
+                .collect()
+        })
+        .collect()
+}
+
+fn unified_payload_value_to_core(value: &UnifiedPayloadValue) -> CorePayloadValue {
+    match value {
+        UnifiedPayloadValue::Bool(v) => CorePayloadValue::Bool(*v),
+        UnifiedPayloadValue::Int64(v) => CorePayloadValue::Int64(*v),
+        UnifiedPayloadValue::Float32(v) => CorePayloadValue::Float32(*v),
+        UnifiedPayloadValue::Float64(v) => CorePayloadValue::Float64(*v),
+        UnifiedPayloadValue::Keyword(v) => CorePayloadValue::Keyword(v.clone()),
+        UnifiedPayloadValue::Text(v) => CorePayloadValue::Text(v.clone()),
+        UnifiedPayloadValue::Bytes(v) => CorePayloadValue::Bytes(v.clone()),
+        UnifiedPayloadValue::TimestampMicros(v) => CorePayloadValue::TimestampMicros(*v),
+        UnifiedPayloadValue::LobRef(v) => {
+            CorePayloadValue::LobRef(drift_core::payload::PayloadLobRef {
+                blob_key: v.blob_key.clone(),
+                offset: v.offset,
+                length: v.length,
+                fingerprint: v.fingerprint.clone(),
+            })
+        }
+        UnifiedPayloadValue::Null => CorePayloadValue::Null,
+    }
+}
+
+fn unified_payload_logical_type_to_core(
+    logical_type: &UnifiedLogicalType,
+) -> CorePayloadLogicalType {
+    match logical_type {
+        UnifiedLogicalType::Bool => CorePayloadLogicalType::Bool,
+        UnifiedLogicalType::Int64 => CorePayloadLogicalType::Int64,
+        UnifiedLogicalType::Float32 => CorePayloadLogicalType::Float32,
+        UnifiedLogicalType::Float64 => CorePayloadLogicalType::Float64,
+        UnifiedLogicalType::Keyword => CorePayloadLogicalType::Keyword,
+        UnifiedLogicalType::Text => CorePayloadLogicalType::Text,
+        UnifiedLogicalType::Bytes => CorePayloadLogicalType::Bytes,
+        UnifiedLogicalType::TimestampMicros => CorePayloadLogicalType::TimestampMicros,
+        UnifiedLogicalType::LobRef => CorePayloadLogicalType::LobRef,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PayloadRowLookupKey {
+    id: u64,
+    vector_bits: Vec<u32>,
+}
+
+type PayloadRowLookup = HashMap<PayloadRowLookupKey, VecDeque<UnifiedPayloadRow>>;
+
+fn payload_lookup_key(id: u64, vector: &[f32]) -> PayloadRowLookupKey {
+    PayloadRowLookupKey {
+        id,
+        vector_bits: vector.iter().map(|v| v.to_bits()).collect(),
+    }
+}
+
+fn build_payload_row_lookup(
+    bucket_id: u32,
+    context: &str,
+    ids: &[u64],
+    flat_vectors: &[f32],
+    dim: usize,
+    rows: &[UnifiedPayloadRow],
+) -> io::Result<PayloadRowLookup> {
+    if rows.len() != ids.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{context} payload row mismatch for bucket {bucket_id}: ids={}, payload_rows={}",
+                ids.len(),
+                rows.len()
+            ),
+        ));
+    }
+    if flat_vectors.len() != ids.len() * dim {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{context} vector length mismatch for bucket {bucket_id}: ids={}, flat={}",
+                ids.len(),
+                flat_vectors.len()
+            ),
+        ));
+    }
+
+    let mut lookup: PayloadRowLookup = HashMap::new();
+    for (row_idx, id) in ids.iter().enumerate() {
+        let start = row_idx * dim;
+        let end = start + dim;
+        let key = payload_lookup_key(*id, &flat_vectors[start..end]);
+        lookup
+            .entry(key)
+            .or_default()
+            .push_back(rows[row_idx].clone());
+    }
+    Ok(lookup)
+}
+
+fn take_payload_rows_for_group(
+    bucket_id: u32,
+    context: &str,
+    group: &PartitionGroup,
+    dim: usize,
+    lookup: &mut PayloadRowLookup,
+) -> io::Result<Vec<UnifiedPayloadRow>> {
+    if group.flat_vectors.len() != group.ids.len() * dim {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{context} vector length mismatch for bucket {bucket_id}: ids={}, flat={}",
+                group.ids.len(),
+                group.flat_vectors.len()
+            ),
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(group.ids.len());
+    for (row_idx, id) in group.ids.iter().enumerate() {
+        let start = row_idx * dim;
+        let end = start + dim;
+        let key = payload_lookup_key(*id, &group.flat_vectors[start..end]);
+        let (row, should_remove) = match lookup.get_mut(&key) {
+            Some(queue) => {
+                let value = queue.pop_front().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{context} payload queue underflow for bucket {bucket_id} (id={id})"
+                        ),
+                    )
+                })?;
+                (value, queue.is_empty())
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{context} payload lookup miss for bucket {bucket_id} (id={id})"),
+                ));
+            }
+        };
+        if should_remove {
+            lookup.remove(&key);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn take_payload_rows_for_loopback(
+    bucket_id: u32,
+    context: &str,
+    loopback: &[(u64, Vec<f32>)],
+    dim: usize,
+    lookup: &mut PayloadRowLookup,
+) -> io::Result<Vec<UnifiedPayloadRow>> {
+    let mut rows = Vec::with_capacity(loopback.len());
+    for (id, vector) in loopback {
+        if vector.len() != dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{context} loopback vector length mismatch for bucket {bucket_id} (id={id})"
+                ),
+            ));
+        }
+
+        let key = payload_lookup_key(*id, vector);
+        let (row, should_remove) = match lookup.get_mut(&key) {
+            Some(queue) => {
+                let value = queue.pop_front().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{context} payload queue underflow for bucket {bucket_id} (loopback id={id})"
+                        ),
+                    )
+                })?;
+                (value, queue.is_empty())
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{context} payload lookup miss for bucket {bucket_id} (loopback id={id})"
+                    ),
+                ));
+            }
+        };
+        if should_remove {
+            lookup.remove(&key);
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn ensure_payload_lookup_drained(
+    bucket_id: u32,
+    context: &str,
+    lookup: &PayloadRowLookup,
+) -> io::Result<()> {
+    let remaining: usize = lookup.values().map(VecDeque::len).sum();
+    if remaining != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{context} payload lookup not fully consumed for bucket {bucket_id}: remaining_rows={remaining}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub struct JanitorVars {
@@ -197,6 +436,216 @@ impl Janitor {
         if let Err(e) = self.index.get_kv().sync() {
             warn!("Janitor: kv.sync failed ({reason}): {e}");
         }
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn read_bucket_flat_with_payload(
+        &self,
+        bucket_id: u32,
+        context: &str,
+    ) -> io::Result<(
+        Vec<u64>,
+        Vec<f32>,
+        Option<UnifiedPayloadSchema>,
+        Option<Vec<UnifiedPayloadRow>>,
+    )> {
+        #[derive(Clone)]
+        enum Source {
+            Local(String),
+            Remote(String),
+        }
+
+        let version = self.bucket_manager.get_version(bucket_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("bucket {bucket_id} not found"),
+            )
+        })?;
+
+        let mut sources = Vec::new();
+        match &version.class {
+            StorageClass::Local => {
+                sources.push(Source::Local(version.path.clone()));
+            }
+            StorageClass::Remote => {
+                sources.push(Source::Remote(version.path.clone()));
+            }
+            StorageClass::Tiered {
+                remote_path,
+                local_path,
+            } => {
+                sources.push(Source::Remote(remote_path.clone()));
+                sources.push(Source::Local(local_path.clone()));
+            }
+            StorageClass::Promoting {
+                local_active,
+                local_frozen,
+                remote_path,
+            } => {
+                if let Some(path) = remote_path {
+                    sources.push(Source::Remote(path.clone()));
+                }
+                sources.push(Source::Local(local_frozen.clone()));
+                sources.push(Source::Local(local_active.clone()));
+            }
+        }
+
+        let dim = self.index.get_dim();
+        let mut merged_ids = Vec::new();
+        let mut merged_flat = Vec::new();
+        let mut merged_schema: Option<UnifiedPayloadSchema> = None;
+        let mut merged_rows: Option<Vec<UnifiedPayloadRow>> = None;
+
+        for source in sources {
+            let (source_label, ids, flat, schema, rows) = match &source {
+                Source::Local(path) => {
+                    let ids_and_flat = self.staging.read_file_content_flat(path).await?;
+                    let schema = self.staging.read_file_payload_schema(path).await?;
+                    let rows = self.staging.read_file_payload_rows(path).await?;
+                    (
+                        format!("local:{path}"),
+                        ids_and_flat.0,
+                        ids_and_flat.1,
+                        schema,
+                        rows,
+                    )
+                }
+                Source::Remote(path) => {
+                    let ids_and_flat = self.persistence.read_remote_bucket_path_flat(path).await?;
+                    let schema = self
+                        .persistence
+                        .read_remote_bucket_payload_schema_path(path)
+                        .await?;
+                    let rows = self
+                        .persistence
+                        .read_remote_bucket_payload_rows_path_optional(path)
+                        .await?;
+                    (
+                        format!("remote:{path}"),
+                        ids_and_flat.0,
+                        ids_and_flat.1,
+                        schema,
+                        rows,
+                    )
+                }
+            };
+
+            if flat.len() != ids.len() * dim {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{context} vector length mismatch for bucket {bucket_id} source {source_label}: ids={}, flat={}",
+                        ids.len(),
+                        flat.len()
+                    ),
+                ));
+            }
+            if rows.is_some() && schema.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{context} payload rows present without schema for bucket {bucket_id} source {source_label}"
+                    ),
+                ));
+            }
+            if schema.is_some() && rows.is_none() && !ids.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{context} payload schema present without rows for bucket {bucket_id} source {source_label}"
+                    ),
+                ));
+            }
+            if let Some(source_rows) = rows.as_ref()
+                && source_rows.len() != ids.len()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{context} payload row mismatch for bucket {bucket_id} source {source_label}: ids={}, payload_rows={}",
+                        ids.len(),
+                        source_rows.len()
+                    ),
+                ));
+            }
+
+            if let Some(source_schema) = schema.as_ref() {
+                if let Some(existing) = merged_schema.as_ref() {
+                    if existing != source_schema {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "{context} payload schema mismatch while reading bucket {bucket_id} source {source_label}"
+                            ),
+                        ));
+                    }
+                } else {
+                    merged_schema = Some(source_schema.clone());
+                }
+            } else if merged_schema.is_some() && !ids.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{context} payload schema missing for bucket {bucket_id} source {source_label}"
+                    ),
+                ));
+            }
+
+            match (rows, merged_rows.as_mut()) {
+                (Some(mut source_rows), Some(target_rows)) => target_rows.append(&mut source_rows),
+                (Some(source_rows), None) => merged_rows = Some(source_rows),
+                (None, Some(_)) if !ids.is_empty() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{context} payload rows missing for bucket {bucket_id} source {source_label}"
+                        ),
+                    ));
+                }
+                (None, Some(_)) => {}
+                (None, None) => {}
+            }
+
+            merged_ids.extend(ids);
+            merged_flat.extend(flat);
+        }
+
+        if merged_flat.len() != merged_ids.len() * dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{context} merged vector length mismatch for bucket {bucket_id}: ids={}, flat={}",
+                    merged_ids.len(),
+                    merged_flat.len()
+                ),
+            ));
+        }
+        if let Some(rows) = merged_rows.as_ref() {
+            if rows.len() != merged_ids.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{context} merged payload row mismatch for bucket {bucket_id}: ids={}, payload_rows={}",
+                        merged_ids.len(),
+                        rows.len()
+                    ),
+                ));
+            }
+        }
+        if merged_rows.is_some() && merged_schema.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{context} payload rows present without schema for bucket {bucket_id}"),
+            ));
+        }
+        if merged_schema.is_some() && merged_rows.is_none() && !merged_ids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{context} payload schema present without rows for bucket {bucket_id}"),
+            ));
+        }
+
+        Ok((merged_ids, merged_flat, merged_schema, merged_rows))
     }
 
     pub async fn run(&self) {
@@ -838,6 +1287,70 @@ impl Janitor {
             return Ok(());
         }
 
+        let dim = self.index.get_dim();
+        let (source_ids, source_flat, source_schema, source_rows) = self
+            .read_bucket_flat_with_payload(bucket_id, "split-source")
+            .await?;
+        if source_ids.len() != child_sum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "split source row mismatch for bucket {}: source_rows={}, split_rows={}",
+                    bucket_id,
+                    source_ids.len(),
+                    child_sum
+                ),
+            ));
+        }
+
+        let mut payload_lookup = match source_rows.as_ref() {
+            Some(rows) => Some(build_payload_row_lookup(
+                bucket_id,
+                "split-source",
+                &source_ids,
+                &source_flat,
+                dim,
+                rows,
+            )?),
+            None => None,
+        };
+        let left_payload_rows = if let Some(lookup) = payload_lookup.as_mut() {
+            Some(take_payload_rows_for_group(
+                bucket_id,
+                "split-left",
+                &proposal.left,
+                dim,
+                lookup,
+            )?)
+        } else {
+            None
+        };
+        let right_payload_rows = if let Some(lookup) = payload_lookup.as_mut() {
+            Some(take_payload_rows_for_group(
+                bucket_id,
+                "split-right",
+                &proposal.right,
+                dim,
+                lookup,
+            )?)
+        } else {
+            None
+        };
+        let loopback_payload_rows = if let Some(lookup) = payload_lookup.as_mut() {
+            Some(take_payload_rows_for_loopback(
+                bucket_id,
+                "split-loopback",
+                &proposal.loopback,
+                dim,
+                lookup,
+            )?)
+        } else {
+            None
+        };
+        if let Some(lookup) = payload_lookup.as_ref() {
+            ensure_payload_lookup_drained(bucket_id, "split-source", lookup)?;
+        }
+
         // 2. Write New Buckets (Staging)
         // We allocate new IDs for the children
         // Note: allocate_next_bucket_id is atomic on Index
@@ -845,11 +1358,27 @@ impl Janitor {
         let id_right = self.index.allocate_next_bucket_id();
 
         // Write Left
-        let count_l = self.staging.append_batch(id_left, &proposal.left).await?;
+        let count_l = self
+            .staging
+            .append_batch_with_payload(
+                id_left,
+                &proposal.left,
+                source_schema.as_ref(),
+                left_payload_rows.as_deref(),
+            )
+            .await?;
         let file_l = self.staging.get_active_filename(id_left);
 
         // Write Right
-        let count_r = self.staging.append_batch(id_right, &proposal.right).await?;
+        let count_r = self
+            .staging
+            .append_batch_with_payload(
+                id_right,
+                &proposal.right,
+                source_schema.as_ref(),
+                right_payload_rows.as_deref(),
+            )
+            .await?;
         let file_r = self.staging.get_active_filename(id_right);
 
         // Update KV mapping for new buckets
@@ -900,7 +1429,26 @@ impl Janitor {
                 "Janitor: ↩️ Looping back {} defectors",
                 proposal.loopback.len()
             );
-            self.index.insert_batch(&proposal.loopback)?;
+            if let Some(rows) = loopback_payload_rows.as_ref() {
+                let core_schema = source_schema.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "split loopback payload rows present without schema for bucket {}",
+                            bucket_id
+                        ),
+                    )
+                })?;
+                let core_schema = unified_payload_schema_to_core(core_schema);
+                let core_rows = unified_payload_rows_to_core(rows);
+                self.index.insert_batch_with_payload(
+                    &proposal.loopback,
+                    Some(&core_schema),
+                    Some(core_rows.as_slice()),
+                )?;
+            } else {
+                self.index.insert_batch(&proposal.loopback)?;
+            }
         }
 
         // 7. Cleanup Old
@@ -956,6 +1504,22 @@ impl Janitor {
             return Ok(());
         }
 
+        let dim = self.index.get_dim();
+        let (zombie_ids, zombie_flat, zombie_schema, zombie_rows) = self
+            .read_bucket_flat_with_payload(zombie_id, "merge-zombie")
+            .await?;
+        let mut zombie_payload_lookup = match zombie_rows.as_ref() {
+            Some(rows) => Some(build_payload_row_lookup(
+                zombie_id,
+                "merge-zombie",
+                &zombie_ids,
+                &zombie_flat,
+                dim,
+                rows,
+            )?),
+            None => None,
+        };
+
         let mut manifest_updates = Vec::new();
         let mut files_to_delete = Vec::new();
 
@@ -964,26 +1528,120 @@ impl Janitor {
             let new_filename = format!("bucket_{}_{}.driftu", target_id, uuid::Uuid::new_v4());
 
             // B. Read Old Data (to merge)
-            let (mut ids, mut vecs) = self.staging.read_full_bucket(*target_id).await?;
+            let (mut ids, mut flat_vecs, target_schema, target_rows) = self
+                .read_bucket_flat_with_payload(*target_id, "merge-target")
+                .await?;
             let old_filename = self.staging.get_active_filename(*target_id);
+            let target_count = ids.len();
+            if group.flat_vectors.len() != group.ids.len() * dim {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "merge proposal vector mismatch for target {}: ids={}, flat={}",
+                        target_id,
+                        group.ids.len(),
+                        group.flat_vectors.len()
+                    ),
+                ));
+            }
+            let incoming_rows = if let Some(lookup) = zombie_payload_lookup.as_mut() {
+                Some(take_payload_rows_for_group(
+                    zombie_id,
+                    "merge-zombie-moves",
+                    group,
+                    dim,
+                    lookup,
+                )?)
+            } else {
+                None
+            };
 
             // C. Merge Vectors
             ids.extend(&group.ids);
-            let dim = self.index.get_dim();
-            for chunk in group.flat_vectors.chunks_exact(dim) {
-                vecs.push(chunk.to_vec());
+            flat_vecs.extend_from_slice(&group.flat_vectors);
+
+            let merged_schema = match (target_schema.as_ref(), zombie_schema.as_ref()) {
+                (Some(lhs), Some(rhs)) => {
+                    if lhs != rhs {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "merge payload schema mismatch between target {} and zombie {}",
+                                target_id, zombie_id
+                            ),
+                        ));
+                    }
+                    Some(lhs.clone())
+                }
+                (Some(schema), None) => Some(schema.clone()),
+                (None, Some(schema)) => Some(schema.clone()),
+                (None, None) => None,
+            };
+            let mut merged_rows: Option<Vec<UnifiedPayloadRow>> = None;
+            if merged_schema.is_some() {
+                let mut rows = Vec::with_capacity(ids.len());
+                if target_count > 0 {
+                    let existing_rows = target_rows.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "merge target payload rows missing for bucket {} (target={})",
+                                zombie_id, target_id
+                            ),
+                        )
+                    })?;
+                    rows.extend(existing_rows);
+                } else if let Some(existing_rows) = target_rows {
+                    rows.extend(existing_rows);
+                }
+
+                if !group.ids.is_empty() {
+                    let mut moved_rows = incoming_rows.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "merge incoming payload rows missing for zombie {} -> target {}",
+                                zombie_id, target_id
+                            ),
+                        )
+                    })?;
+                    rows.append(&mut moved_rows);
+                } else if let Some(mut moved_rows) = incoming_rows {
+                    rows.append(&mut moved_rows);
+                }
+
+                if rows.len() != ids.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "merge payload row mismatch for target {}: ids={}, payload_rows={}",
+                            target_id,
+                            ids.len(),
+                            rows.len()
+                        ),
+                    ));
+                }
+                merged_rows = Some(rows);
+            } else if target_rows.is_some()
+                || incoming_rows.is_some()
+                || target_schema.is_some()
+                || zombie_schema.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "merge payload presence mismatch for target {} and zombie {}",
+                        target_id, zombie_id
+                    ),
+                ));
             }
 
             // D. Recalculate Stats (Sum & Centroid)
             let count = ids.len();
             let mut new_sum = vec![0.0; dim];
-
-            // Flatten for writing & summing
-            let mut flat_vecs = Vec::with_capacity(count * dim);
-            for v in &vecs {
-                flat_vecs.extend_from_slice(v);
+            for chunk in flat_vecs.chunks_exact(dim) {
                 for i in 0..dim {
-                    new_sum[i] += v[i];
+                    new_sum[i] += chunk[i];
                 }
             }
 
@@ -1002,7 +1660,12 @@ impl Janitor {
             merged_group.count = count;
 
             self.staging
-                .write_new_file(&new_filename, &merged_group)
+                .write_new_file_with_payload(
+                    &new_filename,
+                    &merged_group,
+                    merged_schema.as_ref(),
+                    merged_rows.as_deref(),
+                )
                 .await?;
 
             // Update KV mapping for all IDs now owned by target_id
@@ -1017,6 +1680,9 @@ impl Janitor {
                 new_filename,
             ));
             files_to_delete.push(old_filename);
+        }
+        if let Some(lookup) = zombie_payload_lookup.as_ref() {
+            ensure_payload_lookup_drained(zombie_id, "merge-zombie", lookup)?;
         }
 
         // 3. Atomic Commit (Manifest)

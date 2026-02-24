@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id: 1,
                 values: vec![0.1; dim],
             }),
+            payload: None,
         }))
         .await?;
 
@@ -57,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id: 1,
                 values: vec![0.9; dim],
             }),
+            payload: None,
         }))
         .await?;
 
@@ -70,6 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_confidence: 0.9,
             lambda: 25.0,
             tau: 100.0,
+            filters: vec![],
+            payload_projection_fields: vec![],
         }))
         .await?
         .into_inner();
@@ -90,6 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_confidence: 0.9,
             lambda: 25.0,
             tau: 100.0,
+            filters: vec![],
+            payload_projection_fields: vec![],
         }))
         .await?
         .into_inner();

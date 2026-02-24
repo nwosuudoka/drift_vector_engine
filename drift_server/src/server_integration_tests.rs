@@ -1,7 +1,11 @@
 #[cfg(test)]
 mod tests {
     use crate::config::{Config, FileConfig, StorageCommand};
-    use crate::drift_proto::{HealthRequest, drift_server::Drift};
+    use crate::drift_proto::{
+        CreateCollectionRequest, FieldFilter, HealthRequest, InsertBatchRequest, MetricType,
+        PayloadRow, PayloadValue, PayloadValueList, RangeFilter, SearchRequest, Vector,
+        drift_server::Drift,
+    };
     use crate::local_staging::LocalStagingManager;
     use crate::manager::CollectionManager;
     use crate::manifest::ServerManifestManager;
@@ -16,6 +20,7 @@ mod tests {
     use drift_storage::unified_writer::UnifiedLocalWriter;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tonic::Request;
@@ -82,6 +87,171 @@ mod tests {
             health.recovery_guard.is_some(),
             "health endpoint should always return recovery guard metrics payload"
         );
+    }
+
+    fn payload_keyword(value: &str) -> PayloadValue {
+        PayloadValue {
+            kind: Some(crate::drift_proto::payload_value::Kind::KeywordValue(
+                value.to_string(),
+            )),
+        }
+    }
+
+    fn payload_int64(value: i64) -> PayloadValue {
+        PayloadValue {
+            kind: Some(crate::drift_proto::payload_value::Kind::Int64Value(value)),
+        }
+    }
+
+    fn payload_row(entries: Vec<(u32, PayloadValue)>) -> PayloadRow {
+        PayloadRow {
+            fields: entries.into_iter().collect::<HashMap<_, _>>(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_field_filters_exact_anyof_range_and_projection() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            port: 50057,
+            wal_dir: dir.path().join("wal"),
+            data_dir: dir.path().join("data"),
+            default_dim: 2,
+            max_bucket_capacity: 100,
+            ef_construction: 32,
+            ef_search: 32,
+            storage: StorageCommand::File(FileConfig {
+                path: dir.path().join("storage"),
+            }),
+        };
+
+        let service = DriftService {
+            manager: Arc::new(CollectionManager::new(config)),
+        };
+        let collection = "filters_demo";
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                collection_name: collection.to_string(),
+                dim: 2,
+                metric: MetricType::L2 as i32,
+                max_bucket_capacity: 0,
+            }))
+            .await
+            .expect("create_collection should succeed");
+
+        let vectors = vec![
+            Vector {
+                id: 1,
+                values: vec![0.0, 0.0],
+            },
+            Vector {
+                id: 2,
+                values: vec![0.1, 0.1],
+            },
+            Vector {
+                id: 3,
+                values: vec![0.2, 0.2],
+            },
+            Vector {
+                id: 4,
+                values: vec![0.3, 0.3],
+            },
+        ];
+        let payload_rows = vec![
+            payload_row(vec![(1, payload_keyword("tenant_a")), (2, payload_int64(10))]),
+            payload_row(vec![(1, payload_keyword("tenant_b")), (2, payload_int64(20))]),
+            payload_row(vec![(1, payload_keyword("tenant_a")), (2, payload_int64(30))]),
+            payload_row(vec![(1, payload_keyword("tenant_c")), (2, payload_int64(40))]),
+        ];
+
+        service
+            .insert_batch(Request::new(InsertBatchRequest {
+                collection_name: collection.to_string(),
+                vectors,
+                payload_rows,
+            }))
+            .await
+            .expect("insert_batch should succeed");
+
+        let exact = service
+            .search(Request::new(SearchRequest {
+                collection_name: collection.to_string(),
+                vector: vec![0.0, 0.0],
+                k: 4,
+                target_confidence: 0.99,
+                lambda: 0.1,
+                tau: 10.0,
+                filters: vec![FieldFilter {
+                    field_id: 1,
+                    condition: Some(crate::drift_proto::field_filter::Condition::Exact(
+                        payload_keyword("tenant_a"),
+                    )),
+                }],
+                payload_projection_fields: vec![1, 2],
+            }))
+            .await
+            .expect("exact-filter search should succeed")
+            .into_inner();
+        let exact_ids: Vec<u64> = exact.results.iter().map(|r| r.id).collect();
+        assert_eq!(exact_ids, vec![1, 3]);
+        assert!(
+            exact
+                .results
+                .iter()
+                .all(|r| r.payload.is_some() && r.payload.as_ref().unwrap().fields.contains_key(&1))
+        );
+
+        let any_of = service
+            .search(Request::new(SearchRequest {
+                collection_name: collection.to_string(),
+                vector: vec![0.0, 0.0],
+                k: 4,
+                target_confidence: 0.99,
+                lambda: 0.1,
+                tau: 10.0,
+                filters: vec![FieldFilter {
+                    field_id: 1,
+                    condition: Some(crate::drift_proto::field_filter::Condition::AnyOf(
+                        PayloadValueList {
+                            values: vec![payload_keyword("tenant_b"), payload_keyword("tenant_c")],
+                        },
+                    )),
+                }],
+                payload_projection_fields: vec![],
+            }))
+            .await
+            .expect("any_of-filter search should succeed")
+            .into_inner();
+        let any_ids: Vec<u64> = any_of.results.iter().map(|r| r.id).collect();
+        assert_eq!(any_ids, vec![2, 4]);
+
+        let range = service
+            .search(Request::new(SearchRequest {
+                collection_name: collection.to_string(),
+                vector: vec![0.0, 0.0],
+                k: 4,
+                target_confidence: 0.99,
+                lambda: 0.1,
+                tau: 10.0,
+                filters: vec![FieldFilter {
+                    field_id: 2,
+                    condition: Some(crate::drift_proto::field_filter::Condition::Range(
+                        RangeFilter {
+                            lower: Some(payload_int64(15)),
+                            lower_inclusive: Some(true),
+                            upper: Some(payload_int64(35)),
+                            upper_inclusive: Some(true),
+                        },
+                    )),
+                }],
+                payload_projection_fields: vec![],
+            }))
+            .await
+            .expect("range-filter search should succeed")
+            .into_inner();
+        let range_ids: Vec<u64> = range.results.iter().map(|r| r.id).collect();
+        assert_eq!(range_ids, vec![2, 3]);
     }
 
     #[tokio::test]

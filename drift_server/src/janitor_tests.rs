@@ -455,9 +455,14 @@ mod janitor_split_test {
     use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_storage::unified_format::{
+        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadRow, UnifiedPayloadSchema,
+        UnifiedPayloadValue,
+    };
     use drift_storage::unified_writer::UnifiedLocalWriter;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use tempfile::tempdir;
 
@@ -476,6 +481,28 @@ mod janitor_split_test {
         let path = dir.join(filename);
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
         UnifiedLocalWriter::write_vector_only_flat_to_path(&path, ids, &flat, dim).unwrap();
+    }
+
+    async fn create_bucket_file_with_payload(
+        dir: &std::path::Path,
+        filename: &str,
+        ids: &[u64],
+        vecs: &[Vec<f32>],
+        dim: usize,
+        schema: &UnifiedPayloadSchema,
+        rows: &[UnifiedPayloadRow],
+    ) {
+        let path = dir.join(filename);
+        let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
+        UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
+            &path,
+            ids,
+            &flat,
+            dim,
+            Some(schema),
+            Some(rows),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -602,6 +629,138 @@ mod janitor_split_test {
         assert!(router_snap.1.contains(&2));
         assert!(router_snap.1.contains(&3));
         assert!(!router_snap.1.contains(&1));
+    }
+
+    #[tokio::test]
+    async fn test_janitor_split_preserves_payload_rows() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let dim = 2;
+        let schema = UnifiedPayloadSchema::new(vec![UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+
+        let manifest = Arc::new(ServerManifestManager::new(dir.path(), dim as u32).unwrap());
+        let staging = Arc::new(LocalStagingManager::new(&data_dir).unwrap());
+        let op = create_fs_operator(&data_dir);
+        let persistence = Arc::new(PersistenceManager::new(op.clone()));
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let bucket_manager = Arc::new(BucketManager::new(
+            op.clone(),
+            op.clone(),
+            4,
+            coordinator.clone(),
+            Metric::L2,
+        ));
+
+        let wal_dir = dir.path().join("wal");
+        let wal_mgr = Arc::new(Mutex::new(WalManager::new(&wal_dir).unwrap()));
+        let kv = Arc::new(BitStore::new(dir.path().join("kv")).unwrap());
+        let centroids = vec![drift_core::manifest::pb::Centroid {
+            id: 1,
+            vector: vec![0.0; dim],
+        }];
+        let router = Arc::new(RwLock::new(
+            Router::new(&centroids, &[100], dim, Metric::L2).unwrap(),
+        ));
+        let index = Arc::new(VectorIndex::new(
+            dim,
+            1000,
+            router,
+            wal_mgr,
+            bucket_manager.clone(),
+            kv,
+        ));
+
+        let mut ids = Vec::new();
+        let mut vecs = Vec::new();
+        for i in 0..50 {
+            ids.push(i as u64);
+            vecs.push(vec![0.1 * (i as f32), 0.1 * (i as f32)]);
+        }
+        for i in 50..100 {
+            ids.push(i as u64);
+            vecs.push(vec![10.0 + 0.1 * (i as f32), 10.0 + 0.1 * (i as f32)]);
+        }
+        let payload_rows: Vec<UnifiedPayloadRow> = ids
+            .iter()
+            .map(|id| BTreeMap::from([(1, UnifiedPayloadValue::Keyword(format!("tenant_{id}")))]))
+            .collect();
+
+        let filename = "bucket_1.driftu";
+        create_bucket_file_with_payload(
+            &data_dir,
+            filename,
+            &ids,
+            &vecs,
+            dim,
+            &schema,
+            &payload_rows,
+        )
+        .await;
+
+        bucket_manager.register_bucket(1, filename.to_string(), StorageClass::Local);
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(1, "run1".into(), Some(vec![5.0, 5.0]));
+                m.update_bucket_stats(1, 100, 0);
+            })
+            .unwrap();
+
+        let janitor = Janitor::new(JanitorConfig {
+            index,
+            manifest: manifest.clone(),
+            staging: staging.clone(),
+            persistence,
+            bucket_manager,
+            coordinator,
+            vars: JanitorVars::default(),
+        });
+        janitor.perform_split(1).await.expect("split failed");
+
+        let state = manifest.get_state();
+        let b2 = state
+            .get_buckets()
+            .iter()
+            .find(|b| b.id == 2)
+            .expect("bucket 2 missing");
+        let b3 = state
+            .get_buckets()
+            .iter()
+            .find(|b| b.id == 3)
+            .expect("bucket 3 missing");
+        assert_eq!(b2.vector_count + b3.vector_count, 100);
+
+        for bid in [2u32, 3u32] {
+            let child_schema = staging
+                .read_full_bucket_payload_schema(bid)
+                .await
+                .expect("read child payload schema should succeed");
+            assert_eq!(child_schema, Some(schema.clone()));
+
+            let (child_ids, _) = staging
+                .read_full_bucket_flat(bid)
+                .await
+                .expect("read child vectors should succeed");
+            let child_rows = staging
+                .read_full_bucket_payload_rows(bid)
+                .await
+                .expect("read child payload rows should succeed")
+                .expect("child payload rows should exist");
+            assert_eq!(child_ids.len(), child_rows.len());
+
+            for (id, row) in child_ids.iter().zip(child_rows.iter()) {
+                assert_eq!(
+                    row.get(&1),
+                    Some(&UnifiedPayloadValue::Keyword(format!("tenant_{id}")))
+                );
+            }
+        }
     }
 }
 
@@ -868,10 +1027,15 @@ mod janitor_scatter_merge_test {
     use drift_core::wal::WalManager;
     use drift_kv::bitstore::BitStore;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_storage::unified_format::{
+        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadRow, UnifiedPayloadSchema,
+        UnifiedPayloadValue,
+    };
     use drift_storage::unified_writer::UnifiedLocalWriter;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
     use parking_lot::{Mutex, RwLock};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -891,6 +1055,28 @@ mod janitor_scatter_merge_test {
         let path = dir.join(filename);
         let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
         UnifiedLocalWriter::write_vector_only_flat_to_path(path, ids, &flat, dim).unwrap();
+    }
+
+    async fn create_bucket_file_with_payload(
+        dir: &std::path::Path,
+        filename: &str,
+        ids: &[u64],
+        vecs: &[Vec<f32>],
+        dim: usize,
+        schema: &UnifiedPayloadSchema,
+        rows: &[UnifiedPayloadRow],
+    ) {
+        let path = dir.join(filename);
+        let flat: Vec<f32> = vecs.iter().flatten().copied().collect();
+        UnifiedLocalWriter::write_vector_with_payload_flat_to_path(
+            path,
+            ids,
+            &flat,
+            dim,
+            Some(schema),
+            Some(rows),
+        )
+        .unwrap();
     }
 
     async fn setup_env(
@@ -1043,6 +1229,129 @@ mod janitor_scatter_merge_test {
         let state = manifest.get_state();
         let b2 = state.get_buckets().iter().find(|b| b.id == 2).unwrap();
         assert_eq!(b2.vector_count, 55, "Neighbor bucket count incorrect");
+    }
+
+    #[tokio::test]
+    async fn test_scatter_merge_preserves_payload_rows() {
+        let dir = tempdir().unwrap();
+        let dim = 2;
+        let max_cap = 100;
+        let (index, bucket_mgr, janitor, manifest, staging) =
+            setup_env(dir.path(), dim, max_cap).await;
+        let schema = UnifiedPayloadSchema::new(vec![UnifiedFieldSchema {
+            field_id: 1,
+            name: "tenant".to_string(),
+            logical_type: UnifiedLogicalType::Keyword,
+            nullable: false,
+            indexed: true,
+        }]);
+
+        let c1 = vec![0.0; dim];
+        let c2 = vec![10.0; dim];
+        {
+            let mut r = index.get_router().write();
+            r.add_bucket(1, c1.clone());
+            r.add_bucket(2, c2.clone());
+            r.update_bucket(1, 5, c1.clone());
+            r.update_bucket(2, 50, c2.clone());
+        }
+
+        let b1_ids: Vec<u64> = (0..5).collect();
+        let b1_vecs = vec![c1.clone(); 5];
+        let b1_rows: Vec<UnifiedPayloadRow> = b1_ids
+            .iter()
+            .map(|id| BTreeMap::from([(1, UnifiedPayloadValue::Keyword(format!("b1_{id}")))]))
+            .collect();
+        create_bucket_file_with_payload(
+            staging.get_base_path(),
+            "bucket_1.driftu",
+            &b1_ids,
+            &b1_vecs,
+            dim,
+            &schema,
+            &b1_rows,
+        )
+        .await;
+
+        let b2_ids: Vec<u64> = (100..150).collect();
+        let b2_vecs = vec![c2.clone(); 50];
+        let b2_rows: Vec<UnifiedPayloadRow> = b2_ids
+            .iter()
+            .map(|id| BTreeMap::from([(1, UnifiedPayloadValue::Keyword(format!("b2_{id}")))]))
+            .collect();
+        create_bucket_file_with_payload(
+            staging.get_base_path(),
+            "bucket_2.driftu",
+            &b2_ids,
+            &b2_vecs,
+            dim,
+            &schema,
+            &b2_rows,
+        )
+        .await;
+
+        staging.set_active_filename(1, "bucket_1.driftu".into());
+        staging.set_active_filename(2, "bucket_2.driftu".into());
+        bucket_mgr.register_bucket(1, "bucket_1.driftu".into(), StorageClass::Local);
+        bucket_mgr.register_bucket(2, "bucket_2.driftu".into(), StorageClass::Local);
+        bucket_mgr
+            .update_bucket_drift(1, &vec![0.0; dim], 5)
+            .unwrap();
+        bucket_mgr
+            .update_bucket_drift(2, &vec![500.0; dim], 50)
+            .unwrap();
+
+        manifest
+            .apply_atomic(|m| {
+                m.add_bucket(1, "".into(), Some(c1));
+                m.update_bucket_stats(1, 5, 0);
+                m.add_bucket(2, "".into(), Some(c2));
+                m.update_bucket_stats(2, 50, 0);
+            })
+            .unwrap();
+
+        let handle = tokio::spawn(async move { janitor.run().await });
+        let mut merged = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let state = manifest.get_state();
+            if !state.get_buckets().iter().any(|b| b.id == 1) {
+                merged = true;
+                break;
+            }
+        }
+        handle.abort();
+        assert!(
+            merged,
+            "janitor failed to merge payload-bearing zombie bucket"
+        );
+
+        let (merged_ids, _) = staging
+            .read_full_bucket_flat(2)
+            .await
+            .expect("read merged bucket ids should succeed");
+        let merged_rows = staging
+            .read_full_bucket_payload_rows(2)
+            .await
+            .expect("read merged payload rows should succeed")
+            .expect("merged payload rows should exist");
+        let merged_schema = staging
+            .read_full_bucket_payload_schema(2)
+            .await
+            .expect("read merged payload schema should succeed");
+
+        assert_eq!(merged_ids.len(), 55);
+        assert_eq!(merged_rows.len(), 55);
+        assert_eq!(merged_schema, Some(schema));
+
+        for (id, row) in merged_ids.iter().zip(merged_rows.iter()) {
+            let expected = if *id < 100 {
+                format!("b1_{id}")
+            } else {
+                format!("b2_{id}")
+            };
+            assert_eq!(row.get(&1), Some(&UnifiedPayloadValue::Keyword(expected)));
+        }
     }
 
     #[tokio::test]

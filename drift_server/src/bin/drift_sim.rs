@@ -238,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .insert(Request::new(InsertRequest {
                     collection_name: collection_name.to_string(),
                     vector: Some(v.clone()),
+                    payload: None,
                 }))
                 .await?;
         }
@@ -255,6 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_confidence: 0.99,
             lambda,
             tau,
+            filters: vec![],
+            payload_projection_fields: vec![],
         });
 
         let start_q = Instant::now();

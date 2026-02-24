@@ -176,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let req = tonic::Request::new(InsertRequest {
                 collection_name: collection.clone(),
                 vector: Some(Vector { id: *id, values }),
+                payload: None,
             });
 
             let response = client.insert(req).await?;
@@ -199,6 +200,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target_confidence: *confidence,
                 lambda: *lambda,
                 tau: *tau,
+                filters: vec![],
+                payload_projection_fields: vec![],
             });
 
             let response = client.search(req).await?;

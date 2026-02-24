@@ -56,7 +56,7 @@
 - [x] Extend ingest/partition structures to carry payload rows along with vectors.
 - [x] Wire payload rows through staging append path (not schema-only).
 - [x] Preserve payload rows during promotion merge/rewrite (local + remote + tombstone purge).
-- [ ] Preserve payload rows during split/merge/scatter rewrite flows.
+- [x] Preserve payload rows during split/merge/scatter rewrite flows.
 - [ ] Add end-to-end tests that verify payload survives flush -> promote -> recover.
 
 ### Phase C: Manifest and Recovery Metadata (`manifest.proto` + server recovery)
@@ -68,10 +68,10 @@
 ### Phase D: API and Query Surface (`drift.proto` + server handlers)
 
 - [ ] Add payload schema management API (create/update/validate field definitions).
-- [ ] Add insert/insert-batch payload fields in protobuf API.
-- [ ] Add filter DSL to search request (`exact`, `in`, `range`, boolean composition baseline).
-- [ ] Add optional payload projection in search response (late materialization path).
-- [ ] Keep vector-only API behavior fully backward compatible.
+- [x] Add insert/insert-batch payload fields in protobuf API.
+- [x] Add filter DSL to search request (`exact`, `in`, `range`, boolean composition baseline).
+- [x] Add optional payload projection in search response (late materialization path).
+- [x] Keep vector-only API behavior fully backward compatible.
 
 ### Phase E: Planner and Execution
 

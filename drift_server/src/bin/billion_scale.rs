@@ -98,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .insert_batch(Request::new(InsertBatchRequest {
             collection_name: collection.to_string(),
             vectors: needles.clone(),
+            payload_rows: vec![],
         }))
         .await?;
 
@@ -133,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .insert_batch(Request::new(InsertBatchRequest {
                 collection_name: collection.to_string(),
                 vectors: batch_proto,
+                payload_rows: vec![],
             }))
             .await?;
 
@@ -380,6 +382,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target_confidence: 0.99,
                 lambda: 0.05,
                 tau: 20.0,
+                filters: vec![],
+                payload_projection_fields: vec![],
             }))
             .await?
             .into_inner();

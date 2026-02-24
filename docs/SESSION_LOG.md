@@ -1,5 +1,107 @@
 # Session Log
 
+## 2026-02-24 (continued, item 14)
+- Goal:
+  - Execute `docs/NEXT.md` item 14 (protobuf payload insert + filter search contract) and validate filtering behavior.
+- Work completed:
+  - Extended `drift_server/proto/drift.proto` with payload and filtering API messages:
+    - `PayloadLobRef`, `PayloadValue`, `PayloadRow`
+    - `PayloadValueList`, `RangeFilter`, `FieldFilter`
+  - Added payload-bearing request/response fields:
+    - `InsertRequest.payload`
+    - `InsertBatchRequest.payload_rows`
+    - `SearchRequest.filters`
+    - `SearchRequest.payload_projection_fields`
+    - `SearchResult.payload`
+  - Wired collection runtime handles needed for filter execution by extending `Collection` with:
+    - `staging`
+    - `persistence`
+    - `bucket_manager`
+  - Added L0 payload lookup helper in core index:
+    - `MemTable::snapshot_payload_rows()`
+    - `VectorIndex::lookup_l0_payload_rows(...)`
+  - Implemented server-side payload handling:
+    - payload-row decoding from protobuf insert APIs
+    - schema inference for payload rows on insert/insert-batch
+    - search filter parsing (`exact`, `any_of`, `range`)
+    - payload row lookup from L1 files + L0 fallback
+    - optional payload projection in search results
+  - Updated all affected request constructors across tests/binaries for new proto fields.
+  - Added integration test:
+    - `server_integration_tests::test_search_field_filters_exact_anyof_range_and_projection`
+- Files changed:
+  - `drift_server/proto/drift.proto`
+  - `drift_server/src/server.rs`
+  - `drift_server/src/manager.rs`
+  - `drift_core/src/memtable.rs`
+  - `drift_core/src/index.rs`
+  - `drift_server/src/server_integration_tests.rs`
+  - `drift_server/src/chaos_test.rs`
+  - `drift_server/src/s3_integration_test.rs`
+  - `drift_server/src/bin/{bench_rw.rs,billion_scale.rs,churn_sim.rs,client.rs,drift.rs,drift_sim.rs}`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+  - `TODO.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server server_integration_tests::tests::test_health_endpoint_reports_ready_and_version`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `cargo test -p drift_server`
+  - `cargo test --workspace`
+  - `cargo run -p drift_server --bin bench_rw -- --total-vectors 10000 --batch-size 1000 --query-count 200 --warmup-queries 20 --dim 128 --k 10`
+- Speed snapshot:
+  - Write throughput: ~18.2k vectors/sec (10k vectors, dim=128, batch=1000)
+  - Write batch latency p50/p95/p99: ~20.4ms / 39.8ms / 39.8ms
+  - Read QPS: ~57 q/s (200 queries, k=10)
+  - Read latency p50/p95/p99: ~17.5ms / 18.7ms / 19.9ms
+- Open issues:
+  - Filter execution currently uses payload row lookup in server path (L1 read + L0 fallback) without index pushdown planning.
+  - Dedicated filtered-search benchmark harness is not yet added.
+- Next steps:
+  - Execute `docs/NEXT.md` item 15 (prepare focused commit).
+  - Start Phase E planner work (candidate pruning + selectivity-based planning).
+
+## 2026-02-24 (continued, item 13)
+- Goal:
+  - Execute `docs/NEXT.md` item 13 (payload preservation in split/merge/scatter rewrite flows).
+- Work completed:
+  - Added payload conversion helpers in `drift_server/src/janitor.rs` for unified<->core payload types.
+  - Added janitor helper `read_bucket_flat_with_payload(...)` to read vectors + payload schema/rows across:
+    - `Local`
+    - `Remote`
+    - `Tiered` (remote then local)
+    - `Promoting` (remote, frozen local, active local)
+  - Updated `perform_split(...)` to:
+    - derive payload rows from source bucket using deterministic `(id, vector)` lookup queues
+    - write child files via `append_batch_with_payload(...)`
+    - reinsert loopback defectors via `insert_batch_with_payload(...)`
+  - Updated `perform_merge(...)` to:
+    - preserve payload schema/rows when merging zombie moves into target buckets
+    - rewrite merged targets via `write_new_file_with_payload(...)`
+    - enforce strict schema/row consistency checks during rewrite
+  - Added new tests:
+    - `janitor_split_test::test_janitor_split_preserves_payload_rows`
+    - `janitor_scatter_merge_test::test_scatter_merge_preserves_payload_rows`
+- Files changed:
+  - `drift_server/src/janitor.rs`
+  - `drift_server/src/janitor_tests.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+  - `TODO.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server janitor_split_test::test_janitor_performs_split_and_updates_manifest`
+  - `cargo test -p drift_server janitor_scatter_merge_test::test_scatter_merge_e2e_small_bucket`
+  - `cargo test -p drift_server janitor_split_test::test_janitor_split_preserves_payload_rows`
+  - `cargo test -p drift_server janitor_scatter_merge_test::test_scatter_merge_preserves_payload_rows`
+  - `cargo test -p drift_server`
+  - `cargo test --workspace`
+- Open issues:
+  - Protobuf API still lacks payload-bearing insert fields and filter search clauses.
+- Next steps:
+  - Execute `docs/NEXT.md` item 14 (`drift_server/proto/drift.proto` payload/filter contract).
+  - After item 14, prepare focused commit as listed in `docs/NEXT.md`.
+
 ## 2026-02-24 (continued)
 - Goal:
   - Execute `docs/NEXT.md` item 11 (ingest/partition payload-row carrier).
