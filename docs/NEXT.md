@@ -48,9 +48,20 @@ Last updated: 2026-02-25
       - `--max-filtered-overhead-ratio`
     - Added optional machine-readable summary output:
       - `--summary-json-path <path>`
-- [ ] 19. Add remaining Phase B E2E durability test.
+- [x] 19. Add remaining Phase B E2E durability test.
   - Goal: verify payload survives `flush -> promote -> recover` lifecycle.
-- [ ] 20. Prepare follow-up commit after items 17-19 are green.
+  - Completed:
+    - Upgraded `server_integration_tests::test_full_lifecycle_flush_promote_recover` to use payload-bearing staging flush.
+    - Promotion now writes payload schema + rows into the remote unified file.
+    - Recovery assertions now verify:
+      - payload schema survives and matches expected schema
+      - payload rows survive for each ID with exact field-value checks
+      - exact-index postings survive (`filter_ids_exact` check for tenant field)
+- [x] 20. Prepare follow-up commit after items 17-19 are green.
+  - Completed:
+    - Ran full workspace regression (`cargo test --workspace`) after item 19 updates.
+    - Confirmed targeted payload durability lifecycle test remains green.
+    - Prepared follow-up commit contents for items 17-19 completion set.
 
 ## Priority Queue
 - [x] 1. Run full workspace regression once before commit.

@@ -1,5 +1,50 @@
 # Session Log
 
+## 2026-02-25 (item 20: follow-up commit preparation after items 17-19)
+- Goal:
+  - Execute `docs/NEXT.md` item 20 by validating green status and preparing follow-up commit scope.
+- Work completed:
+  - Verified item 19 payload durability test remains green after the payload lifecycle assertions were added.
+  - Ran full workspace regression and confirmed all crates pass.
+  - Finalized planning/docs state with item 20 marked complete.
+- Files changed:
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+  - `drift_server/src/server_integration_tests.rs`
+- Commands/tests run:
+  - `cargo test --workspace`
+  - `cargo test -p drift_server server_integration_tests::tests::test_full_lifecycle_flush_promote_recover`
+- Open issues:
+  - None for items 17-20 in this execution queue.
+- Next steps:
+  - If desired, start the next Phase E follow-up (ID-level candidate pushdown for exact-index filters).
+
+## 2026-02-25 (item 19: payload durability E2E for flush->promote->recover)
+- Goal:
+  - Execute `docs/NEXT.md` item 19 by validating payload durability across `flush -> promote -> recover`.
+- Work completed:
+  - Extended `server_integration_tests::test_full_lifecycle_flush_promote_recover` to include payload-bearing data path:
+    - staged flush writes vectors + payload schema + payload rows.
+    - promote step writes remote unified file with payload (`write_remote_bucket_unified_flat_with_payload`).
+    - recovery re-registers remote bucket and preserves payload/index metadata in file.
+  - Added post-recovery payload durability assertions:
+    - recovered payload schema equals expected schema.
+    - recovered payload rows align with IDs and retain exact values for both fields.
+    - recovered exact-index postings validate with `filter_ids_exact` for tenant predicate.
+- Files changed:
+  - `drift_server/src/server_integration_tests.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server server_integration_tests::tests::test_full_lifecycle_flush_promote_recover`
+  - `cargo test -p drift_server`
+- Open issues:
+  - Item 20 (follow-up commit preparation) is still pending.
+  - Phase E ID-level pushdown optimization remains follow-up work.
+- Next steps:
+  - Execute `docs/NEXT.md` item 20 (prepare follow-up commit after items 17-19).
+
 ## 2026-02-25 (item 18: filtered-search benchmark + p95 guardrails)
 - Goal:
   - Execute `docs/NEXT.md` item 18 by adding a targeted filtered-search benchmark phase and regression guardrails.

@@ -19,10 +19,14 @@ mod tests {
     use drift_core::partitioner::PartitionGroup;
     use drift_core::wal::WalWriter;
     use drift_storage::bucket_manager::{BucketManager, StorageClass};
+    use drift_storage::unified_format::{
+        UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadSchema, UnifiedPayloadValue,
+    };
+    use drift_storage::unified_reader::UnifiedReader;
     use drift_storage::unified_writer::UnifiedLocalWriter;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use tempfile::tempdir;
     use tonic::Request;
@@ -464,10 +468,47 @@ mod tests {
         let staging = Arc::new(LocalStagingManager::new(&data_dir).unwrap());
         let op = create_fs_operator(&data_dir);
         let persistence = PersistenceManager::new(op.clone());
+        let payload_schema = UnifiedPayloadSchema::new(vec![
+            UnifiedFieldSchema {
+                field_id: 1,
+                name: "tenant".to_string(),
+                logical_type: UnifiedLogicalType::Keyword,
+                nullable: false,
+                indexed: true,
+            },
+            UnifiedFieldSchema {
+                field_id: 2,
+                name: "score".to_string(),
+                logical_type: UnifiedLogicalType::Int64,
+                nullable: false,
+                indexed: true,
+            },
+        ]);
 
         // A. Flush to Local Staging
         let group = mock_batch(0, 10, dim, 0.0);
-        staging.append_batch(bucket_id, &group).await.unwrap();
+        let payload_rows = group
+            .ids
+            .iter()
+            .map(|id| {
+                BTreeMap::from([
+                    (
+                        1u32,
+                        UnifiedPayloadValue::Keyword(format!("tenant_{}", id % 2)),
+                    ),
+                    (2u32, UnifiedPayloadValue::Int64((*id as i64) * 10)),
+                ])
+            })
+            .collect::<Vec<_>>();
+        staging
+            .append_batch_with_payload(
+                bucket_id,
+                &group,
+                Some(&payload_schema),
+                Some(payload_rows.as_slice()),
+            )
+            .await
+            .unwrap();
 
         manifest
             .apply_atomic(|m| {
@@ -478,12 +519,28 @@ mod tests {
 
         // B. Promote to S3 (Simulating Janitor Logic)
         // 1. Read Local
-        let (local_ids, local_vecs) = staging.read_full_bucket(bucket_id).await.unwrap();
+        let (local_ids, local_flat) = staging.read_full_bucket_flat(bucket_id).await.unwrap();
+        let local_payload_schema = staging
+            .read_full_bucket_payload_schema(bucket_id)
+            .await
+            .unwrap();
+        let local_payload_rows = staging
+            .read_full_bucket_payload_rows(bucket_id)
+            .await
+            .unwrap()
+            .expect("local payload rows should exist before promotion");
 
         // 2. Read Remote (None here)
         // 3. Write New S3 Segment using the new primitive
         let (new_run_id, _) = persistence
-            .write_remote_bucket(bucket_id, &local_ids, &local_vecs, dim)
+            .write_remote_bucket_unified_flat_with_payload(
+                bucket_id,
+                &local_ids,
+                &local_flat,
+                dim,
+                local_payload_schema.as_ref(),
+                Some(local_payload_rows.as_slice()),
+            )
             .await
             .unwrap();
 
@@ -515,6 +572,44 @@ mod tests {
             .expect("Bucket registered");
         assert!(reg_path.contains(&new_run_id));
         assert_eq!(class, StorageClass::Remote);
+
+        let mut reader = UnifiedReader::open(op.clone(), &reg_path).await.unwrap();
+        let (recovered_ids, _) = reader.read_all_vectors_flat().await.unwrap();
+        let recovered_schema = reader
+            .read_payload_schema()
+            .await
+            .unwrap()
+            .expect("payload schema must survive recovery");
+        let recovered_rows = reader.read_payload_rows().await.unwrap();
+
+        assert_eq!(recovered_ids, local_ids);
+        assert_eq!(recovered_schema, payload_schema);
+        assert_eq!(recovered_rows.len(), local_ids.len());
+
+        let by_id: HashMap<u64, BTreeMap<u32, UnifiedPayloadValue>> = recovered_ids
+            .iter()
+            .copied()
+            .zip(recovered_rows.iter().cloned())
+            .collect();
+        for id in &local_ids {
+            let row = by_id
+                .get(id)
+                .unwrap_or_else(|| panic!("missing payload row for id={id}"));
+            assert_eq!(
+                row.get(&1),
+                Some(&UnifiedPayloadValue::Keyword(format!("tenant_{}", id % 2)))
+            );
+            assert_eq!(
+                row.get(&2),
+                Some(&UnifiedPayloadValue::Int64((*id as i64) * 10))
+            );
+        }
+
+        let tenant_one_ids = reader
+            .filter_ids_exact(1, &UnifiedPayloadValue::Keyword("tenant_1".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(tenant_one_ids, vec![1, 3, 5, 7, 9]);
 
         let query = vec![5.0; dim];
         drop(router);
