@@ -117,7 +117,7 @@ On startup:
 
 - Vector retrieval happens before payload filtering, so selective filters can still over-fetch.
 - Candidate expansion (`k * 8`) improves filtered recall but adds read/decode work.
-- Dedicated schema-management RPCs are not yet shipped; schema is currently inferred from writes.
+- Payload schema RPCs are shipped, but schema definitions are currently runtime state (not persisted across restart).
 
 This is the current production mental model and should be treated as the source of truth
 for v3 runtime behavior.

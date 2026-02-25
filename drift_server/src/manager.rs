@@ -9,13 +9,14 @@ use drift_core::index::VectorIndex;
 use drift_core::lock_manager::BucketCoordinator;
 use drift_core::manifest::ManifestWrapper;
 use drift_core::math::Metric;
+use drift_core::payload::PayloadSchema as CorePayloadSchema;
 use drift_core::wal::WalManager;
 use drift_kv::bitstore::BitStore;
 use drift_storage::bucket_manager::BucketManager;
 use drift_traits::StorageEngine;
 use opendal::Operator;
 use opendal::services::Fs;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock as ParkingRwLock};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub struct Collection {
     pub staging: Arc<LocalStagingManager>,
     pub persistence: Arc<PersistenceManager>,
     pub bucket_manager: Arc<BucketManager>,
+    pub payload_schema: Arc<ParkingRwLock<Option<CorePayloadSchema>>>,
     // We hold the handle so it runs in the background. Dropping this struct (e.g. shutdown) will abort it.
     pub janitor_task: tokio::task::JoinHandle<()>,
 }
@@ -529,6 +531,7 @@ impl CollectionManager {
             staging,
             persistence,
             bucket_manager,
+            payload_schema: Arc::new(ParkingRwLock::new(None)),
             janitor_task,
         });
 

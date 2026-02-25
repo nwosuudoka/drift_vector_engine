@@ -152,6 +152,10 @@ impl BucketManager {
             .map(|s| s.version.clone())
     }
 
+    pub fn bucket_count(&self) -> usize {
+        self.registry.read().len()
+    }
+
     pub fn get_location(&self, bucket_id: u32) -> Option<(String, StorageClass)> {
         self.get_version(bucket_id)
             .map(|v| (v.path.clone(), v.class.clone()))

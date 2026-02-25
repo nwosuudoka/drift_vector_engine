@@ -10,6 +10,18 @@ service Drift {
   // Creates (or validates) a collection with explicit metric and dimension.
   rpc CreateCollection (CreateCollectionRequest) returns (CreateCollectionResponse);
 
+  // Create payload schema definitions for a collection.
+  rpc CreatePayloadSchema (CreatePayloadSchemaRequest) returns (PayloadSchemaResponse);
+
+  // Replace existing payload schema definitions for a collection.
+  rpc UpdatePayloadSchema (UpdatePayloadSchemaRequest) returns (PayloadSchemaResponse);
+
+  // Fetch payload schema definitions for a collection.
+  rpc GetPayloadSchema (GetPayloadSchemaRequest) returns (GetPayloadSchemaResponse);
+
+  // Validate payload rows against the currently registered schema.
+  rpc ValidatePayload (ValidatePayloadRequest) returns (ValidatePayloadResponse);
+
   // Inserts a vector into an index.
   rpc Insert (InsertRequest) returns (InsertResponse);
 
@@ -101,6 +113,65 @@ message PayloadValue {
 
 message PayloadRow {
   map<uint32, PayloadValue> fields = 1;
+}
+
+enum PayloadLogicalType {
+  PAYLOAD_LOGICAL_TYPE_UNSPECIFIED = 0;
+  PAYLOAD_LOGICAL_TYPE_BOOL = 1;
+  PAYLOAD_LOGICAL_TYPE_INT64 = 2;
+  PAYLOAD_LOGICAL_TYPE_FLOAT32 = 3;
+  PAYLOAD_LOGICAL_TYPE_FLOAT64 = 4;
+  PAYLOAD_LOGICAL_TYPE_KEYWORD = 5;
+  PAYLOAD_LOGICAL_TYPE_TEXT = 6;
+  PAYLOAD_LOGICAL_TYPE_BYTES = 7;
+  PAYLOAD_LOGICAL_TYPE_TIMESTAMP_MICROS = 8;
+  PAYLOAD_LOGICAL_TYPE_LOB_REF = 9;
+}
+
+message PayloadFieldDefinition {
+  uint32 field_id = 1;
+  string name = 2;
+  PayloadLogicalType logical_type = 3;
+  bool nullable = 4;
+  bool indexed = 5;
+}
+
+message PayloadSchemaDefinition {
+  repeated PayloadFieldDefinition fields = 1;
+}
+
+message CreatePayloadSchemaRequest {
+  string collection_name = 1;
+  PayloadSchemaDefinition schema = 2;
+}
+
+message UpdatePayloadSchemaRequest {
+  string collection_name = 1;
+  PayloadSchemaDefinition schema = 2;
+}
+
+message GetPayloadSchemaRequest {
+  string collection_name = 1;
+}
+
+message PayloadSchemaResponse {
+  bool success = 1;
+  PayloadSchemaDefinition schema = 2;
+}
+
+message GetPayloadSchemaResponse {
+  bool found = 1;
+  PayloadSchemaDefinition schema = 2;
+}
+
+message ValidatePayloadRequest {
+  string collection_name = 1;
+  repeated PayloadRow rows = 2;
+}
+
+message ValidatePayloadResponse {
+  bool valid = 1;
+  repeated string errors = 2;
 }
 
 message InsertRequest {

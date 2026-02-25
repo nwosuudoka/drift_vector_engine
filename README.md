@@ -21,6 +21,7 @@ Search and maintenance operate on this logical view through `BucketManager`.
 - Storage format is strict v3-only (`.driftu`) on read and write paths.
 - Collection metric is explicit at creation time and validated on reopen/reuse.
 - Typed payload rows are stored in unified files alongside vectors.
+- Payload schema management RPCs are available for create/update/get/validate field definitions.
 - Search API supports field filters (`exact`, `any_of`, `range`) and payload projection.
 - Recovery validates payload/index metadata against manifest state and reports diagnostics.
 - Remote reads can use local NVMe full-object cache with fingerprint-aware invalidation.
@@ -183,5 +184,5 @@ cargo run -p drift_server --bin bench_rw --release -- --total-vectors 20000 --qu
 
 - Server/janitor/recovery path is active by default in `drift_server`.
 - Payload-preserving flush/promotion/split/scatter paths are wired.
-- API includes typed payload insert plus field-filtered search and projection.
+- API includes payload schema management, typed payload insert, and field-filtered search with projection.
 - Filter execution is currently post-vector candidate stage (planner/index pushdown is next phase).

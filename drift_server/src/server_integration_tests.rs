@@ -2,8 +2,10 @@
 mod tests {
     use crate::config::{Config, FileConfig, StorageCommand};
     use crate::drift_proto::{
-        CreateCollectionRequest, FieldFilter, HealthRequest, InsertBatchRequest, MetricType,
-        PayloadRow, PayloadValue, PayloadValueList, RangeFilter, SearchRequest, Vector,
+        CreateCollectionRequest, CreatePayloadSchemaRequest, FieldFilter, GetPayloadSchemaRequest,
+        HealthRequest, InsertBatchRequest, InsertRequest, MetricType, PayloadFieldDefinition,
+        PayloadLogicalType, PayloadRow, PayloadSchemaDefinition, PayloadValue, PayloadValueList,
+        RangeFilter, SearchRequest, UpdatePayloadSchemaRequest, ValidatePayloadRequest, Vector,
         drift_server::Drift,
     };
     use crate::local_staging::LocalStagingManager;
@@ -159,10 +161,22 @@ mod tests {
             },
         ];
         let payload_rows = vec![
-            payload_row(vec![(1, payload_keyword("tenant_a")), (2, payload_int64(10))]),
-            payload_row(vec![(1, payload_keyword("tenant_b")), (2, payload_int64(20))]),
-            payload_row(vec![(1, payload_keyword("tenant_a")), (2, payload_int64(30))]),
-            payload_row(vec![(1, payload_keyword("tenant_c")), (2, payload_int64(40))]),
+            payload_row(vec![
+                (1, payload_keyword("tenant_a")),
+                (2, payload_int64(10)),
+            ]),
+            payload_row(vec![
+                (1, payload_keyword("tenant_b")),
+                (2, payload_int64(20)),
+            ]),
+            payload_row(vec![
+                (1, payload_keyword("tenant_a")),
+                (2, payload_int64(30)),
+            ]),
+            payload_row(vec![
+                (1, payload_keyword("tenant_c")),
+                (2, payload_int64(40)),
+            ]),
         ];
 
         service
@@ -252,6 +266,188 @@ mod tests {
             .into_inner();
         let range_ids: Vec<u64> = range.results.iter().map(|r| r.id).collect();
         assert_eq!(range_ids, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_payload_schema_management_and_insert_validation() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            port: 50058,
+            wal_dir: dir.path().join("wal"),
+            data_dir: dir.path().join("data"),
+            default_dim: 2,
+            max_bucket_capacity: 100,
+            ef_construction: 32,
+            ef_search: 32,
+            storage: StorageCommand::File(FileConfig {
+                path: dir.path().join("storage"),
+            }),
+        };
+
+        let service = DriftService {
+            manager: Arc::new(CollectionManager::new(config)),
+        };
+        let collection = "schema_demo";
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                collection_name: collection.to_string(),
+                dim: 2,
+                metric: MetricType::L2 as i32,
+                max_bucket_capacity: 0,
+            }))
+            .await
+            .expect("create_collection should succeed");
+
+        let schema = PayloadSchemaDefinition {
+            fields: vec![
+                PayloadFieldDefinition {
+                    field_id: 1,
+                    name: "tenant".to_string(),
+                    logical_type: PayloadLogicalType::Keyword as i32,
+                    nullable: false,
+                    indexed: true,
+                },
+                PayloadFieldDefinition {
+                    field_id: 2,
+                    name: "rank".to_string(),
+                    logical_type: PayloadLogicalType::Int64 as i32,
+                    nullable: true,
+                    indexed: true,
+                },
+            ],
+        };
+
+        let created = service
+            .create_payload_schema(Request::new(CreatePayloadSchemaRequest {
+                collection_name: collection.to_string(),
+                schema: Some(schema.clone()),
+            }))
+            .await
+            .expect("create_payload_schema should succeed")
+            .into_inner();
+        assert!(created.success);
+        assert_eq!(
+            created
+                .schema
+                .expect("schema should be returned")
+                .fields
+                .len(),
+            2
+        );
+
+        let fetched = service
+            .get_payload_schema(Request::new(GetPayloadSchemaRequest {
+                collection_name: collection.to_string(),
+            }))
+            .await
+            .expect("get_payload_schema should succeed")
+            .into_inner();
+        assert!(fetched.found);
+        assert_eq!(
+            fetched
+                .schema
+                .expect("schema should be present")
+                .fields
+                .len(),
+            2
+        );
+
+        let validation = service
+            .validate_payload(Request::new(ValidatePayloadRequest {
+                collection_name: collection.to_string(),
+                rows: vec![
+                    payload_row(vec![(1, payload_keyword("tenant_a"))]),
+                    payload_row(vec![(1, payload_int64(7))]),
+                ],
+            }))
+            .await
+            .expect("validate_payload should succeed")
+            .into_inner();
+        assert!(!validation.valid);
+        assert!(
+            !validation.errors.is_empty(),
+            "invalid row should produce validation errors"
+        );
+
+        let missing_payload = service
+            .insert(Request::new(InsertRequest {
+                collection_name: collection.to_string(),
+                vector: Some(Vector {
+                    id: 1,
+                    values: vec![0.0, 0.0],
+                }),
+                payload: None,
+            }))
+            .await
+            .expect_err("insert missing required schema field should fail");
+        assert_eq!(missing_payload.code(), tonic::Code::InvalidArgument);
+
+        let wrong_type = service
+            .insert(Request::new(InsertRequest {
+                collection_name: collection.to_string(),
+                vector: Some(Vector {
+                    id: 2,
+                    values: vec![0.1, 0.1],
+                }),
+                payload: Some(payload_row(vec![(1, payload_int64(99))])),
+            }))
+            .await
+            .expect_err("insert with wrong payload type should fail");
+        assert_eq!(wrong_type.code(), tonic::Code::InvalidArgument);
+
+        let updated_schema = PayloadSchemaDefinition {
+            fields: vec![
+                PayloadFieldDefinition {
+                    field_id: 1,
+                    name: "tenant".to_string(),
+                    logical_type: PayloadLogicalType::Keyword as i32,
+                    nullable: true,
+                    indexed: true,
+                },
+                PayloadFieldDefinition {
+                    field_id: 2,
+                    name: "rank".to_string(),
+                    logical_type: PayloadLogicalType::Int64 as i32,
+                    nullable: true,
+                    indexed: true,
+                },
+            ],
+        };
+        service
+            .update_payload_schema(Request::new(UpdatePayloadSchemaRequest {
+                collection_name: collection.to_string(),
+                schema: Some(updated_schema),
+            }))
+            .await
+            .expect("update_payload_schema should succeed");
+
+        service
+            .insert(Request::new(InsertRequest {
+                collection_name: collection.to_string(),
+                vector: Some(Vector {
+                    id: 3,
+                    values: vec![0.3, 0.3],
+                }),
+                payload: None,
+            }))
+            .await
+            .expect("insert without payload should succeed after nullable schema update");
+
+        service
+            .insert(Request::new(InsertRequest {
+                collection_name: collection.to_string(),
+                vector: Some(Vector {
+                    id: 4,
+                    values: vec![0.4, 0.4],
+                }),
+                payload: Some(payload_row(vec![
+                    (1, payload_keyword("tenant_a")),
+                    (2, payload_int64(42)),
+                ])),
+            }))
+            .await
+            .expect("insert with valid payload should succeed");
     }
 
     #[tokio::test]

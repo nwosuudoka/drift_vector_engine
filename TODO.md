@@ -43,7 +43,7 @@
 
 ## Immediate Next Execution Steps (Post-Item 15)
 
-- [ ] 1. Finish remaining Phase D gap: payload schema management API (create/update/validate field definitions).
+- [x] 1. Finish remaining Phase D gap: payload schema management API (create/update/validate field definitions).
 - [ ] 2. Start Phase E performance work: move from vector-first filtering toward filter-aware planning and index pushdown.
 - [ ] 3. Add targeted filtered-search benchmarks and p95 guardrails to track regressions.
 - [ ] 4. Add remaining Phase B E2E durability test: payload survives flush -> promote -> recover.
@@ -74,7 +74,7 @@
 
 ### Phase D: API and Query Surface (`drift.proto` + server handlers)
 
-- [ ] Add payload schema management API (create/update/validate field definitions).
+- [x] Add payload schema management API (create/update/validate field definitions).
 - [x] Add insert/insert-batch payload fields in protobuf API.
 - [x] Add filter DSL to search request (`exact`, `in`, `range`, boolean composition baseline).
 - [x] Add optional payload projection in search response (late materialization path).

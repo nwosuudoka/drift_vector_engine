@@ -30,6 +30,10 @@ Important:
 
 - `Health(HealthRequest) -> HealthResponse`
 - `CreateCollection(CreateCollectionRequest) -> CreateCollectionResponse`
+- `CreatePayloadSchema(CreatePayloadSchemaRequest) -> PayloadSchemaResponse`
+- `UpdatePayloadSchema(UpdatePayloadSchemaRequest) -> PayloadSchemaResponse`
+- `GetPayloadSchema(GetPayloadSchemaRequest) -> GetPayloadSchemaResponse`
+- `ValidatePayload(ValidatePayloadRequest) -> ValidatePayloadResponse`
 - `Insert(InsertRequest) -> InsertResponse`
 - `InsertBatch(InsertBatchRequest) -> InsertResponse`
 - `Search(SearchRequest) -> SearchResponse`
@@ -66,7 +70,33 @@ Payload row is `map<uint32, PayloadValue>` where key = `field_id`.
 - `lob_ref_value` (`blob_key`, `offset`, `length`, optional `fingerprint`)
 - `null_value` (must be `true` when present)
 
-## 5) Insert and InsertBatch
+## 5) Payload schema management
+
+Schema model:
+
+- `PayloadSchemaDefinition` contains `PayloadFieldDefinition[]`.
+- Each field has `field_id`, `name`, `logical_type`, `nullable`, `indexed`.
+
+RPCs:
+
+- `CreatePayloadSchema`:
+  - requires schema to be present and non-empty.
+  - fails with `ALREADY_EXISTS` if schema is already registered.
+- `UpdatePayloadSchema`:
+  - replaces the currently registered schema.
+  - currently requires an empty collection (no buffered/persisted vectors), otherwise `FAILED_PRECONDITION`.
+- `GetPayloadSchema`:
+  - returns `found=false` when no schema is registered.
+- `ValidatePayload`:
+  - validates rows against current schema and returns per-row error strings.
+  - fails with `FAILED_PRECONDITION` if schema is not configured.
+
+Current persistence note:
+
+- payload schema definitions are runtime collection state in current implementation.
+- schema definitions are not yet persisted across server restart.
+
+## 6) Insert and InsertBatch
 
 ### Insert
 
@@ -81,6 +111,7 @@ Validation highlights:
 - payload without vector is rejected (`INVALID_ARGUMENT`).
 - payload value must set a valid oneof kind.
 - `null_value` must be `true` if present.
+- when a payload schema is registered, payload rows are validated against field definitions.
 
 ### InsertBatch
 
@@ -95,13 +126,14 @@ Validation highlights:
 - if `payload_rows` is provided, length must equal `vectors` length.
 - field logical type must be consistent per `field_id` within the request.
 - null-only fields are rejected (at least one typed value required).
+- when a payload schema is registered, each row is validated against that schema.
 
 Schema note:
 
-- There is no separate schema-management RPC yet.
-- Schema is inferred from payload rows submitted with writes.
+- If schema is registered: inserts must satisfy registered definitions.
+- If schema is not registered: schema is inferred from payload rows in each request.
 
-## 6) Search with filters and payload projection
+## 7) Search with filters and payload projection
 
 `SearchRequest`:
 
@@ -158,13 +190,14 @@ When filters or projection are requested, server expands candidate count before 
 
 Filtering/projection currently happens after vector candidate retrieval.
 
-## 7) Error mapping
+## 8) Error mapping
 
 - Validation issues -> `INVALID_ARGUMENT`
 - Missing collection or missing resources -> `NOT_FOUND`
+- Precondition failures (for example missing schema or non-empty collection during schema update) -> `FAILED_PRECONDITION`
 - Internal IO/engine failures -> `INTERNAL`
 
-## 8) grpcurl quickstart examples
+## 9) grpcurl quickstart examples
 
 All examples assume server at `127.0.0.1:50051`.
 Use `-plaintext` for local non-TLS testing.
@@ -194,6 +227,54 @@ grpcurl -plaintext \
   }' \
   127.0.0.1:50051 \
   drift.Drift/CreateCollection
+```
+
+Create payload schema:
+
+```bash
+grpcurl -plaintext \
+  -import-path drift_server/proto \
+  -proto drift.proto \
+  -d '{
+    "collectionName": "products",
+    "schema": {
+      "fields": [
+        {
+          "fieldId": 1,
+          "name": "tenant",
+          "logicalType": "PAYLOAD_LOGICAL_TYPE_KEYWORD",
+          "nullable": false,
+          "indexed": true
+        },
+        {
+          "fieldId": 2,
+          "name": "price",
+          "logicalType": "PAYLOAD_LOGICAL_TYPE_FLOAT64",
+          "nullable": true,
+          "indexed": true
+        }
+      ]
+    }
+  }' \
+  127.0.0.1:50051 \
+  drift.Drift/CreatePayloadSchema
+```
+
+Validate payload rows:
+
+```bash
+grpcurl -plaintext \
+  -import-path drift_server/proto \
+  -proto drift.proto \
+  -d '{
+    "collectionName": "products",
+    "rows": [
+      { "fields": { "1": { "keywordValue": "tenant_a" }, "2": { "float64Value": 19.99 } } },
+      { "fields": { "1": { "int64Value": "7" } } }
+    ]
+  }' \
+  127.0.0.1:50051 \
+  drift.Drift/ValidatePayload
 ```
 
 Insert one vector with payload:
@@ -289,7 +370,7 @@ grpcurl -plaintext \
   drift.Drift/Search
 ```
 
-## 9) CLI note
+## 10) CLI note
 
 `cargo run -p drift_server --bin drift -- --help` is useful for basic vector flows, but it does
 not yet expose payload/filter/projection arguments. For those features, use gRPC clients directly.

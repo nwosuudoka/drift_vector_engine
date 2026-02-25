@@ -1,5 +1,62 @@
 # Session Log
 
+## 2026-02-25 (item 16: payload schema management API)
+- Goal:
+  - Implement remaining Phase D gap: payload schema management API (create/update/get/validate field definitions) and enforce schema validation on ingest paths.
+- Work completed:
+  - Extended protobuf API contract in `drift_server/proto/drift.proto`:
+    - Added RPCs:
+      - `CreatePayloadSchema`
+      - `UpdatePayloadSchema`
+      - `GetPayloadSchema`
+      - `ValidatePayload`
+    - Added schema definition messages:
+      - `PayloadLogicalType`
+      - `PayloadFieldDefinition`
+      - `PayloadSchemaDefinition`
+      - request/response messages for schema CRUD + validation
+  - Added collection-level payload schema registry in manager state.
+  - Implemented server-side schema conversion + validation helpers:
+    - proto logical type <-> core logical type mapping
+    - proto schema <-> core schema mapping
+    - row validation against configured schema (unknown fields, nullability, type mismatches)
+  - Wired new RPC handlers in `drift_server/src/server.rs`.
+  - Enforced schema-aware ingestion:
+    - `Insert`, `InsertBatch`, and `Train` now validate rows against configured schema when present.
+    - Added explicit precondition for `UpdatePayloadSchema`: collection must be empty (no buffered or persisted vectors) to avoid unsafe mixed-schema state.
+  - Added integration coverage:
+    - `server_integration_tests::test_payload_schema_management_and_insert_validation`
+  - Updated docs to reflect new API:
+    - `README.md`
+    - `SYSTEM_VIEW.md`
+    - `docs/API_SPEC.md`
+    - planning docs (`docs/NEXT.md`, `TODO.md`)
+- Files changed:
+  - `drift_server/proto/drift.proto`
+  - `drift_server/src/server.rs`
+  - `drift_server/src/manager.rs`
+  - `drift_server/src/server_integration_tests.rs`
+  - `drift_storage/src/bucket_manager.rs`
+  - `README.md`
+  - `SYSTEM_VIEW.md`
+  - `docs/API_SPEC.md`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+  - `TODO.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server server_integration_tests::tests::test_payload_schema_management_and_insert_validation`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `cargo test -p drift_server`
+  - `cargo test -p drift_storage`
+  - `cargo test --workspace`
+- Open issues:
+  - Payload schema definitions are runtime state and are not yet persisted across restart.
+  - Phase E filter-aware planner/index pushdown work is not started yet.
+- Next steps:
+  - Execute `docs/NEXT.md` item 17 (filter-aware planning and index pushdown).
+  - Execute `docs/NEXT.md` item 18 (filtered-search benchmark + p95 guardrails).
+
 ## 2026-02-25 (docs sync: API/system view)
 - Goal:
   - Update system view and README to reflect the current payload/filter API, and add a developer API spec sheet.

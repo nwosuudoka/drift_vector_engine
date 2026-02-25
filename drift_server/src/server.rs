@@ -1,7 +1,10 @@
 use crate::drift_proto::{
-    CreateCollectionRequest, CreateCollectionResponse, FieldFilter, InsertBatchRequest,
-    InsertRequest, MetricType, PayloadRow, PayloadValue, SearchRequest, SearchResponse,
-    SearchResult, drift_server::Drift,
+    CreateCollectionRequest, CreateCollectionResponse, CreatePayloadSchemaRequest, FieldFilter,
+    GetPayloadSchemaRequest, GetPayloadSchemaResponse, InsertBatchRequest, InsertRequest,
+    MetricType, PayloadFieldDefinition, PayloadLogicalType, PayloadRow, PayloadSchemaDefinition,
+    PayloadSchemaResponse, PayloadValue, SearchRequest, SearchResponse, SearchResult,
+    UpdatePayloadSchemaRequest, ValidatePayloadRequest, ValidatePayloadResponse,
+    drift_server::Drift,
 };
 use crate::drift_proto::{
     HealthRequest, HealthResponse, InsertResponse, NvmeCacheMetrics, RecoveryGuardMetrics,
@@ -239,6 +242,188 @@ fn infer_core_payload_schema(rows: &[CorePayloadRow]) -> Result<Option<CorePaylo
     }
 
     Ok(Some(CorePayloadSchema::new(fields)))
+}
+
+fn payload_logical_type_from_proto(logical_type: i32) -> Result<CorePayloadLogicalType, Status> {
+    let parsed = PayloadLogicalType::try_from(logical_type).map_err(|_| {
+        Status::invalid_argument(format!(
+            "unknown payload logical type enum value: {}",
+            logical_type
+        ))
+    })?;
+    match parsed {
+        PayloadLogicalType::Bool => Ok(CorePayloadLogicalType::Bool),
+        PayloadLogicalType::Int64 => Ok(CorePayloadLogicalType::Int64),
+        PayloadLogicalType::Float32 => Ok(CorePayloadLogicalType::Float32),
+        PayloadLogicalType::Float64 => Ok(CorePayloadLogicalType::Float64),
+        PayloadLogicalType::Keyword => Ok(CorePayloadLogicalType::Keyword),
+        PayloadLogicalType::Text => Ok(CorePayloadLogicalType::Text),
+        PayloadLogicalType::Bytes => Ok(CorePayloadLogicalType::Bytes),
+        PayloadLogicalType::TimestampMicros => Ok(CorePayloadLogicalType::TimestampMicros),
+        PayloadLogicalType::LobRef => Ok(CorePayloadLogicalType::LobRef),
+        PayloadLogicalType::Unspecified => Err(Status::invalid_argument(
+            "payload logical type must be specified",
+        )),
+    }
+}
+
+fn payload_logical_type_to_proto(logical_type: &CorePayloadLogicalType) -> i32 {
+    match logical_type {
+        CorePayloadLogicalType::Bool => PayloadLogicalType::Bool as i32,
+        CorePayloadLogicalType::Int64 => PayloadLogicalType::Int64 as i32,
+        CorePayloadLogicalType::Float32 => PayloadLogicalType::Float32 as i32,
+        CorePayloadLogicalType::Float64 => PayloadLogicalType::Float64 as i32,
+        CorePayloadLogicalType::Keyword => PayloadLogicalType::Keyword as i32,
+        CorePayloadLogicalType::Text => PayloadLogicalType::Text as i32,
+        CorePayloadLogicalType::Bytes => PayloadLogicalType::Bytes as i32,
+        CorePayloadLogicalType::TimestampMicros => PayloadLogicalType::TimestampMicros as i32,
+        CorePayloadLogicalType::LobRef => PayloadLogicalType::LobRef as i32,
+    }
+}
+
+fn payload_logical_type_label(logical_type: &CorePayloadLogicalType) -> &'static str {
+    match logical_type {
+        CorePayloadLogicalType::Bool => "bool",
+        CorePayloadLogicalType::Int64 => "int64",
+        CorePayloadLogicalType::Float32 => "float32",
+        CorePayloadLogicalType::Float64 => "float64",
+        CorePayloadLogicalType::Keyword => "keyword",
+        CorePayloadLogicalType::Text => "text",
+        CorePayloadLogicalType::Bytes => "bytes",
+        CorePayloadLogicalType::TimestampMicros => "timestamp_micros",
+        CorePayloadLogicalType::LobRef => "lob_ref",
+    }
+}
+
+fn core_payload_schema_to_proto(schema: &CorePayloadSchema) -> PayloadSchemaDefinition {
+    let fields = schema
+        .fields
+        .iter()
+        .map(|field| PayloadFieldDefinition {
+            field_id: field.field_id,
+            name: field.name.clone(),
+            logical_type: payload_logical_type_to_proto(&field.logical_type),
+            nullable: field.nullable,
+            indexed: field.indexed,
+        })
+        .collect();
+    PayloadSchemaDefinition { fields }
+}
+
+fn validate_core_payload_schema(schema: &CorePayloadSchema) -> Result<(), Status> {
+    if schema.fields.is_empty() {
+        return Err(Status::invalid_argument(
+            "payload schema must include at least one field definition",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(schema.fields.len());
+    for field in &schema.fields {
+        if !seen.insert(field.field_id) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate payload field_id {} in schema definition",
+                field.field_id
+            )));
+        }
+        if field.name.trim().is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "payload field {} has empty name",
+                field.field_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn proto_payload_schema_to_core(
+    schema: PayloadSchemaDefinition,
+) -> Result<CorePayloadSchema, Status> {
+    if schema.fields.is_empty() {
+        return Err(Status::invalid_argument(
+            "payload schema must include at least one field definition",
+        ));
+    }
+
+    let mut fields = Vec::with_capacity(schema.fields.len());
+    for field in schema.fields {
+        let logical_type = payload_logical_type_from_proto(field.logical_type)?;
+        let name = if field.name.trim().is_empty() {
+            format!("field_{}", field.field_id)
+        } else {
+            field.name
+        };
+        fields.push(CorePayloadFieldSchema {
+            field_id: field.field_id,
+            name,
+            logical_type,
+            nullable: field.nullable,
+            indexed: field.indexed,
+        });
+    }
+    fields.sort_by_key(|field| field.field_id);
+    let schema = CorePayloadSchema::new(fields);
+    validate_core_payload_schema(&schema)?;
+    Ok(schema)
+}
+
+fn validate_payload_rows_against_schema(
+    rows: &[CorePayloadRow],
+    schema: &CorePayloadSchema,
+) -> Vec<String> {
+    let field_by_id: HashMap<u32, &CorePayloadFieldSchema> = schema
+        .fields
+        .iter()
+        .map(|field| (field.field_id, field))
+        .collect();
+    let mut errors = Vec::new();
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        for field_id in row.keys() {
+            if !field_by_id.contains_key(field_id) {
+                errors.push(format!(
+                    "row {} contains unknown field_id {}",
+                    row_idx, field_id
+                ));
+            }
+        }
+
+        for field in &schema.fields {
+            let Some(value) = row.get(&field.field_id) else {
+                if !field.nullable {
+                    errors.push(format!(
+                        "row {} missing non-nullable field_id {} ({})",
+                        row_idx, field.field_id, field.name
+                    ));
+                }
+                continue;
+            };
+
+            if matches!(value, CorePayloadValue::Null) {
+                if !field.nullable {
+                    errors.push(format!(
+                        "row {} has null for non-nullable field_id {} ({})",
+                        row_idx, field.field_id, field.name
+                    ));
+                }
+                continue;
+            }
+
+            let Some(actual_type) = core_payload_value_logical_type(value) else {
+                continue;
+            };
+            if actual_type != field.logical_type {
+                errors.push(format!(
+                    "row {} field_id {} ({}) type mismatch: expected {}, got {}",
+                    row_idx,
+                    field.field_id,
+                    field.name,
+                    payload_logical_type_label(&field.logical_type),
+                    payload_logical_type_label(&actual_type)
+                ));
+            }
+        }
+    }
+
+    errors
 }
 
 fn proto_payload_row_to_core(row: PayloadRow) -> Result<CorePayloadRow, Status> {
@@ -639,6 +824,138 @@ impl Drift for DriftService {
         Ok(Response::new(CreateCollectionResponse { success: true }))
     }
 
+    async fn create_payload_schema(
+        &self,
+        request: Request<CreatePayloadSchemaRequest>,
+    ) -> Result<Response<PayloadSchemaResponse>, Status> {
+        let req = request.into_inner();
+        if req.collection_name.trim().is_empty() {
+            return Err(Status::invalid_argument("collection_name cannot be empty"));
+        }
+        let schema_req = req
+            .schema
+            .ok_or_else(|| Status::invalid_argument("schema is required"))?;
+        let schema = proto_payload_schema_to_core(schema_req)?;
+
+        let collection = self
+            .manager
+            .get_or_create(&req.collection_name, None, None, None)
+            .await
+            .map_err(map_collection_error)?;
+
+        {
+            let mut guard = collection.payload_schema.write();
+            if guard.is_some() {
+                return Err(Status::already_exists(
+                    "payload schema already exists; use UpdatePayloadSchema",
+                ));
+            }
+            *guard = Some(schema.clone());
+        }
+
+        Ok(Response::new(PayloadSchemaResponse {
+            success: true,
+            schema: Some(core_payload_schema_to_proto(&schema)),
+        }))
+    }
+
+    async fn update_payload_schema(
+        &self,
+        request: Request<UpdatePayloadSchemaRequest>,
+    ) -> Result<Response<PayloadSchemaResponse>, Status> {
+        let req = request.into_inner();
+        if req.collection_name.trim().is_empty() {
+            return Err(Status::invalid_argument("collection_name cannot be empty"));
+        }
+        let schema_req = req
+            .schema
+            .ok_or_else(|| Status::invalid_argument("schema is required"))?;
+        let schema = proto_payload_schema_to_core(schema_req)?;
+
+        let collection = self
+            .manager
+            .get_or_create(&req.collection_name, None, None, None)
+            .await
+            .map_err(map_collection_error)?;
+
+        if collection.index.memtable_len() > 0
+            || collection.index.get_frozen_count() > 0
+            || collection.bucket_manager.bucket_count() > 0
+        {
+            return Err(Status::failed_precondition(
+                "updating payload schema requires an empty collection (no buffered or persisted vectors)",
+            ));
+        }
+
+        {
+            let mut guard = collection.payload_schema.write();
+            if guard.is_none() {
+                return Err(Status::not_found(
+                    "payload schema does not exist; use CreatePayloadSchema first",
+                ));
+            }
+            *guard = Some(schema.clone());
+        }
+
+        Ok(Response::new(PayloadSchemaResponse {
+            success: true,
+            schema: Some(core_payload_schema_to_proto(&schema)),
+        }))
+    }
+
+    async fn get_payload_schema(
+        &self,
+        request: Request<GetPayloadSchemaRequest>,
+    ) -> Result<Response<GetPayloadSchemaResponse>, Status> {
+        let req = request.into_inner();
+        if req.collection_name.trim().is_empty() {
+            return Err(Status::invalid_argument("collection_name cannot be empty"));
+        }
+
+        let collection = self
+            .manager
+            .get_or_create(&req.collection_name, None, None, None)
+            .await
+            .map_err(map_collection_error)?;
+        let schema = collection.payload_schema.read().clone();
+
+        Ok(Response::new(GetPayloadSchemaResponse {
+            found: schema.is_some(),
+            schema: schema.as_ref().map(core_payload_schema_to_proto),
+        }))
+    }
+
+    async fn validate_payload(
+        &self,
+        request: Request<ValidatePayloadRequest>,
+    ) -> Result<Response<ValidatePayloadResponse>, Status> {
+        let req = request.into_inner();
+        if req.collection_name.trim().is_empty() {
+            return Err(Status::invalid_argument("collection_name cannot be empty"));
+        }
+        let collection = self
+            .manager
+            .get_or_create(&req.collection_name, None, None, None)
+            .await
+            .map_err(map_collection_error)?;
+        let Some(schema) = collection.payload_schema.read().clone() else {
+            return Err(Status::failed_precondition(
+                "payload schema is not configured for collection",
+            ));
+        };
+
+        let mut rows = Vec::with_capacity(req.rows.len());
+        for row in req.rows {
+            rows.push(proto_payload_row_to_core(row)?);
+        }
+        let errors = validate_payload_rows_against_schema(rows.as_slice(), &schema);
+
+        Ok(Response::new(ValidatePayloadResponse {
+            valid: errors.is_empty(),
+            errors,
+        }))
+    }
+
     async fn train(
         &self,
         request: Request<TrainRequest>,
@@ -657,12 +974,27 @@ impl Drift for DriftService {
         let batch: Vec<(u64, Vec<f32>)> =
             req.vectors.into_iter().map(|v| (v.id, v.values)).collect();
 
-        // Treat training data as just another batch of inserts.
-        // The Janitor will see the volume and trigger training automatically.
-        collection
-            .index
-            .insert_batch_with_payload(&batch, None, None)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        if let Some(schema) = collection.payload_schema.read().clone() {
+            let payload_rows = vec![BTreeMap::new(); batch.len()];
+            let errors = validate_payload_rows_against_schema(payload_rows.as_slice(), &schema);
+            if !errors.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "payload validation failed: {}",
+                    errors.join("; ")
+                )));
+            }
+            collection
+                .index
+                .insert_batch_with_payload(&batch, Some(&schema), Some(payload_rows.as_slice()))
+                .map_err(|e| Status::internal(e.to_string()))?;
+        } else {
+            // Treat training data as just another batch of inserts.
+            // The Janitor will see the volume and trigger training automatically.
+            collection
+                .index
+                .insert_batch_with_payload(&batch, None, None)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
 
         Ok(Response::new(TrainResponse { success: true }))
     }
@@ -688,12 +1020,34 @@ impl Drift for DriftService {
             .map_err(map_collection_error)?;
 
         if let Some(vec) = req.vector {
+            let configured_schema = collection.payload_schema.read().clone();
             let payload_row = req.payload.map(proto_payload_row_to_core).transpose()?;
-            let payload_row = payload_row.filter(|row| !row.is_empty());
-            let payload_schema = if let Some(row) = payload_row.as_ref() {
-                infer_core_payload_schema(std::slice::from_ref(row))?
+            let payload_row = payload_row.unwrap_or_default();
+
+            let (payload_schema, payload_row_for_insert) = if let Some(schema) = configured_schema {
+                let errors = validate_payload_rows_against_schema(
+                    std::slice::from_ref(&payload_row),
+                    &schema,
+                );
+                if !errors.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "payload validation failed: {}",
+                        errors.join("; ")
+                    )));
+                }
+                (Some(schema), Some(payload_row))
             } else {
-                None
+                let payload_row = if payload_row.is_empty() {
+                    None
+                } else {
+                    Some(payload_row)
+                };
+                let payload_schema = if let Some(row) = payload_row.as_ref() {
+                    infer_core_payload_schema(std::slice::from_ref(row))?
+                } else {
+                    None
+                };
+                (payload_schema, payload_row)
             };
 
             collection
@@ -702,7 +1056,7 @@ impl Drift for DriftService {
                     vec.id,
                     &vec.values,
                     payload_schema.as_ref(),
-                    payload_row.as_ref(),
+                    payload_row_for_insert.as_ref(),
                 )
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
@@ -737,36 +1091,63 @@ impl Drift for DriftService {
             return Ok(Response::new(InsertResponse { success: true }));
         }
 
-        if req.payload_rows.is_empty() {
+        let configured_schema = collection.payload_schema.read().clone();
+        if let Some(schema) = configured_schema {
+            let payload_rows = if req.payload_rows.is_empty() {
+                vec![BTreeMap::new(); batch.len()]
+            } else {
+                let mut rows: Vec<CorePayloadRow> = Vec::with_capacity(req.payload_rows.len());
+                for row in req.payload_rows {
+                    rows.push(proto_payload_row_to_core(row)?);
+                }
+                rows
+            };
+
+            let errors = validate_payload_rows_against_schema(payload_rows.as_slice(), &schema);
+            if !errors.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "payload validation failed: {}",
+                    errors.join("; ")
+                )));
+            }
+
             collection
                 .index
-                .insert_batch_with_payload(&batch, None, None)
+                .insert_batch_with_payload(&batch, Some(&schema), Some(payload_rows.as_slice()))
                 .map_err(|e| Status::internal(e.to_string()))?;
         } else {
-            let mut payload_rows: Vec<CorePayloadRow> = Vec::with_capacity(req.payload_rows.len());
-            for row in req.payload_rows {
-                payload_rows.push(proto_payload_row_to_core(row)?);
-            }
-            let payload_schema = infer_core_payload_schema(&payload_rows)?;
-            if payload_schema.is_none() && payload_rows.iter().any(|row| !row.is_empty()) {
-                return Err(Status::invalid_argument(
-                    "unable to infer payload schema for non-empty payload rows",
-                ));
-            }
-            if payload_schema.is_none() {
+            if req.payload_rows.is_empty() {
                 collection
                     .index
                     .insert_batch_with_payload(&batch, None, None)
                     .map_err(|e| Status::internal(e.to_string()))?;
             } else {
-                collection
-                    .index
-                    .insert_batch_with_payload(
-                        &batch,
-                        payload_schema.as_ref(),
-                        Some(payload_rows.as_slice()),
-                    )
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let mut payload_rows: Vec<CorePayloadRow> =
+                    Vec::with_capacity(req.payload_rows.len());
+                for row in req.payload_rows {
+                    payload_rows.push(proto_payload_row_to_core(row)?);
+                }
+                let payload_schema = infer_core_payload_schema(&payload_rows)?;
+                if payload_schema.is_none() && payload_rows.iter().any(|row| !row.is_empty()) {
+                    return Err(Status::invalid_argument(
+                        "unable to infer payload schema for non-empty payload rows",
+                    ));
+                }
+                if payload_schema.is_none() {
+                    collection
+                        .index
+                        .insert_batch_with_payload(&batch, None, None)
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                } else {
+                    collection
+                        .index
+                        .insert_batch_with_payload(
+                            &batch,
+                            payload_schema.as_ref(),
+                            Some(payload_rows.as_slice()),
+                        )
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
             }
         }
 
