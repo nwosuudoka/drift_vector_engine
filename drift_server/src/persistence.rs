@@ -47,6 +47,10 @@ impl PersistenceManager {
         Self { op }
     }
 
+    pub fn operator(&self) -> Operator {
+        self.op.clone()
+    }
+
     pub fn remote_bucket_path(&self, bucket_id: u32, run_id: &str) -> String {
         format!("bucket_{}_{}.driftu", bucket_id, run_id)
     }

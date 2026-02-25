@@ -1,5 +1,84 @@
 # Session Log
 
+## 2026-02-25 (item 18: filtered-search benchmark + p95 guardrails)
+- Goal:
+  - Execute `docs/NEXT.md` item 18 by adding a targeted filtered-search benchmark phase and regression guardrails.
+- Work completed:
+  - Extended `drift_server/src/bin/bench_rw.rs` to benchmark both:
+    - baseline unfiltered search latency/QPS
+    - filtered search latency/QPS using payload-backed exact filter predicates
+  - Updated ingest workload in benchmark to include payload rows per vector:
+    - field `1`: tenant keyword (`tenant_<bucket>`)
+    - field `2`: numeric value (`int64` id)
+  - Added filtered workload controls:
+    - `--filtered-query-count`
+    - `--filtered-warmup-queries`
+    - `--filter-cardinality`
+    - `--filtered-projection`
+  - Added p95 regression guardrails with hard-fail behavior (non-zero exit):
+    - `--max-unfiltered-p95-ms`
+    - `--max-filtered-p95-ms`
+    - `--max-filtered-overhead-ratio`
+  - Added optional JSON summary export (`--summary-json-path`) for CI/perf tracking.
+  - Verified both guardrail behaviors:
+    - intentional fail case with strict ratio limit
+    - pass case with relaxed ratio limit + summary export.
+- Files changed:
+  - `drift_server/src/bin/bench_rw.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo run -p drift_server --bin bench_rw -- --help`
+  - `cargo run -p drift_server --bin bench_rw -- --dim 32 --total-vectors 4000 --batch-size 500 --query-count 60 --warmup-queries 10 --filtered-query-count 60 --filtered-warmup-queries 10 --filter-cardinality 32 --k 10 --max-unfiltered-p95-ms 200 --max-filtered-p95-ms 350 --max-filtered-overhead-ratio 2.5 --summary-json-path /tmp/bench_rw_filtered_summary.json`
+  - `cargo run -p drift_server --bin bench_rw -- --dim 32 --total-vectors 4000 --batch-size 500 --query-count 60 --warmup-queries 10 --filtered-query-count 60 --filtered-warmup-queries 10 --filter-cardinality 32 --k 10 --max-unfiltered-p95-ms 200 --max-filtered-p95-ms 350 --max-filtered-overhead-ratio 8.0 --summary-json-path /tmp/bench_rw_filtered_summary.json`
+  - `cargo test -p drift_server`
+- Open issues:
+  - Guardrail thresholds are workload/hardware-dependent and should be calibrated per environment.
+  - Benchmark currently uses exact-filter workload only; range-filter microbench remains future enhancement.
+- Next steps:
+  - Execute `docs/NEXT.md` item 19 (payload durability E2E for `flush -> promote -> recover`).
+  - Consider Phase E follow-up for ID-level exact-index candidate pushdown.
+
+## 2026-02-25 (item 17: filter-aware bucket planning + metadata pushdown start)
+- Goal:
+  - Execute `docs/NEXT.md` item 17 by introducing filter-aware planning and storage metadata pushdown in the search path.
+- Work completed:
+  - Added `VectorIndex` planning/search hooks in `drift_core/src/index.rs`:
+    - `select_buckets(...)`
+    - `search_with_bucket_hint(...)`
+    - existing `search(...)` now delegates to the bucket-hint path.
+  - Added server-side metadata planner in `drift_server/src/server.rs`:
+    - plans a pruned bucket subset before disk search when filters are present.
+    - uses exact-index postings for non-null `exact` and `any_of` conditions.
+    - uses payload stats (`min`/`max` overlap by chunk) for `range` conditions.
+  - Preserved correctness-first behavior:
+    - final `row_matches_filters(...)` evaluation is unchanged.
+    - metadata probe failures fall back to keeping buckets (conservative, no false-negative pruning).
+  - Added `PersistenceManager::operator()` accessor in `drift_server/src/persistence.rs` to enable remote metadata probes.
+- Files changed:
+  - `drift_core/src/index.rs`
+  - `drift_core/src/index_tests.rs`
+  - `drift_server/src/server.rs`
+  - `drift_server/src/persistence.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `cargo fmt --all`
+  - `cargo test -p drift_server`
+  - `cargo test -p drift_core index_tests::tests::test_two_stage_search_l0_l1_integration`
+  - `cargo fmt --all`
+  - `cargo test -p drift_core index_tests::tests::test_search_with_bucket_hint_limits_disk_scan_scope`
+- Open issues:
+  - Planner currently prunes at bucket granularity only; ID-level candidate pushdown is not yet implemented.
+  - Pushdown is intentionally conservative for null-inclusive `exact`/`any_of` filters.
+  - Item 18 benchmark and p95 regression guardrails are still pending.
+- Next steps:
+  - Execute `docs/NEXT.md` item 18 (filtered-search benchmark + p95 guardrails).
+  - Extend Phase E with ID-level pushdown path for exact postings when selectivity is high.
+
 ## 2026-02-25 (item 16: payload schema management API)
 - Goal:
   - Implement remaining Phase D gap: payload schema management API (create/update/get/validate field definitions) and enforce schema validation on ingest paths.

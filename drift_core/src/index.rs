@@ -303,12 +303,32 @@ impl VectorIndex {
         lambda: f32,
         tau: f32,
     ) -> io::Result<Vec<(u64, f32)>> {
+        self.search_with_bucket_hint(query, k, target, lambda, tau, None)
+            .await
+    }
+
+    pub fn select_buckets(&self, query: &[f32], target: f32, lambda: f32, tau: f32) -> Vec<u32> {
+        let router = self.router.read();
+        router.select_buckets(query, target, lambda, tau)
+    }
+
+    pub async fn search_with_bucket_hint(
+        &self,
+        query: &[f32],
+        k: usize,
+        target: f32,
+        lambda: f32,
+        tau: f32,
+        bucket_hint: Option<&[u32]>,
+    ) -> io::Result<Vec<(u64, f32)>> {
         let (bucket_ids, metric) = {
             let router = self.router.read();
-            (
-                router.select_buckets(query, target, lambda, tau),
-                router.metric(),
-            )
+            let mut selected = router.select_buckets(query, target, lambda, tau);
+            if let Some(hint) = bucket_hint {
+                let allowed: HashSet<u32> = hint.iter().copied().collect();
+                selected.retain(|id| allowed.contains(id));
+            }
+            (selected, router.metric())
         };
 
         let (ram_tables, l0_view) = {

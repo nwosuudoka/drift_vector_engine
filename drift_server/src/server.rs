@@ -20,7 +20,12 @@ use drift_core::payload::{
 };
 use drift_storage::bucket_manager::StorageClass;
 use drift_storage::disk_manager::DiskManager;
-use drift_storage::unified_format::{UnifiedLobRef, UnifiedPayloadRow, UnifiedPayloadValue};
+use drift_storage::unified_format::{
+    UnifiedLobRef, UnifiedPayloadFieldStats, UnifiedPayloadRow, UnifiedPayloadStatsChunk,
+    UnifiedPayloadValue,
+};
+use drift_storage::unified_reader::UnifiedReader;
+use opendal::{Operator, services};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -700,6 +705,274 @@ fn payload_sources_for_class(class: &StorageClass, primary_path: &str) -> Vec<Pa
     }
 }
 
+fn create_staging_operator(collection: &Collection) -> io::Result<Operator> {
+    let root = collection
+        .staging
+        .get_base_path()
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid staging path"))?;
+    let builder = services::Fs::default().root(root);
+    Ok(Operator::new(builder).map_err(io::Error::other)?.finish())
+}
+
+fn range_filter_overlaps_field_stats(
+    stats: &UnifiedPayloadFieldStats,
+    row_count: u32,
+    lower: Option<&UnifiedPayloadValue>,
+    lower_inclusive: bool,
+    upper: Option<&UnifiedPayloadValue>,
+    upper_inclusive: bool,
+) -> bool {
+    if stats.null_count >= row_count {
+        return false;
+    }
+
+    let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
+        // Keep the bucket/source if stats are partial; final row-level evaluation remains authoritative.
+        return true;
+    };
+
+    if let Some(lower_bound) = lower {
+        let Some(ordering) = compare_payload_values(max, lower_bound) else {
+            return false;
+        };
+        if lower_inclusive {
+            if ordering == Ordering::Less {
+                return false;
+            }
+        } else if ordering != Ordering::Greater {
+            return false;
+        }
+    }
+
+    if let Some(upper_bound) = upper {
+        let Some(ordering) = compare_payload_values(min, upper_bound) else {
+            return false;
+        };
+        if upper_inclusive {
+            if ordering == Ordering::Greater {
+                return false;
+            }
+        } else if ordering != Ordering::Less {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn range_filter_might_match_chunk(
+    chunk: &UnifiedPayloadStatsChunk,
+    field_id: u32,
+    lower: Option<&UnifiedPayloadValue>,
+    lower_inclusive: bool,
+    upper: Option<&UnifiedPayloadValue>,
+    upper_inclusive: bool,
+) -> bool {
+    let Some(stats) = chunk.fields.iter().find(|f| f.field_id == field_id) else {
+        return false;
+    };
+    range_filter_overlaps_field_stats(
+        stats,
+        chunk.row_count,
+        lower,
+        lower_inclusive,
+        upper,
+        upper_inclusive,
+    )
+}
+
+async fn source_might_match_filters(
+    reader: &UnifiedReader,
+    filters: &[ParsedFilter],
+) -> io::Result<bool> {
+    if filters.is_empty() {
+        return Ok(true);
+    }
+
+    let schema = reader.read_payload_schema().await?;
+    let needs_range_stats = filters
+        .iter()
+        .any(|filter| matches!(filter, ParsedFilter::Range { .. }));
+    let payload_stats = if needs_range_stats {
+        let stats = reader.read_payload_stats().await?;
+        if stats.is_empty() { None } else { Some(stats) }
+    } else {
+        None
+    };
+
+    for filter in filters {
+        match filter {
+            ParsedFilter::Exact { field_id, value } => {
+                if matches!(value, UnifiedPayloadValue::Null) {
+                    continue;
+                }
+
+                let Some(schema) = schema.as_ref() else {
+                    return Ok(false);
+                };
+                let Some(field) = schema.fields.iter().find(|f| f.field_id == *field_id) else {
+                    return Ok(false);
+                };
+
+                if !field.indexed {
+                    continue;
+                }
+
+                let exact = reader.filter_ids_exact(*field_id, value).await?;
+                if exact.is_empty() {
+                    return Ok(false);
+                }
+            }
+            ParsedFilter::AnyOf { field_id, values } => {
+                if values
+                    .iter()
+                    .any(|value| matches!(value, UnifiedPayloadValue::Null))
+                {
+                    continue;
+                }
+
+                let Some(schema) = schema.as_ref() else {
+                    return Ok(false);
+                };
+                let Some(field) = schema.fields.iter().find(|f| f.field_id == *field_id) else {
+                    return Ok(false);
+                };
+
+                if !field.indexed {
+                    continue;
+                }
+
+                let mut any_match = false;
+                for value in values {
+                    let exact = reader.filter_ids_exact(*field_id, value).await?;
+                    if !exact.is_empty() {
+                        any_match = true;
+                        break;
+                    }
+                }
+                if !any_match {
+                    return Ok(false);
+                }
+            }
+            ParsedFilter::Range {
+                field_id,
+                lower,
+                lower_inclusive,
+                upper,
+                upper_inclusive,
+            } => {
+                let Some(schema) = schema.as_ref() else {
+                    return Ok(false);
+                };
+                if schema
+                    .fields
+                    .iter()
+                    .all(|field| field.field_id != *field_id)
+                {
+                    return Ok(false);
+                }
+
+                let Some(stats) = payload_stats.as_ref() else {
+                    continue;
+                };
+                let any_chunk_matches = stats.iter().any(|chunk| {
+                    range_filter_might_match_chunk(
+                        chunk,
+                        *field_id,
+                        lower.as_ref(),
+                        *lower_inclusive,
+                        upper.as_ref(),
+                        *upper_inclusive,
+                    )
+                });
+                if !any_chunk_matches {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+async fn bucket_might_match_filters_via_metadata(
+    collection: &Collection,
+    bucket_id: u32,
+    filters: &[ParsedFilter],
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+
+    let Some(version) = collection.bucket_manager.get_version(bucket_id) else {
+        return true;
+    };
+    let local_op = match create_staging_operator(collection) {
+        Ok(op) => op,
+        Err(err) => {
+            tracing::debug!(
+                "Filter planner: failed to create staging operator for bucket {}: {}",
+                bucket_id,
+                err
+            );
+            return true;
+        }
+    };
+    let remote_op = collection.persistence.operator();
+    let sources = payload_sources_for_class(&version.class, &version.path);
+
+    for source in sources {
+        let probe = match source {
+            PayloadSource::Local(path) => {
+                match UnifiedReader::open(local_op.clone(), &path).await {
+                    Ok(reader) => source_might_match_filters(&reader, filters).await,
+                    Err(err) => Err(err),
+                }
+            }
+            PayloadSource::Remote(path) => {
+                match UnifiedReader::open(remote_op.clone(), &path).await {
+                    Ok(reader) => source_might_match_filters(&reader, filters).await,
+                    Err(err) => Err(err),
+                }
+            }
+        };
+
+        match probe {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::debug!(
+                    "Filter planner: metadata probe failed for bucket {}: {}; keeping bucket",
+                    bucket_id,
+                    err
+                );
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+async fn plan_filter_aware_bucket_subset(
+    collection: &Collection,
+    routed_bucket_ids: &[u32],
+    filters: &[ParsedFilter],
+) -> Vec<u32> {
+    if routed_bucket_ids.is_empty() || filters.is_empty() {
+        return routed_bucket_ids.to_vec();
+    }
+
+    let mut planned = Vec::with_capacity(routed_bucket_ids.len());
+    for &bucket_id in routed_bucket_ids {
+        if bucket_might_match_filters_via_metadata(collection, bucket_id, filters).await {
+            planned.push(bucket_id);
+        }
+    }
+    planned
+}
+
 async fn load_bucket_payload_rows(
     collection: &Collection,
     bucket_id: u32,
@@ -1169,6 +1442,20 @@ impl Drift for DriftService {
         let parsed_filters = parse_filters(&req.filters)?;
         let projection: HashSet<u32> = req.payload_projection_fields.iter().copied().collect();
         let needs_payload_eval = !parsed_filters.is_empty() || !projection.is_empty();
+        let planned_bucket_ids = if parsed_filters.is_empty() {
+            None
+        } else {
+            let routed_bucket_ids = collection.index.select_buckets(
+                &req.vector,
+                req.target_confidence,
+                req.lambda,
+                req.tau,
+            );
+            let pruned =
+                plan_filter_aware_bucket_subset(&collection, &routed_bucket_ids, &parsed_filters)
+                    .await;
+            Some(pruned)
+        };
         let candidate_k = if needs_payload_eval {
             requested_k.saturating_mul(8).clamp(requested_k, 8192)
         } else {
@@ -1177,12 +1464,13 @@ impl Drift for DriftService {
 
         let results = collection
             .index
-            .search(
+            .search_with_bucket_hint(
                 &req.vector,
                 candidate_k,
                 req.target_confidence,
                 req.lambda,
                 req.tau,
+                planned_bucket_ids.as_deref(),
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

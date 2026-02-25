@@ -17,10 +17,37 @@ Last updated: 2026-02-25
     - Added collection-level payload schema registry and insert/train-time schema validation.
     - Added integration coverage:
       - `server_integration_tests::test_payload_schema_management_and_insert_validation`
-- [ ] 17. Start Phase E performance work for filter-aware planning.
+- [x] 17. Start Phase E performance work for filter-aware planning.
   - Goal: move from vector-first filtering toward selectivity-aware candidate planning and index pushdown.
-- [ ] 18. Add targeted filtered-search benchmark + p95 regression guardrails.
+  - Completed:
+    - Added filter-aware bucket planning in server search path using storage metadata.
+    - Added metadata probe path that uses:
+      - exact-index postings for `exact` / non-null `any_of` filters
+      - payload stats min/max overlap for `range` filters
+    - Added conservative fallback behavior:
+      - metadata probe failures keep buckets (no false-negative pruning).
+      - final row-level filter evaluation remains unchanged.
+    - Added `VectorIndex` bucket-hint support:
+      - `select_buckets(...)`
+      - `search_with_bucket_hint(...)`
+    - Search now routes through planned bucket subset when filters are present.
+- [x] 18. Add targeted filtered-search benchmark + p95 regression guardrails.
   - Goal: track filtered query latency impact over time and catch regressions early.
+  - Completed:
+    - Extended `drift_server/src/bin/bench_rw.rs` with payload-backed filtered workload:
+      - inserts payload rows with tenant keyword + numeric field.
+      - runs dedicated filtered search phase (`FieldFilter::exact`) after baseline read phase.
+    - Added filtered benchmark controls:
+      - `--filtered-query-count`
+      - `--filtered-warmup-queries`
+      - `--filter-cardinality`
+      - `--filtered-projection`
+    - Added p95 guardrails with non-zero exit on violation:
+      - `--max-unfiltered-p95-ms`
+      - `--max-filtered-p95-ms`
+      - `--max-filtered-overhead-ratio`
+    - Added optional machine-readable summary output:
+      - `--summary-json-path <path>`
 - [ ] 19. Add remaining Phase B E2E durability test.
   - Goal: verify payload survives `flush -> promote -> recover` lifecycle.
 - [ ] 20. Prepare follow-up commit after items 17-19 are green.

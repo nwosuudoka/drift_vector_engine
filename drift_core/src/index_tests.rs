@@ -262,6 +262,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_search_with_bucket_hint_limits_disk_scan_scope() {
+        let dir = tempdir().unwrap();
+        let (index, disk) = create_index(&dir, 8);
+
+        disk.insert(0, 100, 0.1);
+        disk.insert(1, 200, 0.2);
+
+        let query = vec![-10.0, -10.0];
+        let hinted = index
+            .search_with_bucket_hint(&query, 10, 0.9, 1.0, 100.0, Some(&[0]))
+            .await
+            .unwrap();
+        let hinted_ids: Vec<u64> = hinted.iter().map(|(id, _)| *id).collect();
+        assert!(hinted_ids.contains(&100));
+        assert!(!hinted_ids.contains(&200));
+
+        let hinted_other = index
+            .search_with_bucket_hint(&query, 10, 0.9, 1.0, 100.0, Some(&[1]))
+            .await
+            .unwrap();
+        let hinted_other_ids: Vec<u64> = hinted_other.iter().map(|(id, _)| *id).collect();
+        assert!(hinted_other_ids.contains(&200));
+        assert!(!hinted_other_ids.contains(&100));
+    }
+
     // --- TEST 3: END-TO-END FLOW ---
     #[tokio::test]
     async fn test_end_to_end_flow() {
