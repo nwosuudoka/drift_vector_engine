@@ -1,219 +1,187 @@
 # Drift Vector Engine
 
-Rust workspace implementing a drift-aware vector index with WAL-backed ingestion, unified
-on-disk row-group storage, and background maintenance for evolving data distributions.
-This README describes the **current system** as implemented in this repository.
+Rust workspace implementing drift-aware vector search with WAL-backed ingestion, unified `.driftu`
+storage, typed payload columns, and background maintenance.
+
+This document reflects the current v3 implementation in this repository.
 
 ## Overview
 
-System is organized around **Logical Buckets** that can live in multiple physical locations:
+System state is modeled as logical buckets that can span multiple physical files:
 
-- **Local staging**: mutable `.drift` files under `data/<collection>/staging/`.
-- **Remote base**: immutable `.drift` files in the configured storage root (local or S3).
-- **Tiered**: a remote base plus a local delta.
+- Local staging: mutable `.driftu` files under `data/<collection>/staging/`.
+- Remote base: immutable `.driftu` files in the configured storage backend root.
+- Tiered: remote base plus local delta.
+- Promoting: temporary merge state during local -> remote promotion.
 
-Search and maintenance operate on this logical view, while the Janitor keeps metadata
-and files consistent.
+Search and maintenance operate on this logical view through `BucketManager`.
 
 ## V3 status
 
-- **Storage format is strict V3-only** for read/write paths.
-- **Hot row-group layout** is `[ids][sq8_codes]` (no serialized tombstone trailer bytes).
-- **Collection metric is explicit at create time** and enforced across reopen/reuse.
-- **Remote reads use a local NVMe full-object cache** with local range slicing, singleflight
-  miss coordination, and budget-based eviction.
-- **Health RPC includes NVMe cache + recovery guard runtime metrics** to expose cache/recovery behavior.
-- **Optional Prometheus exporter** can expose the same counters on `/metrics`.
+- Storage format is strict v3-only (`.driftu`) on read and write paths.
+- Collection metric is explicit at creation time and validated on reopen/reuse.
+- Typed payload rows are stored in unified files alongside vectors.
+- Search API supports field filters (`exact`, `any_of`, `range`) and payload projection.
+- Recovery validates payload/index metadata against manifest state and reports diagnostics.
+- Remote reads can use local NVMe full-object cache with fingerprint-aware invalidation.
+- Optional Prometheus metrics exporter exposes cache and recovery counters.
 
 ## Architecture
 
 ### Core components
 
-- **L0 MemTable**: append-only in-memory buffer with parallel scan search.
-- **WAL**: per-collection WAL for durable inserts/deletes, replayed on recovery.
-- **L1 Bucket Files**: columnar `.drift` files with hot SQ8 + cold ALP data, multiple
-  row groups for local staging, and a single run id for remote base files.
-- **Router**: centroid routing table that selects buckets using target_confidence, lambda,
-  tau, plus a distance guardrail.
-- **BucketManager**: tracks bucket state (Local/Remote/Tiered/Promoting), tombstones,
-  and provides unified search across local/remote tiers.
-- **NVMe object cache**: `DiskManager` caches full remote objects locally, serves sub-ranges
-  from disk, verifies provider-agnostic fingerprints, and invalidates stale entries.
-- **BitStore (KV)**: persistent `VectorID -> BucketID` mapping used for L1 tombstones.
-- **Janitor**: background loop for flush, promotion, split, scatter merge, tombstone
-  persistence, and reaper cleanup.
+- L0 MemTable: append-only in-memory buffer with parallel search scan.
+- WAL: per-collection durability for inserts/deletes before L0 mutation.
+- L1 bucket files: unified `.driftu` files with vector data, payload schema/rows, and payload indexes.
+- Router: centroid routing for bucket selection (`target_confidence`, `lambda`, `tau`).
+- BucketManager: tracks bucket location/state (Local/Remote/Tiered/Promoting).
+- KV store (`drift_kv`): persistent `VectorID -> BucketID` mapping for tombstone propagation.
+- Janitor: flush, promote, split, scatter-merge, tombstone persistence, and cleanup.
+- DiskManager: optional local cache for remote object reads.
 
-### Data layout (on disk)
+## Data layout (on disk)
 
-For a collection named `my_collection`:
+For collection `my_collection`:
 
 - WAL: `WAL_DIR/my_collection/`
-- Local staging: `DATA_DIR/my_collection/staging/`
-- KV store: `DATA_DIR/my_collection/kv/`
-- Remote storage root (local or S3): `STORAGE_ROOT/my_collection/`
+- Local collection root: `DRIFT_DATA/my_collection/`
+- Local staging: `DRIFT_DATA/my_collection/staging/`
+- KV store: `DRIFT_DATA/my_collection/kv/`
+- Remote storage root: `<storage-root>/my_collection/` (`file` or `s3` backend)
 
 ## Write path
 
-1. **Insert/Train** writes to WAL first.
-2. **MemTable** receives the vector (L0 visibility).
-3. When L0 reaches capacity it is rotated to a frozen table.
-4. **Janitor flush** partitions frozen vectors using the Router and appends row groups
-   to local staging files.
-5. **Router and KV** are updated: centroids/counts are recalculated and KV mappings
-   are written for each flushed ID.
+1. Insert/InsertBatch writes to WAL first.
+2. Vector (and optional payload row) is appended to L0 MemTable.
+3. MemTable rotation creates frozen tables when capacity is reached.
+4. Janitor flush partitions rows by router centroid and appends unified row groups to local staging.
+5. KV and router are updated to keep `VectorID -> BucketID` and centroid stats consistent.
 
 ## Read path
 
-1. **Snapshot** L0 tombstones and active/frozen tables.
-2. **L0 scan**: parallel scan of memtables, filtered by L0 tombstones.
-3. **Bucket selection**: Router chooses buckets using target_confidence/lambda/tau plus
-   a distance guardrail.
-4. **L1 scan**: BucketManager scans local/remote/tiered files, applying per-bucket
-   tombstones and refining candidates.
-5. **Merge** L0 and L1 results, re-check L0 tombstones, return top-K.
+1. Snapshot L0 state (active/frozen tables + tombstones).
+2. Router selects candidate buckets using drift parameters.
+3. Vector search returns top-K candidate IDs from L0 and L1.
+4. If request has payload filters/projection:
+   - candidate K is expanded (`k * 8`, capped at 8192),
+   - payload rows are loaded from L1 (plus L0 fallback),
+   - filters are applied in server layer,
+   - optional payload projection is attached to results.
+5. L0/L1 results merge and final top-K is returned.
 
 ## Promotion (Local -> Remote)
 
-When a local staging file exceeds a threshold, the Janitor promotes it:
+When local staging exceeds threshold:
 
-1. **Lock** the bucket with the BucketCoordinator.
-2. **Rotate** the local file (active -> frozen) and create a new empty local file.
-3. **Merge** frozen local data with the remote base (if any), apply tombstones, and
-   write a new remote file.
-4. **Finalize**: bucket becomes Tiered, manifest run id is updated, tombstones are
-   pruned, and old files are scheduled for cleanup.
-
-Result: remote is compacted, local continues as a delta, and search reads both.
-
-## Split and Defector Loopback (Split/Steal update)
-
-When a bucket is too large or drifted:
-
-1. **Fetch** the bucket (merging tiers if needed).
-2. **K-Means (K=2)** produces two child centroids.
-3. **Partition** vectors into left/right children.
-4. **Defector check**: vectors that are much closer to a different global centroid are
-   looped back to L0 instead of being written to children.
-5. **Write** new local files for children, update manifest/router, delete old staging file.
-
-This replaces the older explicit neighbor stealing with a safer defector loopback guard.
-
-## Scatter Merge (Zombie healing)
-
-When a bucket becomes a zombie (low count / high urgency):
-
-1. **Fetch** the bucket data.
-2. **Scatter** each vector to the nearest neighbor centroid.
-3. **Rewrite neighbors** by writing new local files (copy-on-write).
-4. **Update** manifest/router/bucket manager and delete the zombie file.
-
-## Tombstones and deletes
-
-- **L0 tombstones** are maintained in-memory for fast filtering.
-- **L1 tombstones** are tracked per bucket; KV mapping provides `VectorID -> BucketID`.
-- **Persistence**: Janitor periodically persists a cumulative tombstone file and updates
-  the manifest pointer.
+1. Bucket is locked.
+2. Active local file is rotated into frozen staging.
+3. Frozen local rows merge with existing remote base (if present), applying tombstones.
+4. New remote `.driftu` file is written.
+5. Manifest metadata is updated atomically (run/path/fingerprint + payload/index flags/hash).
+6. Bucket transitions to Tiered and old files are scheduled for reaper cleanup.
 
 ## Recovery
 
-On startup, RecoveryManager:
+On startup:
 
-1. Loads the manifest and rebuilds the Router.
-2. Registers buckets in BucketManager (local or remote).
-3. Replays WAL inserts/deletes.
-4. Hydrates persisted tombstones.
+1. Manifest is loaded and router is rebuilt.
+2. Bucket locations/classes are re-registered.
+3. WAL inserts/deletes are replayed.
+4. Tombstones are hydrated.
+5. Recovery guard validates remote-object fingerprints and payload/index metadata alignment.
 
 ## Configuration
 
-CLI flags (also available via environment variables):
+Main server flags (also available as env vars):
 
-- `DRIFT_PORT` (default 50051)
-- `DRIFT_WAL_DIR` (default ./data/wal)
-- `DRIFT_DATA` (default ./data/drift)
-- `DRIFT_DEFAULT_DIM` (default 128)
-- `DRIFT_MAX_BUCKET_CAPACITY` (default 1000)
-- `DRIFT_EF_CONSTRUCTION` (default 128)
-- `DRIFT_EF_SEARCH` (default 50)
+- `DRIFT_PORT` (default `50051`)
+- `DRIFT_WAL_DIR` (default `./data/wal`)
+- `DRIFT_DATA` (default `./data/drift/`)
+- `DRIFT_DEFAULT_DIM` (default `128`)
+- `DRIFT_MAX_BUCKET_CAPACITY` (default `1000`)
+- `DRIFT_EF_CONSTRUCTION` (default `128`)
+- `DRIFT_EF_SEARCH` (default `50`)
 
-Storage:
+Storage backend:
 
-- File backend: `DRIFT_DATA_DIR` (root directory for remote storage)
+- File backend: `DRIFT_DATA_DIR` (subcommand `file`)
 - S3 backend: `DRIFT_S3_BUCKET`, `DRIFT_S3_REGION`, `DRIFT_S3_ENDPOINT`,
-  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (subcommand `s3`)
 
-NVMe remote-read cache:
+NVMe object cache:
 
-- `DRIFT_NVME_CACHE_DIR` (required to enable local object cache)
-- `DRIFT_NVME_CACHE_MAX_BYTES` (optional global byte budget)
-- `DRIFT_NVME_CACHE_MAX_FILES` (optional global file-count budget)
-- `DRIFT_NVME_CACHE_MAX_FILE_BYTES` (optional per-object max size; larger objects bypass full-file cache)
-- `DRIFT_NVME_FINGERPRINT_VERIFY_INTERVAL_MS` (optional fingerprint re-verify interval)
-- `DRIFT_NVME_CACHE_FORCE_ALL_SCHEMES=1` (test-only override; enables cache even for `fs` backend)
+- `DRIFT_NVME_CACHE_DIR`
+- `DRIFT_NVME_CACHE_MAX_BYTES`
+- `DRIFT_NVME_CACHE_MAX_FILES`
+- `DRIFT_NVME_CACHE_MAX_FILE_BYTES`
+- `DRIFT_NVME_FINGERPRINT_VERIFY_INTERVAL_MS`
+- `DRIFT_NVME_CACHE_FORCE_ALL_SCHEMES=1` (test-only override)
 
-Metrics exporter (optional):
+Metrics exporter:
 
-- `DRIFT_METRICS_ADDR` (for example `0.0.0.0:9091`; preferred)
-- `DRIFT_METRICS_PORT` (fallback; binds `0.0.0.0:<port>`)
-- If either is set, server starts HTTP metrics endpoint at `/metrics`.
+- `DRIFT_METRICS_ADDR` (preferred, example `0.0.0.0:9091`)
+- `DRIFT_METRICS_PORT` (fallback)
 
-KV durability and startup validation:
+KV durability startup controls:
 
-- `DRIFT_KV_SYNC_INTERVAL_MS` (optional; janitor periodic `kv.sync()` interval, default `5000`)
-- `DRIFT_KV_FORCE_REBUILD_ON_STARTUP` (`1|true|yes|on`; force full KV rebuild from bucket files on startup)
-- `DRIFT_KV_VALIDATE_MAX_BUCKETS` (optional startup validation sample size, default `8`)
-- `DRIFT_KV_VALIDATE_IDS_PER_BUCKET` (optional per-bucket ID validation sample size, default `4`)
+- `DRIFT_KV_SYNC_INTERVAL_MS`
+- `DRIFT_KV_FORCE_REBUILD_ON_STARTUP`
+- `DRIFT_KV_VALIDATE_MAX_BUCKETS`
+- `DRIFT_KV_VALIDATE_IDS_PER_BUCKET`
 
-## How to use
+## Run and use
 
-### Run the server
+### Start server (local filesystem backend)
 
+```bash
+cargo run -p drift_server --bin drift_server -- file --path ./data
 ```
-cargo run -p drift_server
+
+### Start server (S3 backend)
+
+```bash
+cargo run -p drift_server --bin drift_server -- s3 --bucket <bucket> --region us-east-1
 ```
 
-### Client / CLI
+### CLI client (vector-focused convenience wrapper)
 
-```
-cargo run -p drift_server --bin client
+```bash
 cargo run -p drift_server --bin drift -- --help
 ```
 
+`drift` CLI currently covers create/train/insert/search for vectors.
+For payload inserts, filters, and projection, use the gRPC API directly.
+
+### API reference
+
+- gRPC proto: `drift_server/proto/drift.proto`
+- Developer API spec: `docs/API_SPEC.md`
+- Architecture flow: `SYSTEM_VIEW.md`
+
 ### Simulations
 
-```
-# drift simulation
+```bash
 cargo run -p drift_server --bin drift_sim --release
-
-# churn/tombstone simulation
 cargo run -p drift_server --bin churn_sim --release
 ```
 
 ### Benchmarking
 
-```
-# Read/write benchmark (in-process)
-scripts/bench_rw.sh
-
-# Custom parameters
-scripts/bench_rw.sh -- --total-vectors 50000 --query-count 500
+```bash
+cargo run -p drift_server --bin bench_rw --release -- --total-vectors 20000 --query-count 200
 ```
 
 ## Workspace layout
 
-- `drift_core`: index, router, memtable, WAL, maintenance algorithms.
-- `drift_storage`: `.drift` file format, row groups, quantization, compression.
-- `drift_kv`: BitStore mapping for `VectorID -> BucketID`.
-- `drift_server`: gRPC server, manager, janitor, persistence, and sims.
+- `drift_core`: index, router, memtable, WAL, payload model, maintenance algorithms.
+- `drift_storage`: unified `.driftu` format, payload encoding/indexing, disk cache.
+- `drift_kv`: persistent `VectorID -> BucketID` mapping.
+- `drift_server`: gRPC service, collection manager, janitor, recovery, benchmarks/sims.
+- `drift_traits`: storage abstractions.
 
 ## Current status
 
-- server/manager/janitor are active and used by default (`drift_server` binary).
-- L0 uses a parallel scan MemTable;
-  - Reason for this is that inserts were slow for high throughput writes (this can be changed in the future if the parallel scans in your system becomes a bottle neck).
-- maintenance includes split with defector loopback and scatter merge.
-- Promotion supports Local/Remote/Tiered/Promoting states.
-- Health endpoint reports readiness/version and includes NVMe cache metrics payload.
-- Recovery guard counters are included in health and exposed via optional `/metrics`.
-- Chaos durability test is hardened with health-gated warmup/restart and epoch-specific recovery checks.
-
-Reference #[System View](./SYSTEM_VIEW.md) for a vector lifecycle
+- Server/janitor/recovery path is active by default in `drift_server`.
+- Payload-preserving flush/promotion/split/scatter paths are wired.
+- API includes typed payload insert plus field-filtered search and projection.
+- Filter execution is currently post-vector candidate stage (planner/index pushdown is next phase).

@@ -1,126 +1,123 @@
-# System View (v2)
+# System View (v3)
 
-This document describes the end-to-end flow of a vector through the v2 system and how the
-major subsystems interact. The design centers on a **Logical Bucket** that can span multiple
-physical files and states, while search and maintenance operate on a consistent view.
+This document describes the current end-to-end runtime flow for vectors and payloads in Drift v3.
+The core design unit is a logical bucket that may span local and remote unified files.
 
-## Logical Bucket (v2)
-A bucket is no longer a single file. It is a logical entity with storage state managed by the
-BucketManager:
+## 0) API contract (current)
 
-- **Local**: one mutable local `.drift` file in `data/<collection>/staging/` (multiple row groups).
-- **Remote**: one immutable remote `.drift` file in the configured storage root (single run id).
-- **Tiered**: a remote base file plus a local delta file.
-- **Promoting**: a transient state while a local file is being merged into remote.
+- Collections are created explicitly with `CreateCollection` (dim + metric).
+- Inserts can carry typed payload rows (`PayloadRow`).
+- Search supports:
+  - vector nearest-neighbor retrieval,
+  - payload field filters (`exact`, `any_of`, `range`),
+  - payload field projection in results.
 
-All of these are expressed by `StorageClass` and hidden behind `BucketManager` + `StorageEngine`.
+All payload data is stored in the same `.driftu` unified files as vectors.
 
----
+## 1) Logical bucket model
 
-## 1) Ingest: MemTable + WAL
+`BucketManager` exposes one logical bucket state per bucket ID:
 
-- **Arrival**: Vector `V` (ID=100) arrives via Insert/Train.
-- **Durability**: the insert is written to the per-collection WAL first.
-- **Visibility**: the vector is appended to the active MemTable (L0).
-- **Tombstones**: deletes mark an L0 tombstone set (copy-on-write for lock-free reads).
+- `Local`: active mutable staging file.
+- `Remote`: immutable remote base file.
+- `Tiered`: remote base + local delta.
+- `Promoting`: transient state while frozen local data is being merged into remote.
 
-When the MemTable reaches capacity it is rotated into a frozen table and queued for flush.
+Search and maintenance read through this abstraction, not directly from one file path.
 
----
+## 2) Ingest path (WAL -> L0)
 
-## 2) Flush: Local Staging + Router/KV updates
+For each insert or insert-batch row:
 
-The Janitor periodically flushes frozen MemTables:
+1. Entry is written to WAL.
+2. Vector is inserted into L0 MemTable.
+3. Optional payload row is inserted alongside the vector.
+4. L0 tombstones track deletes with copy-on-write snapshots for lock-light reads.
 
-1. **Partition**: vectors are assigned to buckets using the Router (centroid routing).
-2. **Append**: each bucket's vectors are appended as a new row group in
-   `data/<collection>/staging/bucket_<id>.drift`.
-3. **KV Mapping**: `VectorID -> BucketID` is updated in BitStore for each flushed ID.
-4. **Bucket Stats**: BucketManager updates per-bucket drift stats (count + vector sum).
-5. **Router Update**: global centroid and count are recalculated and applied to the Router.
-6. **Manifest Update**: bucket metadata and current tombstone file pointer are updated
-   atomically.
+Payload schema is inferred per insert-batch request:
 
-Result: L0 drains into L1 (local staging), routing metadata stays consistent, and the ID map is
-kept correct for delete propagation.
+- field logical type must be consistent for each `field_id`,
+- null-only fields are rejected,
+- nullable is inferred from null/missing observations.
 
----
+## 3) Flush path (L0 -> local unified staging)
 
-## 3) Promotion: Local -> Remote (Tiered state)
+When MemTable rotates/freeze threshold is hit:
 
-When a local staging file exceeds a size threshold, the Janitor promotes it:
+1. Janitor partitions rows by router centroid.
+2. Each partition appends a row group into bucket-local `.driftu` staging file.
+3. Payload schema/rows are written with vectors into the same unified row groups.
+4. KV mapping (`VectorID -> BucketID`) is updated.
+5. Router centroid/count stats are updated.
+6. Manifest metadata is atomically updated.
 
-1. **Lock**: the bucket is write-locked via `BucketCoordinator`.
-2. **Rotate**: the active local file becomes a frozen staging file, and a new empty local
-   file is created.
-3. **Merge**: the remote base (if any) and the frozen local file are read, tombstones are
-   applied, and a new remote file is written.
-4. **Finalize**: the bucket becomes **Tiered** (remote base + local delta), the manifest
-   run id is updated, and processed tombstones are pruned.
+Result: vector and payload data move together from L0 to L1.
 
-Result: remote is compacted, local continues as a mutable delta, and search reads both.
+## 4) Promotion path (local -> remote)
 
----
+When a local staging file crosses promotion threshold:
 
-## 4) Split + Defector Loopback (Split/Steal update)
+1. Bucket lock is acquired.
+2. Active local file is rotated to frozen staging.
+3. Frozen local + remote base (if any) are merged.
+4. Tombstones are applied during merge.
+5. New remote `.driftu` object is written.
+6. Manifest remote metadata is updated atomically, including payload/index flags and schema hash.
+7. Bucket transitions to `Tiered`; old files are queued for reaper cleanup.
 
-When a bucket is too large or drifted:
+Result: remote holds compacted base, local continues as mutable delta.
 
-1. **Fetch**: the bucket's full data is loaded (merging tiers if needed).
-2. **K-Means (K=2)**: produces two candidate child centroids.
-3. **Partition**: vectors are assigned to left/right children.
-4. **Defector Check**: if a vector is much closer to a *different* global centroid than its
-   assigned child, it is **looped back** to L0 instead of being written to a child bucket.
-5. **Write**: two new local bucket files are created; old bucket metadata is removed.
-6. **Router/Manifest**: atomic updates replace the parent bucket with the two children.
+## 5) Search path (vector + payload)
 
-This replaces the older explicit neighbor stealing with a safer “defector loopback” guard.
+Search execution is two-stage today:
 
----
+1. Vector stage:
+   - Router selects buckets from drift params (`target_confidence`, `lambda`, `tau`).
+   - Index returns vector candidates by score.
+2. Payload stage (only when filters/projection requested):
+   - candidate `k` is expanded (`k * 8`, capped at 8192),
+   - payload rows are loaded for candidate IDs from L1 buckets, with L0 fallback,
+   - filters are evaluated in server layer,
+   - projection fields are attached to output rows.
 
-## 5) Scatter Merge (Zombie healing)
+If no filters and no projection are requested, search returns vector results without payload lookup.
 
-When a bucket becomes a zombie (low count / high urgency):
+## 6) Filter semantics (server implementation)
 
-1. **Fetch**: load the bucket's full data.
-2. **Scatter**: each vector is assigned to the nearest neighboring centroid.
-3. **Rewrite Neighbors**: for each target bucket, a new local file is written with
-   the merged vectors (copy-on-write).
-4. **Update**: manifest, router, and bucket manager are updated; zombie file is deleted.
+Filters are combined with logical AND:
 
-Result: sparse buckets are eliminated and their vectors are redistributed to healthy neighbors.
+- `exact`: field value must equal target value.
+- `any_of`: field value must match one of provided values.
+- `range`: lower/upper bounds; inclusivity defaults to `true` if omitted.
 
----
+Comparison behavior:
 
-## 6) Search: L0 + L1 Unified Scan
+- Numeric comparison is supported across `int64`, `float32`, `float64`, and `timestamp_micros`.
+- `keyword` and `text` compare lexicographically.
+- Missing field behaves as `null` for `exact`/`any_of`.
+- `range` fails when field is missing, null, or non-comparable type.
 
-Search is executed as:
+Projection behavior:
 
-1. **Snapshot**: capture L0 tombstones and the current MemTable/Frozen tables.
-2. **L0 Scan**: scan MemTables (parallel) and filter by L0 tombstones.
-3. **Bucket Selection**: Router selects bucket IDs using target_confidence, lambda, tau,
-   plus a distance guardrail.
-4. **L1 Scan**: BucketManager scans the selected bucket files (Local/Remote/Tiered),
-   applying per-bucket tombstones.
-5. **Merge**: L0 + L1 results are merged, L0 tombstones are rechecked, top-K returned.
+- Empty `payload_projection_fields` => `SearchResult.payload` is omitted.
+- Non-empty projection => payload object includes only requested fields that exist.
 
----
+## 7) Recovery and startup guards
 
-## 7) Tombstones + Recovery
+On startup:
 
-- **Tombstones**: L0 and L1 deletes are merged and persisted periodically; the manifest
-  tracks the active tombstone file for crash-safe recovery.
-- **Recovery**: on startup, the manifest is loaded, Router is rebuilt, buckets are
-  registered, WAL is replayed, and tombstones are rehydrated.
+1. Manifest is loaded.
+2. Bucket classes/paths are re-registered.
+3. WAL replay rehydrates recent writes/deletes.
+4. Persisted tombstones are hydrated.
+5. Recovery guard validates remote fingerprint and payload/index metadata consistency.
+6. Health/metrics expose recovery guard diagnostics.
 
----
+## 8) Current trade-offs
 
-## Key Trade-offs (v2)
+- Vector retrieval happens before payload filtering, so selective filters can still over-fetch.
+- Candidate expansion (`k * 8`) improves filtered recall but adds read/decode work.
+- Dedicated schema-management RPCs are not yet shipped; schema is currently inferred from writes.
 
-- **Logical buckets** simplify reasoning but require a BucketManager abstraction.
-- **Local staging + remote base** minimizes remote writes while keeping search correctness.
-- **Defector loopback** avoids misrouting during splits without expensive neighbor stealing.
-- **Copy-on-write merges** keep maintenance safe at the cost of some rewrite overhead.
-
-This is the current production mental model for v2 and aligns with the v2 server, janitor,
-router, and bucket manager implementations.
+This is the current production mental model and should be treated as the source of truth
+for v3 runtime behavior.

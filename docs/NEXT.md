@@ -1,9 +1,22 @@
 # Next Steps
 
-Last updated: 2026-02-24
+Last updated: 2026-02-25
 
 ## Current Execution Phase
-- Phase C baseline complete; entering Phase D API surface (protobuf payload + filter contract).
+- Phase D payload/filter API is shipped; remaining Phase D gap is payload schema management API.
+- Documentation surface is now synced for current API/runtime (`README.md`, `SYSTEM_VIEW.md`, `docs/API_SPEC.md`).
+
+## Active Queue (Post-Item 15)
+- [ ] 16. Finish remaining Phase D gap: payload schema management API.
+  - Scope: create/update/validate payload field definitions.
+  - File focus: `drift_server/proto/drift.proto` + server handlers.
+- [ ] 17. Start Phase E performance work for filter-aware planning.
+  - Goal: move from vector-first filtering toward selectivity-aware candidate planning and index pushdown.
+- [ ] 18. Add targeted filtered-search benchmark + p95 regression guardrails.
+  - Goal: track filtered query latency impact over time and catch regressions early.
+- [ ] 19. Add remaining Phase B E2E durability test.
+  - Goal: verify payload survives `flush -> promote -> recover` lifecycle.
+- [ ] 20. Prepare follow-up commit after items 16-19 are green.
 
 ## Priority Queue
 - [x] 1. Run full workspace regression once before commit.

@@ -1,5 +1,57 @@
 # Session Log
 
+## 2026-02-25 (docs sync: API/system view)
+- Goal:
+  - Update system view and README to reflect the current payload/filter API, and add a developer API spec sheet.
+- Work completed:
+  - Rewrote `README.md` to:
+    - reflect `.driftu` terminology and unified payload model
+    - fix server startup instructions to include required storage subcommand (`file` / `s3`)
+    - replace stale benchmark script references with the `bench_rw` binary command
+    - link to the new developer API spec
+  - Rewrote `SYSTEM_VIEW.md` from v2 wording to current v3 behavior:
+    - payload-aware ingest/flush/promotion/search lifecycle
+    - current filter/projection evaluation semantics
+    - current performance tradeoff (vector-first candidate retrieval before payload filtering)
+  - Added `docs/API_SPEC.md`:
+    - RPC contract summary from `drift_server/proto/drift.proto`
+    - payload type and filter semantics
+    - validation/error behavior
+    - concrete `grpcurl` examples for create/insert/insert-batch/search
+  - Updated `docs/NEXT.md` phase wording to reflect this doc-sync milestone.
+- Files changed:
+  - `README.md`
+  - `SYSTEM_VIEW.md`
+  - `docs/API_SPEC.md`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo run -p drift_server --bin drift_server -- --help`
+  - `cargo run -p drift_server --bin drift_server -- file --help`
+  - `cargo run -p drift_server --bin drift_server -- s3 --help`
+  - `cargo run -p drift_server --bin drift -- --help`
+- Open issues:
+  - Payload schema management API (Phase D gap) is still pending.
+  - Query planner/index pushdown for selective filters (Phase E) is still pending.
+- Next steps:
+  - Execute `docs/NEXT.md` item 16 (payload schema management API).
+  - Execute `docs/NEXT.md` item 17 (filter-aware planning and index pushdown).
+
+## 2026-02-24 (planning refresh)
+- Goal:
+  - Sync planning docs to the next execution phase after item 15 commit.
+- Work completed:
+  - Added explicit post-item-15 execution queue to `TODO.md` with four immediate steps:
+    1. payload schema management API
+    2. filter-aware planning/index pushdown
+    3. filtered-search benchmark + p95 guardrails
+    4. flush->promote->recover payload durability E2E test
+  - Mirrored the same ordered queue in `docs/NEXT.md` as active items 16-20.
+- Files changed:
+  - `TODO.md`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+
 ## 2026-02-24 (continued, item 14)
 - Goal:
   - Execute `docs/NEXT.md` item 14 (protobuf payload insert + filter search contract) and validate filtering behavior.

@@ -41,6 +41,13 @@
   - [x] Janitor periodic + lifecycle `kv.sync()` policy.
   - [x] Startup KV validation with rebuild on missing/stale mappings.
 
+## Immediate Next Execution Steps (Post-Item 15)
+
+- [ ] 1. Finish remaining Phase D gap: payload schema management API (create/update/validate field definitions).
+- [ ] 2. Start Phase E performance work: move from vector-first filtering toward filter-aware planning and index pushdown.
+- [ ] 3. Add targeted filtered-search benchmarks and p95 guardrails to track regressions.
+- [ ] 4. Add remaining Phase B E2E durability test: payload survives flush -> promote -> recover.
+
 ## Next Major Step: Unified Payload and Secondary Index Expansion
 
 ### Phase A: Storage Wire Contract Hardening (`drift_storage`)
