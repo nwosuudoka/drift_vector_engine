@@ -1,5 +1,48 @@
 # Session Log
 
+## 2026-02-25 (item 21: ID-level candidate pushdown for filter-aware planning)
+- Goal:
+  - Implement Phase E follow-up so metadata planner can push exact-index candidate IDs through search into disk scan.
+- Work completed:
+  - Added candidate-aware search contract in traits layer:
+    - `StorageEngine::search_and_refine_with_candidates(...)` with default fallback to `search_and_refine(...)`.
+  - Extended core search path:
+    - `VectorIndex::search_with_hints(...)` accepts both `bucket_hint` and `candidate_ids`.
+    - `search(...)` and `search_with_bucket_hint(...)` now route through unified hint path.
+  - Implemented disk-side ID allowlist pushdown in `BucketManager`:
+    - skips scoring vectors not in per-bucket candidate set.
+    - preserves legacy behavior when no candidate map is supplied.
+  - Reworked server planner into `FilterAwareExecutionPlan`:
+    - bucket pruning still uses metadata feasibility checks.
+    - exact-index probes now collect/intersect candidate IDs for indexed `exact` / non-null `any_of` filters.
+    - search request path passes both bucket and candidate hints to index search.
+  - Added/updated tests validating the new path:
+    - `index_tests::test_search_with_hints_respects_disk_candidate_ids`
+    - `bucket_manager_tests::test_bucket_manager_candidate_id_pushdown`
+    - `server_integration_tests::test_search_field_filters_exact_anyof_range_and_projection`
+- Files changed:
+  - `drift_traits/src/lib.rs`
+  - `drift_core/src/index.rs`
+  - `drift_core/src/index_tests.rs`
+  - `drift_storage/src/bucket_manager.rs`
+  - `drift_storage/src/bucket_manager_tests.rs`
+  - `drift_server/src/server.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_core index_tests::tests::test_search_with_hints_respects_disk_candidate_ids`
+  - `cargo test -p drift_storage bucket_manager_tests::tests::test_bucket_manager_candidate_id_pushdown`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `cargo test -p drift_core`
+  - `cargo test -p drift_storage`
+  - `cargo test -p drift_server`
+- Open issues:
+  - Candidate pushdown currently targets indexed `exact` / non-null `any_of`; range filters still use stats-only feasibility pruning.
+  - No selectivity threshold gate yet for disabling candidate maps when fanout is broad.
+- Next steps:
+  - Implement `docs/NEXT.md` item 22 (selectivity guardrails + benchmark instrumentation for candidate fanout).
+
 ## 2026-02-25 (item 20: follow-up commit preparation after items 17-19)
 - Goal:
   - Execute `docs/NEXT.md` item 20 by validating green status and preparing follow-up commit scope.

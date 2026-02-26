@@ -4,7 +4,8 @@ Last updated: 2026-02-25
 
 ## Current Execution Phase
 - Phase D API surface is complete (payload/filter + payload schema management).
-- Entering Phase E performance work (filter-aware planning and index pushdown).
+- Phase E performance work is active (filter-aware planning and index pushdown).
+- Phase E pushdown v1 is complete at bucket + ID levels for indexed `exact` / non-null `any_of` filters.
 - Documentation surface is now synced for current API/runtime (`README.md`, `SYSTEM_VIEW.md`, `docs/API_SPEC.md`).
 
 ## Active Queue (Post-Item 15)
@@ -62,8 +63,29 @@ Last updated: 2026-02-25
     - Ran full workspace regression (`cargo test --workspace`) after item 19 updates.
     - Confirmed targeted payload durability lifecycle test remains green.
     - Prepared follow-up commit contents for items 17-19 completion set.
+- [x] 21. Implement ID-level candidate pushdown for filter-aware search planning.
+  - Goal: carry exact-index candidate IDs from planner to disk scan to avoid scoring non-candidate vectors.
+  - Completed:
+    - Extended search pipeline to pass both:
+      - bucket subset hints
+      - per-bucket ID allowlist hints
+    - Added `StorageEngine::search_and_refine_with_candidates(...)` with default fallback to legacy path.
+    - Implemented allowlist-aware disk scoring in `BucketManager` (`search_and_refine_with_candidates`).
+    - Upgraded server-side metadata planner to produce `FilterAwareExecutionPlan`:
+      - `bucket_ids` for bucket pruning
+      - `candidate_ids` for exact-index ID pushdown
+    - Added coverage:
+      - `index_tests::test_search_with_hints_respects_disk_candidate_ids`
+      - `bucket_manager_tests::test_bucket_manager_candidate_id_pushdown`
+      - `server_integration_tests::test_search_field_filters_exact_anyof_range_and_projection` (regression verification)
 
 ## Priority Queue
+- [ ] 22. Add selectivity guardrails for candidate pushdown and measure impact.
+  - Goal: avoid overhead for low-selectivity filters and quantify p95 gains.
+  - Scope:
+    - planner heuristic gate (skip candidate map when selectivity is too broad)
+    - extend benchmark output to report candidate fanout / scanned IDs
+    - define CI-friendly threshold defaults for filtered workloads
 - [x] 1. Run full workspace regression once before commit.
   - Command: `cargo test --workspace`
 - [x] 2. Extend unified header/footer with metric + schema hash fields.

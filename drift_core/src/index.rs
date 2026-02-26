@@ -303,7 +303,7 @@ impl VectorIndex {
         lambda: f32,
         tau: f32,
     ) -> io::Result<Vec<(u64, f32)>> {
-        self.search_with_bucket_hint(query, k, target, lambda, tau, None)
+        self.search_with_hints(query, k, target, lambda, tau, None, None)
             .await
     }
 
@@ -320,6 +320,20 @@ impl VectorIndex {
         lambda: f32,
         tau: f32,
         bucket_hint: Option<&[u32]>,
+    ) -> io::Result<Vec<(u64, f32)>> {
+        self.search_with_hints(query, k, target, lambda, tau, bucket_hint, None)
+            .await
+    }
+
+    pub async fn search_with_hints(
+        &self,
+        query: &[f32],
+        k: usize,
+        target: f32,
+        lambda: f32,
+        tau: f32,
+        bucket_hint: Option<&[u32]>,
+        candidate_ids: Option<&HashMap<u32, HashSet<u64>>>,
     ) -> io::Result<Vec<(u64, f32)>> {
         let (bucket_ids, metric) = {
             let router = self.router.read();
@@ -367,7 +381,13 @@ impl VectorIndex {
 
         let disk_results = self
             .storage
-            .search_and_refine(&bucket_ids, query, k, oversample_factor)
+            .search_and_refine_with_candidates(
+                &bucket_ids,
+                query,
+                k,
+                oversample_factor,
+                candidate_ids,
+            )
             .await;
 
         // C. Merge

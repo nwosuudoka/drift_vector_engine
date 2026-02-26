@@ -6,6 +6,7 @@ mod tests {
     use drift_core::math::Metric;
     use drift_traits::StorageEngine;
     use opendal::{Operator, services};
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -306,6 +307,37 @@ mod tests {
 
         // 4. Verify ID 100 is filtered
         assert!(res.is_empty(), "Shadowing failed to hide ID 100");
+    }
+
+    #[tokio::test]
+    async fn test_bucket_manager_candidate_id_pushdown() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
+        let dim = 2;
+        let bucket_id = 7;
+
+        let ids = vec![10, 20, 30];
+        let vecs = vec![vec![1.0, 1.0], vec![2.0, 2.0], vec![3.0, 3.0]];
+        create_bucket_file(dir.path(), "b7.driftu", &ids, &vecs, dim).await;
+        manager.register_bucket_with_count(
+            bucket_id,
+            "b7.driftu".to_string(),
+            StorageClass::Local,
+            3,
+        );
+
+        let mut candidate_ids: HashMap<u32, HashSet<u64>> = HashMap::new();
+        candidate_ids.insert(bucket_id, HashSet::from([20u64]));
+
+        let query = vec![0.0, 0.0];
+        let results = manager
+            .search_and_refine_with_candidates(&[bucket_id], &query, 10, 10, Some(&candidate_ids))
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 20);
     }
 
     #[tokio::test]

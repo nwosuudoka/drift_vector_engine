@@ -782,12 +782,31 @@ fn range_filter_might_match_chunk(
     )
 }
 
-async fn source_might_match_filters(
+fn intersect_candidate_ids(existing: &mut HashSet<u64>, next: &HashSet<u64>) {
+    existing.retain(|id| next.contains(id));
+}
+
+#[derive(Default)]
+struct FilterSourceProbe {
+    might_match: bool,
+    exact_candidate_ids: Option<HashSet<u64>>,
+}
+
+#[derive(Default)]
+struct FilterAwareExecutionPlan {
+    bucket_ids: Vec<u32>,
+    candidate_ids: HashMap<u32, HashSet<u64>>,
+}
+
+async fn source_filter_probe(
     reader: &UnifiedReader,
     filters: &[ParsedFilter],
-) -> io::Result<bool> {
+) -> io::Result<FilterSourceProbe> {
     if filters.is_empty() {
-        return Ok(true);
+        return Ok(FilterSourceProbe {
+            might_match: true,
+            exact_candidate_ids: None,
+        });
     }
 
     let schema = reader.read_payload_schema().await?;
@@ -801,6 +820,9 @@ async fn source_might_match_filters(
         None
     };
 
+    let mut exact_candidate_ids: Option<HashSet<u64>> = None;
+    let mut used_exact_pushdown = false;
+
     for filter in filters {
         match filter {
             ParsedFilter::Exact { field_id, value } => {
@@ -809,19 +831,33 @@ async fn source_might_match_filters(
                 }
 
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(false);
+                    return Ok(FilterSourceProbe::default());
                 };
                 let Some(field) = schema.fields.iter().find(|f| f.field_id == *field_id) else {
-                    return Ok(false);
+                    return Ok(FilterSourceProbe::default());
                 };
 
                 if !field.indexed {
                     continue;
                 }
 
-                let exact = reader.filter_ids_exact(*field_id, value).await?;
-                if exact.is_empty() {
-                    return Ok(false);
+                let matches: HashSet<u64> = reader
+                    .filter_ids_exact(*field_id, value)
+                    .await?
+                    .into_iter()
+                    .collect();
+                if matches.is_empty() {
+                    return Ok(FilterSourceProbe::default());
+                }
+
+                used_exact_pushdown = true;
+                if let Some(existing) = exact_candidate_ids.as_mut() {
+                    intersect_candidate_ids(existing, &matches);
+                    if existing.is_empty() {
+                        return Ok(FilterSourceProbe::default());
+                    }
+                } else {
+                    exact_candidate_ids = Some(matches);
                 }
             }
             ParsedFilter::AnyOf { field_id, values } => {
@@ -833,26 +869,32 @@ async fn source_might_match_filters(
                 }
 
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(false);
+                    return Ok(FilterSourceProbe::default());
                 };
                 let Some(field) = schema.fields.iter().find(|f| f.field_id == *field_id) else {
-                    return Ok(false);
+                    return Ok(FilterSourceProbe::default());
                 };
 
                 if !field.indexed {
                     continue;
                 }
 
-                let mut any_match = false;
+                let mut matches = HashSet::new();
                 for value in values {
-                    let exact = reader.filter_ids_exact(*field_id, value).await?;
-                    if !exact.is_empty() {
-                        any_match = true;
-                        break;
-                    }
+                    matches.extend(reader.filter_ids_exact(*field_id, value).await?);
                 }
-                if !any_match {
-                    return Ok(false);
+                if matches.is_empty() {
+                    return Ok(FilterSourceProbe::default());
+                }
+
+                used_exact_pushdown = true;
+                if let Some(existing) = exact_candidate_ids.as_mut() {
+                    intersect_candidate_ids(existing, &matches);
+                    if existing.is_empty() {
+                        return Ok(FilterSourceProbe::default());
+                    }
+                } else {
+                    exact_candidate_ids = Some(matches);
                 }
             }
             ParsedFilter::Range {
@@ -863,14 +905,14 @@ async fn source_might_match_filters(
                 upper_inclusive,
             } => {
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(false);
+                    return Ok(FilterSourceProbe::default());
                 };
                 if schema
                     .fields
                     .iter()
                     .all(|field| field.field_id != *field_id)
                 {
-                    return Ok(false);
+                    return Ok(FilterSourceProbe::default());
                 }
 
                 let Some(stats) = payload_stats.as_ref() else {
@@ -887,90 +929,115 @@ async fn source_might_match_filters(
                     )
                 });
                 if !any_chunk_matches {
-                    return Ok(false);
+                    return Ok(FilterSourceProbe::default());
                 }
             }
         }
     }
 
-    Ok(true)
+    Ok(FilterSourceProbe {
+        might_match: true,
+        exact_candidate_ids: if used_exact_pushdown {
+            exact_candidate_ids
+        } else {
+            None
+        },
+    })
 }
 
-async fn bucket_might_match_filters_via_metadata(
+async fn plan_filter_aware_execution(
     collection: &Collection,
-    bucket_id: u32,
+    routed_bucket_ids: &[u32],
     filters: &[ParsedFilter],
-) -> bool {
-    if filters.is_empty() {
-        return true;
+) -> FilterAwareExecutionPlan {
+    if routed_bucket_ids.is_empty() || filters.is_empty() {
+        return FilterAwareExecutionPlan {
+            bucket_ids: routed_bucket_ids.to_vec(),
+            candidate_ids: HashMap::new(),
+        };
     }
 
-    let Some(version) = collection.bucket_manager.get_version(bucket_id) else {
-        return true;
-    };
     let local_op = match create_staging_operator(collection) {
         Ok(op) => op,
         Err(err) => {
             tracing::debug!(
-                "Filter planner: failed to create staging operator for bucket {}: {}",
-                bucket_id,
+                "Filter planner: failed to create staging operator: {}; disabling pushdown",
                 err
             );
-            return true;
+            return FilterAwareExecutionPlan {
+                bucket_ids: routed_bucket_ids.to_vec(),
+                candidate_ids: HashMap::new(),
+            };
         }
     };
     let remote_op = collection.persistence.operator();
-    let sources = payload_sources_for_class(&version.class, &version.path);
 
-    for source in sources {
-        let probe = match source {
-            PayloadSource::Local(path) => {
-                match UnifiedReader::open(local_op.clone(), &path).await {
-                    Ok(reader) => source_might_match_filters(&reader, filters).await,
-                    Err(err) => Err(err),
-                }
-            }
-            PayloadSource::Remote(path) => {
-                match UnifiedReader::open(remote_op.clone(), &path).await {
-                    Ok(reader) => source_might_match_filters(&reader, filters).await,
-                    Err(err) => Err(err),
-                }
-            }
-        };
-
-        match probe {
-            Ok(true) => return true,
-            Ok(false) => {}
-            Err(err) => {
-                tracing::debug!(
-                    "Filter planner: metadata probe failed for bucket {}: {}; keeping bucket",
-                    bucket_id,
-                    err
-                );
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-async fn plan_filter_aware_bucket_subset(
-    collection: &Collection,
-    routed_bucket_ids: &[u32],
-    filters: &[ParsedFilter],
-) -> Vec<u32> {
-    if routed_bucket_ids.is_empty() || filters.is_empty() {
-        return routed_bucket_ids.to_vec();
-    }
-
-    let mut planned = Vec::with_capacity(routed_bucket_ids.len());
+    let mut plan = FilterAwareExecutionPlan {
+        bucket_ids: Vec::with_capacity(routed_bucket_ids.len()),
+        candidate_ids: HashMap::new(),
+    };
     for &bucket_id in routed_bucket_ids {
-        if bucket_might_match_filters_via_metadata(collection, bucket_id, filters).await {
-            planned.push(bucket_id);
+        let Some(version) = collection.bucket_manager.get_version(bucket_id) else {
+            plan.bucket_ids.push(bucket_id);
+            continue;
+        };
+        let sources = payload_sources_for_class(&version.class, &version.path);
+
+        let mut keep_bucket = false;
+        let mut disable_candidates = false;
+        let mut bucket_candidates = HashSet::new();
+        let mut has_bucket_candidates = false;
+
+        for source in sources {
+            let probe = match source {
+                PayloadSource::Local(path) => {
+                    match UnifiedReader::open(local_op.clone(), &path).await {
+                        Ok(reader) => source_filter_probe(&reader, filters).await,
+                        Err(err) => Err(err),
+                    }
+                }
+                PayloadSource::Remote(path) => {
+                    match UnifiedReader::open(remote_op.clone(), &path).await {
+                        Ok(reader) => source_filter_probe(&reader, filters).await,
+                        Err(err) => Err(err),
+                    }
+                }
+            };
+
+            match probe {
+                Ok(probe) => {
+                    if !probe.might_match {
+                        continue;
+                    }
+                    keep_bucket = true;
+                    if disable_candidates {
+                        continue;
+                    }
+                    if let Some(source_candidates) = probe.exact_candidate_ids {
+                        has_bucket_candidates = true;
+                        bucket_candidates.extend(source_candidates);
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "Filter planner: metadata probe failed for bucket {}: {}; keeping bucket",
+                        bucket_id,
+                        err
+                    );
+                    keep_bucket = true;
+                    disable_candidates = true;
+                }
+            }
+        }
+
+        if keep_bucket {
+            plan.bucket_ids.push(bucket_id);
+            if !disable_candidates && has_bucket_candidates {
+                plan.candidate_ids.insert(bucket_id, bucket_candidates);
+            }
         }
     }
-    planned
+    plan
 }
 
 async fn load_bucket_payload_rows(
@@ -1442,7 +1509,7 @@ impl Drift for DriftService {
         let parsed_filters = parse_filters(&req.filters)?;
         let projection: HashSet<u32> = req.payload_projection_fields.iter().copied().collect();
         let needs_payload_eval = !parsed_filters.is_empty() || !projection.is_empty();
-        let planned_bucket_ids = if parsed_filters.is_empty() {
+        let filter_plan = if parsed_filters.is_empty() {
             None
         } else {
             let routed_bucket_ids = collection.index.select_buckets(
@@ -1451,11 +1518,14 @@ impl Drift for DriftService {
                 req.lambda,
                 req.tau,
             );
-            let pruned =
-                plan_filter_aware_bucket_subset(&collection, &routed_bucket_ids, &parsed_filters)
-                    .await;
-            Some(pruned)
+            Some(
+                plan_filter_aware_execution(&collection, &routed_bucket_ids, &parsed_filters).await,
+            )
         };
+        let bucket_hint = filter_plan.as_ref().map(|p| p.bucket_ids.as_slice());
+        let candidate_ids_hint = filter_plan
+            .as_ref()
+            .and_then(|p| (!p.candidate_ids.is_empty()).then_some(&p.candidate_ids));
         let candidate_k = if needs_payload_eval {
             requested_k.saturating_mul(8).clamp(requested_k, 8192)
         } else {
@@ -1464,13 +1534,14 @@ impl Drift for DriftService {
 
         let results = collection
             .index
-            .search_with_bucket_hint(
+            .search_with_hints(
                 &req.vector,
                 candidate_k,
                 req.target_confidence,
                 req.lambda,
                 req.tau,
-                planned_bucket_ids.as_deref(),
+                bucket_hint,
+                candidate_ids_hint,
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

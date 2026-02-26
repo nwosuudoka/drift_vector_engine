@@ -1,6 +1,7 @@
 pub mod mock;
 
 use async_trait::async_trait;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::io::Result;
 use std::path::PathBuf;
@@ -120,6 +121,21 @@ pub trait StorageEngine: Send + Sync {
         k: usize,                 // Top-K to return
         oversample_factor: usize, // How many candidates to scan (e.g. k * 3)
     ) -> Vec<(u64, f32)>; // Returns (ID, Exact Distance)
+
+    /// Optional ID-level pushdown hint for disk search.
+    /// Keys are bucket_ids; values are allowlisted vector IDs within those buckets.
+    async fn search_and_refine_with_candidates(
+        &self,
+        bucket_ids: &[u32],
+        query: &[f32],
+        k: usize,
+        oversample_factor: usize,
+        candidate_ids: Option<&HashMap<u32, HashSet<u64>>>,
+    ) -> Vec<(u64, f32)> {
+        let _ = candidate_ids;
+        self.search_and_refine(bucket_ids, query, k, oversample_factor)
+            .await
+    }
 
     fn mark_delete(&self, bucket_id: u32, vector_id: u64) -> Result<()>;
     fn get_bucket_stats(&self, bucket_id: u32) -> Option<BucketStats>;

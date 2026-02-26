@@ -98,14 +98,32 @@ mod tests {
             &self,
             bucket_ids: &[u32],
             _query: &[f32],
+            k: usize,
+            oversample: usize,
+        ) -> Vec<(u64, f32)> {
+            self.search_and_refine_with_candidates(bucket_ids, &[], k, oversample, None)
+                .await
+        }
+
+        async fn search_and_refine_with_candidates(
+            &self,
+            bucket_ids: &[u32],
+            _query: &[f32],
             _k: usize,
             _oversample: usize,
+            candidate_ids: Option<&HashMap<u32, HashSet<u64>>>,
         ) -> Vec<(u64, f32)> {
             let data = self.data.read();
             let mut results = Vec::new();
             for bid in bucket_ids {
                 if let Some(items) = data.get(bid) {
+                    let allowed = candidate_ids.and_then(|m| m.get(bid));
                     for (id, dist) in items {
+                        if let Some(allowed) = allowed
+                            && !allowed.contains(id)
+                        {
+                            continue;
+                        }
                         results.push((*id, *dist));
                     }
                 }
@@ -286,6 +304,38 @@ mod tests {
         let hinted_other_ids: Vec<u64> = hinted_other.iter().map(|(id, _)| *id).collect();
         assert!(hinted_other_ids.contains(&200));
         assert!(!hinted_other_ids.contains(&100));
+    }
+
+    #[tokio::test]
+    async fn test_search_with_hints_respects_disk_candidate_ids() {
+        let dir = tempdir().unwrap();
+        let (index, disk) = create_index(&dir, 8);
+
+        disk.insert(0, 100, 0.1);
+        disk.insert(0, 101, 0.2);
+        disk.insert(1, 200, 0.3);
+
+        let mut candidate_ids: HashMap<u32, HashSet<u64>> = HashMap::new();
+        candidate_ids.insert(0, HashSet::from([101u64]));
+        candidate_ids.insert(1, HashSet::from([200u64]));
+
+        let query = vec![-10.0, -10.0];
+        let hinted = index
+            .search_with_hints(
+                &query,
+                10,
+                0.9,
+                1.0,
+                100.0,
+                Some(&[0]),
+                Some(&candidate_ids),
+            )
+            .await
+            .unwrap();
+        let hinted_ids: Vec<u64> = hinted.iter().map(|(id, _)| *id).collect();
+        assert!(hinted_ids.contains(&101));
+        assert!(!hinted_ids.contains(&100));
+        assert!(!hinted_ids.contains(&200));
     }
 
     // --- TEST 3: END-TO-END FLOW ---

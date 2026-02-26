@@ -252,6 +252,18 @@ impl StorageEngine for BucketManager {
         k: usize,
         oversample_factor: usize,
     ) -> Vec<(u64, f32)> {
+        self.search_and_refine_with_candidates(bucket_ids, query, k, oversample_factor, None)
+            .await
+    }
+
+    async fn search_and_refine_with_candidates(
+        &self,
+        bucket_ids: &[u32],
+        query: &[f32],
+        k: usize,
+        oversample_factor: usize,
+        candidate_ids: Option<&HashMap<u32, HashSet<u64>>>,
+    ) -> Vec<(u64, f32)> {
         let mut handles = Vec::with_capacity(bucket_ids.len());
         let metric = self.metric;
 
@@ -260,6 +272,7 @@ impl StorageEngine for BucketManager {
             let remote_op = self.remote_op.clone();
             let sem = self.scan_semaphore.clone();
             let query = query.to_vec();
+            let allowed_ids = candidate_ids.and_then(|m| m.get(&bid).cloned());
 
             let registry = self.registry.clone(); // ⚡ Clone Arc to pass into task
             let coordinator = self.coordinator.clone();
@@ -314,6 +327,12 @@ impl StorageEngine for BucketManager {
 
                 let mut refined_results = Vec::new();
                 for (op, path, label) in ops_to_scan {
+                    if let Some(allowed) = allowed_ids.as_ref()
+                        && allowed.is_empty()
+                    {
+                        break;
+                    }
+
                     match UnifiedReader::open(op, &path).await {
                         Ok(mut reader) => {
                             if let Ok((ids, flat_vectors)) = reader.read_all_vectors_flat().await {
@@ -323,6 +342,11 @@ impl StorageEngine for BucketManager {
 
                                 for (row_idx, id) in ids.into_iter().enumerate() {
                                     if bucket_view.contains(id) {
+                                        continue;
+                                    }
+                                    if let Some(allowed) = allowed_ids.as_ref()
+                                        && !allowed.contains(&id)
+                                    {
                                         continue;
                                     }
                                     let start = row_idx * dim;
