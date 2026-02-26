@@ -175,6 +175,61 @@ Last updated: 2026-02-26
     - inspect why `filtered_candidate_fanout` and `estimated_scan_ratio` remain `1.0`
     - validate whether planner selectivity gate is disabling useful candidate maps
     - define follow-up optimization target for large-tier filtered p95
+  - Progress (2026-02-26):
+    - Implemented first hybrid-routing step:
+      - planner now probes the full routable bucket universe (not only vector-routed buckets) when filters are present.
+      - filter-matched buckets are ranked by centroid distance to the query before search execution.
+      - search hint handling now treats bucket hints as explicit scan scope.
+    - Added focused regression coverage:
+      - `index_tests::test_search_with_bucket_hint_uses_explicit_ids`
+    - Ran large-tier CI-profile benchmark validation (`60k vectors`, `filter_cardinality=128`, 3 samples):
+      - artifacts:
+        - `/tmp/bench_rw_ci_large_item26_hybrid_s1.json`
+        - `/tmp/bench_rw_ci_large_item26_hybrid_s2.json`
+        - `/tmp/bench_rw_ci_large_item26_hybrid_s3.json`
+      - aggregate:
+        - filtered p95: `42.25ms` avg (`41.42..43.72`)
+        - overhead ratio: `6.28x` avg (`5.99..6.69`)
+        - candidate fanout: `1.0`
+        - estimated scan ratio: `1.0`
+      - comparison vs prior baseline (`/tmp/bench_rw_ci_large_item25_final.json`):
+        - filtered p95: `-2.23%`
+        - overhead ratio: `-14.53%`
+        - candidate fanout / scan ratio: unchanged (`1.0 -> 1.0`)
+    - Implemented planner diagnostics v1 (env-gated):
+      - new env toggle: `DRIFT_FILTER_PLANNER_DIAGNOSTICS`
+      - per-query planner snapshot now records full decision matrix:
+        - produced/applied/gated/probe_error + absence reason buckets
+      - benchmark surfacing added:
+        - console ratios
+        - summary JSON fields:
+          - `filtered_planner_*_bucket_ratio`
+          - `filtered_planner_diagnostics_enabled`
+      - validation runs with diagnostics enabled:
+        - `/tmp/bench_rw_ci_large_item26_diag_s1.json`
+        - `/tmp/bench_rw_ci_large_item26_diag_s2.json`
+        - `/tmp/bench_rw_ci_large_item26_diag_s3.json`
+      - aggregate (3 samples):
+        - filtered p95: `39.66ms` avg (`39.09..40.32`)
+        - overhead ratio: `6.76x` avg (`6.55..6.89`)
+      - observed root-cause shape:
+        - `filtered_planner_produced_bucket_ratio=1.0`
+        - `filtered_planner_applied_bucket_ratio=1.0`
+        - `filtered_planner_gated_bucket_ratio=0.0`
+        - `filtered_planner_probe_error_bucket_ratio=0.0`
+        - all absence-reason ratios `0.0`
+        - `filtered_candidate_fanout=1.0`, `filtered_estimated_scan_ratio=1.0`
+  - Remaining:
+    - verify tenant/value distribution per bucket in benchmark dataset to confirm why exact postings are broad (`candidate_count ~= live_count`).
+    - add benchmark variants with stronger tenant locality (or higher cardinality) to measure achievable scan-ratio reduction from existing pushdown.
+    - decide whether to prioritize data-layout-aware partitioning/catalog changes versus query-time metadata indexing.
+    - decide whether adaptive field-to-bucket metadata indexing is required for planner cost control.
+- [ ] 27. Define adaptive metadata catalog for filter-to-bucket routing (v2).
+  - Goal: avoid probing every bucket at query time while preserving filter-first correctness.
+  - Scope:
+    - design a compact field-level bucket membership catalog (exact + range stats pointers).
+    - define update lifecycle across flush/split/merge/promotion/recovery.
+    - wire planner to consult catalog first, then fallback to direct metadata probe on miss/staleness.
 - [x] 1. Run full workspace regression once before commit.
   - Command: `cargo test --workspace`
 - [x] 2. Extend unified header/footer with metric + schema hash fields.

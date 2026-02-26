@@ -1,6 +1,7 @@
 use crate::kmeans::KMeansAlgorithm;
 use crate::math::Metric;
 use crate::memtable::{MemTable, MemTableOptions};
+use crate::metric_strategy::strategy_for;
 use crate::partitioner::{IncrementalPartitioner, PartitionGroup, PartitionResult};
 use crate::payload::{PayloadRow, PayloadSchema};
 use crate::router::Router;
@@ -323,6 +324,63 @@ impl VectorIndex {
         router.select_buckets(query, target, lambda, tau)
     }
 
+    pub fn all_routable_bucket_ids(&self) -> Vec<u32> {
+        let router = self.router.read();
+        let (_, ids) = router.get_snapshot();
+        ids
+    }
+
+    pub fn rank_bucket_ids_by_query_distance(&self, query: &[f32], bucket_ids: &[u32]) -> Vec<u32> {
+        if bucket_ids.len() <= 1 {
+            return bucket_ids.to_vec();
+        }
+
+        let (flat_centroids, ids, dim, metric) = {
+            let router = self.router.read();
+            let (flat, ids) = router.get_snapshot();
+            (flat, ids, router.dim(), router.metric())
+        };
+
+        if query.len() != dim {
+            return bucket_ids.to_vec();
+        }
+
+        let scorer = strategy_for(metric);
+        let mut centroid_scores: HashMap<u32, f32> = HashMap::with_capacity(ids.len());
+        for (idx, bucket_id) in ids.iter().enumerate() {
+            let start = idx * dim;
+            let end = start + dim;
+            if end > flat_centroids.len() {
+                continue;
+            }
+            let centroid = &flat_centroids[start..end];
+            centroid_scores.insert(*bucket_id, scorer.score(query, centroid));
+        }
+
+        let mut ranked: Vec<(u32, f32, usize)> = bucket_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, bucket_id)| {
+                (
+                    bucket_id,
+                    *centroid_scores.get(&bucket_id).unwrap_or(&f32::INFINITY),
+                    idx,
+                )
+            })
+            .collect();
+
+        ranked.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        ranked
+            .into_iter()
+            .map(|(bucket_id, _, _)| bucket_id)
+            .collect()
+    }
+
     pub async fn search_with_bucket_hint(
         &self,
         query: &[f32],
@@ -348,11 +406,11 @@ impl VectorIndex {
     ) -> io::Result<Vec<(u64, f32)>> {
         let (bucket_ids, metric) = {
             let router = self.router.read();
-            let mut selected = router.select_buckets(query, target, lambda, tau);
-            if let Some(hint) = bucket_hint {
-                let allowed: HashSet<u32> = hint.iter().copied().collect();
-                selected.retain(|id| allowed.contains(id));
-            }
+            let selected = if let Some(hint) = bucket_hint {
+                hint.to_vec()
+            } else {
+                router.select_buckets(query, target, lambda, tau)
+            };
             (selected, router.metric())
         };
         let mut hint_stats = SearchHintStats {

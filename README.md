@@ -202,6 +202,19 @@ CI default filtered guardrails (when `CI=1` and explicit filtered limits are not
 - medium tier (`10_001..=50_000`): `max_filtered_p95_ms=35`, `max_filtered_overhead_ratio=7.0`
 - large tier (`> 50_000`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=10.0`
 
+Optional planner diagnostics for filtered benchmarks:
+- Enable with `DRIFT_FILTER_PLANNER_DIAGNOSTICS=1`.
+- `bench_rw` will print planner decision ratios per probed bucket and include these summary JSON fields:
+  - `filtered_planner_produced_bucket_ratio`
+  - `filtered_planner_applied_bucket_ratio`
+  - `filtered_planner_gated_bucket_ratio`
+  - `filtered_planner_probe_error_bucket_ratio`
+  - `filtered_planner_empty_exact_bucket_ratio`
+  - `filtered_planner_no_index_bucket_ratio`
+  - `filtered_planner_range_stats_only_bucket_ratio`
+  - `filtered_planner_other_absence_bucket_ratio`
+  - `filtered_planner_diagnostics_enabled`
+
 ## Workspace layout
 
 - `drift_core`: index, router, memtable, WAL, payload model, maintenance algorithms.

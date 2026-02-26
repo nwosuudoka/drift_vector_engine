@@ -10,6 +10,9 @@ use crate::drift_proto::{
     HealthRequest, HealthResponse, InsertResponse, NvmeCacheMetrics, RecoveryGuardMetrics,
     TrainRequest, TrainResponse,
 };
+use crate::filter_planner_diagnostics::{
+    FilterPlannerDiagnosticsSnapshot, diagnostics_enabled_from_env,
+};
 use crate::manager::{Collection, CollectionManager};
 use crate::recovery::RecoveryManager;
 use drift_core::math::Metric;
@@ -791,12 +794,100 @@ fn intersect_candidate_ids(existing: &mut HashSet<u64>, next: &HashSet<u64>) {
 struct FilterSourceProbe {
     might_match: bool,
     exact_candidate_ids: Option<HashSet<u64>>,
+    saw_exact_filter: bool,
+    saw_indexed_exact_filter: bool,
+    saw_empty_exact_match: bool,
+    saw_range_filter: bool,
 }
 
 #[derive(Default)]
 struct FilterAwareExecutionPlan {
     bucket_ids: Vec<u32>,
     candidate_ids: HashMap<u32, HashSet<u64>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateAbsenceReason {
+    EmptyExactMatch,
+    NoIndexedExact,
+    RangeStatsOnly,
+    Other,
+}
+
+fn classify_candidate_absence_reason(
+    saw_exact_filter: bool,
+    saw_indexed_exact_filter: bool,
+    saw_empty_exact_match: bool,
+    saw_range_filter: bool,
+) -> CandidateAbsenceReason {
+    if saw_empty_exact_match {
+        return CandidateAbsenceReason::EmptyExactMatch;
+    }
+    if saw_exact_filter && !saw_indexed_exact_filter {
+        return CandidateAbsenceReason::NoIndexedExact;
+    }
+    if saw_range_filter && !saw_exact_filter {
+        return CandidateAbsenceReason::RangeStatsOnly;
+    }
+    CandidateAbsenceReason::Other
+}
+
+fn record_candidate_decision(
+    snapshot: &mut FilterPlannerDiagnosticsSnapshot,
+    has_bucket_candidates: bool,
+    candidate_applied: bool,
+    candidate_gated: bool,
+    disable_candidates: bool,
+    bucket_candidate_count: usize,
+    saw_exact_filter: bool,
+    saw_indexed_exact_filter: bool,
+    saw_empty_exact_match: bool,
+    saw_range_filter: bool,
+) {
+    if has_bucket_candidates {
+        snapshot.candidate_produced_bucket_count += 1;
+        snapshot.candidate_id_count += bucket_candidate_count;
+        if candidate_applied {
+            snapshot.candidate_applied_bucket_count += 1;
+        } else if candidate_gated {
+            snapshot.candidate_gated_broad_selectivity_bucket_count += 1;
+        } else {
+            snapshot.candidate_other_absence_bucket_count += 1;
+        }
+        return;
+    }
+
+    if disable_candidates {
+        snapshot.candidate_disabled_probe_error_bucket_count += 1;
+        return;
+    }
+
+    match classify_candidate_absence_reason(
+        saw_exact_filter,
+        saw_indexed_exact_filter,
+        saw_empty_exact_match,
+        saw_range_filter,
+    ) {
+        CandidateAbsenceReason::EmptyExactMatch => {
+            snapshot.candidate_empty_exact_match_bucket_count += 1;
+        }
+        CandidateAbsenceReason::NoIndexedExact => {
+            snapshot.candidate_no_indexed_exact_bucket_count += 1;
+        }
+        CandidateAbsenceReason::RangeStatsOnly => {
+            snapshot.candidate_range_stats_only_bucket_count += 1;
+        }
+        CandidateAbsenceReason::Other => {
+            snapshot.candidate_other_absence_bucket_count += 1;
+        }
+    }
+}
+
+fn write_last_filter_planner_diagnostics(
+    collection: &Collection,
+    snapshot: FilterPlannerDiagnosticsSnapshot,
+) {
+    *collection.last_filter_planner_diagnostics.write() = snapshot;
 }
 
 const CANDIDATE_PUSHDOWN_MAX_SELECTIVITY: f64 = 0.85;
@@ -822,6 +913,10 @@ async fn source_filter_probe(
         return Ok(FilterSourceProbe {
             might_match: true,
             exact_candidate_ids: None,
+            saw_exact_filter: false,
+            saw_indexed_exact_filter: false,
+            saw_empty_exact_match: false,
+            saw_range_filter: false,
         });
     }
 
@@ -838,24 +933,44 @@ async fn source_filter_probe(
 
     let mut exact_candidate_ids: Option<HashSet<u64>> = None;
     let mut used_exact_pushdown = false;
+    let mut saw_exact_filter = false;
+    let mut saw_indexed_exact_filter = false;
+    let mut saw_empty_exact_match = false;
+    let mut saw_range_filter = false;
 
     for filter in filters {
         match filter {
             ParsedFilter::Exact { field_id, value } => {
+                saw_exact_filter = true;
                 if matches!(value, UnifiedPayloadValue::Null) {
                     continue;
                 }
 
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(FilterSourceProbe::default());
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 };
                 let Some(field) = schema.fields.iter().find(|f| f.field_id == *field_id) else {
-                    return Ok(FilterSourceProbe::default());
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 };
 
                 if !field.indexed {
                     continue;
                 }
+                saw_indexed_exact_filter = true;
 
                 let matches: HashSet<u64> = reader
                     .filter_ids_exact(*field_id, value)
@@ -863,20 +978,37 @@ async fn source_filter_probe(
                     .into_iter()
                     .collect();
                 if matches.is_empty() {
-                    return Ok(FilterSourceProbe::default());
+                    saw_empty_exact_match = true;
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 }
 
                 used_exact_pushdown = true;
                 if let Some(existing) = exact_candidate_ids.as_mut() {
                     intersect_candidate_ids(existing, &matches);
                     if existing.is_empty() {
-                        return Ok(FilterSourceProbe::default());
+                        saw_empty_exact_match = true;
+                        return Ok(FilterSourceProbe {
+                            might_match: false,
+                            exact_candidate_ids: None,
+                            saw_exact_filter,
+                            saw_indexed_exact_filter,
+                            saw_empty_exact_match,
+                            saw_range_filter,
+                        });
                     }
                 } else {
                     exact_candidate_ids = Some(matches);
                 }
             }
             ParsedFilter::AnyOf { field_id, values } => {
+                saw_exact_filter = true;
                 if values
                     .iter()
                     .any(|value| matches!(value, UnifiedPayloadValue::Null))
@@ -885,29 +1017,60 @@ async fn source_filter_probe(
                 }
 
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(FilterSourceProbe::default());
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 };
                 let Some(field) = schema.fields.iter().find(|f| f.field_id == *field_id) else {
-                    return Ok(FilterSourceProbe::default());
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 };
 
                 if !field.indexed {
                     continue;
                 }
+                saw_indexed_exact_filter = true;
 
                 let mut matches = HashSet::new();
                 for value in values {
                     matches.extend(reader.filter_ids_exact(*field_id, value).await?);
                 }
                 if matches.is_empty() {
-                    return Ok(FilterSourceProbe::default());
+                    saw_empty_exact_match = true;
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 }
 
                 used_exact_pushdown = true;
                 if let Some(existing) = exact_candidate_ids.as_mut() {
                     intersect_candidate_ids(existing, &matches);
                     if existing.is_empty() {
-                        return Ok(FilterSourceProbe::default());
+                        saw_empty_exact_match = true;
+                        return Ok(FilterSourceProbe {
+                            might_match: false,
+                            exact_candidate_ids: None,
+                            saw_exact_filter,
+                            saw_indexed_exact_filter,
+                            saw_empty_exact_match,
+                            saw_range_filter,
+                        });
                     }
                 } else {
                     exact_candidate_ids = Some(matches);
@@ -920,15 +1083,30 @@ async fn source_filter_probe(
                 upper,
                 upper_inclusive,
             } => {
+                saw_range_filter = true;
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(FilterSourceProbe::default());
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 };
                 if schema
                     .fields
                     .iter()
                     .all(|field| field.field_id != *field_id)
                 {
-                    return Ok(FilterSourceProbe::default());
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 }
 
                 let Some(stats) = payload_stats.as_ref() else {
@@ -945,7 +1123,14 @@ async fn source_filter_probe(
                     )
                 });
                 if !any_chunk_matches {
-                    return Ok(FilterSourceProbe::default());
+                    return Ok(FilterSourceProbe {
+                        might_match: false,
+                        exact_candidate_ids: None,
+                        saw_exact_filter,
+                        saw_indexed_exact_filter,
+                        saw_empty_exact_match,
+                        saw_range_filter,
+                    });
                 }
             }
         }
@@ -958,19 +1143,48 @@ async fn source_filter_probe(
         } else {
             None
         },
+        saw_exact_filter,
+        saw_indexed_exact_filter,
+        saw_empty_exact_match,
+        saw_range_filter,
     })
 }
 
 async fn plan_filter_aware_execution(
     collection: &Collection,
+    planning_bucket_ids: &[u32],
     routed_bucket_ids: &[u32],
+    query: &[f32],
     filters: &[ParsedFilter],
 ) -> FilterAwareExecutionPlan {
-    if routed_bucket_ids.is_empty() || filters.is_empty() {
-        return FilterAwareExecutionPlan {
+    let diagnostics_enabled = diagnostics_enabled_from_env();
+    let mut diagnostics = FilterPlannerDiagnosticsSnapshot {
+        enabled: diagnostics_enabled,
+        query_has_filters: !filters.is_empty(),
+        ..FilterPlannerDiagnosticsSnapshot::default()
+    };
+
+    if filters.is_empty() {
+        let plan = FilterAwareExecutionPlan {
             bucket_ids: routed_bucket_ids.to_vec(),
             candidate_ids: HashMap::new(),
         };
+        write_last_filter_planner_diagnostics(collection, diagnostics);
+        return plan;
+    }
+
+    let probe_bucket_ids = if planning_bucket_ids.is_empty() {
+        routed_bucket_ids
+    } else {
+        planning_bucket_ids
+    };
+    if probe_bucket_ids.is_empty() {
+        let plan = FilterAwareExecutionPlan {
+            bucket_ids: routed_bucket_ids.to_vec(),
+            candidate_ids: HashMap::new(),
+        };
+        write_last_filter_planner_diagnostics(collection, diagnostics);
+        return plan;
     }
 
     let local_op = match create_staging_operator(collection) {
@@ -980,21 +1194,45 @@ async fn plan_filter_aware_execution(
                 "Filter planner: failed to create staging operator: {}; disabling pushdown",
                 err
             );
-            return FilterAwareExecutionPlan {
+            if diagnostics_enabled {
+                diagnostics.candidate_disabled_probe_error_bucket_count = probe_bucket_ids.len();
+            }
+            let plan = FilterAwareExecutionPlan {
                 bucket_ids: routed_bucket_ids.to_vec(),
                 candidate_ids: HashMap::new(),
             };
+            write_last_filter_planner_diagnostics(collection, diagnostics);
+            return plan;
         }
     };
     let remote_op = collection.persistence.operator();
 
     let mut plan = FilterAwareExecutionPlan {
-        bucket_ids: Vec::with_capacity(routed_bucket_ids.len()),
+        bucket_ids: Vec::with_capacity(probe_bucket_ids.len()),
         candidate_ids: HashMap::new(),
     };
-    for &bucket_id in routed_bucket_ids {
+    for &bucket_id in probe_bucket_ids {
+        if diagnostics_enabled {
+            diagnostics.probed_bucket_count += 1;
+        }
+
         let Some(version) = collection.bucket_manager.get_version(bucket_id) else {
             plan.bucket_ids.push(bucket_id);
+            if diagnostics_enabled {
+                diagnostics.kept_bucket_count += 1;
+                record_candidate_decision(
+                    &mut diagnostics,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0,
+                    false,
+                    false,
+                    false,
+                    false,
+                );
+            }
             continue;
         };
         let sources = payload_sources_for_class(&version.class, &version.path);
@@ -1003,6 +1241,12 @@ async fn plan_filter_aware_execution(
         let mut disable_candidates = false;
         let mut bucket_candidates = HashSet::new();
         let mut has_bucket_candidates = false;
+        let mut saw_exact_filter = false;
+        let mut saw_indexed_exact_filter = false;
+        let mut saw_empty_exact_match = false;
+        let mut saw_range_filter = false;
+        let mut candidate_applied = false;
+        let mut candidate_gated = false;
 
         for source in sources {
             let probe = match source {
@@ -1022,6 +1266,10 @@ async fn plan_filter_aware_execution(
 
             match probe {
                 Ok(probe) => {
+                    saw_exact_filter |= probe.saw_exact_filter;
+                    saw_indexed_exact_filter |= probe.saw_indexed_exact_filter;
+                    saw_empty_exact_match |= probe.saw_empty_exact_match;
+                    saw_range_filter |= probe.saw_range_filter;
                     if !probe.might_match {
                         continue;
                     }
@@ -1046,6 +1294,15 @@ async fn plan_filter_aware_execution(
             }
         }
 
+        if diagnostics_enabled {
+            if keep_bucket {
+                diagnostics.kept_bucket_count += 1;
+            } else {
+                diagnostics.pruned_bucket_count += 1;
+            }
+        }
+
+        let candidate_count = bucket_candidates.len();
         if keep_bucket {
             plan.bucket_ids.push(bucket_id);
             if !disable_candidates && has_bucket_candidates {
@@ -1056,6 +1313,7 @@ async fn plan_filter_aware_execution(
                     .unwrap_or(0);
                 if should_apply_candidate_pushdown(bucket_live_ids, bucket_candidates.len()) {
                     plan.candidate_ids.insert(bucket_id, bucket_candidates);
+                    candidate_applied = true;
                 } else {
                     tracing::debug!(
                         "Filter planner: skipping candidate pushdown for bucket {} due to broad selectivity (candidates={}, live_ids={})",
@@ -1063,16 +1321,48 @@ async fn plan_filter_aware_execution(
                         bucket_candidates.len(),
                         bucket_live_ids
                     );
+                    candidate_gated = true;
                 }
             }
         }
+
+        if diagnostics_enabled {
+            record_candidate_decision(
+                &mut diagnostics,
+                has_bucket_candidates,
+                candidate_applied,
+                candidate_gated,
+                disable_candidates,
+                candidate_count,
+                saw_exact_filter,
+                saw_indexed_exact_filter,
+                saw_empty_exact_match,
+                saw_range_filter,
+            );
+        }
     }
+    if plan.bucket_ids.is_empty() {
+        let plan = FilterAwareExecutionPlan {
+            bucket_ids: routed_bucket_ids.to_vec(),
+            candidate_ids: HashMap::new(),
+        };
+        write_last_filter_planner_diagnostics(collection, diagnostics);
+        return plan;
+    }
+    plan.bucket_ids = collection
+        .index
+        .rank_bucket_ids_by_query_distance(query, &plan.bucket_ids);
+    write_last_filter_planner_diagnostics(collection, diagnostics);
     plan
 }
 
 #[cfg(test)]
 mod planner_heuristic_tests {
-    use super::should_apply_candidate_pushdown;
+    use super::{
+        CandidateAbsenceReason, FilterPlannerDiagnosticsSnapshot,
+        classify_candidate_absence_reason, record_candidate_decision,
+        should_apply_candidate_pushdown,
+    };
 
     #[test]
     fn candidate_pushdown_disables_broad_selectivity() {
@@ -1089,6 +1379,140 @@ mod planner_heuristic_tests {
     #[test]
     fn candidate_pushdown_keeps_candidates_when_stats_missing() {
         assert!(should_apply_candidate_pushdown(0, 16));
+    }
+
+    #[test]
+    fn candidate_absence_classification_precedence() {
+        assert_eq!(
+            classify_candidate_absence_reason(true, true, true, false),
+            CandidateAbsenceReason::EmptyExactMatch
+        );
+        assert_eq!(
+            classify_candidate_absence_reason(true, false, false, true),
+            CandidateAbsenceReason::NoIndexedExact
+        );
+        assert_eq!(
+            classify_candidate_absence_reason(false, false, false, true),
+            CandidateAbsenceReason::RangeStatsOnly
+        );
+        assert_eq!(
+            classify_candidate_absence_reason(false, false, false, false),
+            CandidateAbsenceReason::Other
+        );
+    }
+
+    #[test]
+    fn candidate_decision_records_produced_and_applied() {
+        let mut snapshot = FilterPlannerDiagnosticsSnapshot::default();
+        record_candidate_decision(
+            &mut snapshot,
+            true,
+            true,
+            false,
+            false,
+            9,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(snapshot.candidate_produced_bucket_count, 1);
+        assert_eq!(snapshot.candidate_applied_bucket_count, 1);
+        assert_eq!(snapshot.candidate_gated_broad_selectivity_bucket_count, 0);
+        assert_eq!(snapshot.candidate_id_count, 9);
+    }
+
+    #[test]
+    fn candidate_decision_records_produced_and_gated() {
+        let mut snapshot = FilterPlannerDiagnosticsSnapshot::default();
+        record_candidate_decision(
+            &mut snapshot,
+            true,
+            false,
+            true,
+            false,
+            12,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(snapshot.candidate_produced_bucket_count, 1);
+        assert_eq!(snapshot.candidate_applied_bucket_count, 0);
+        assert_eq!(snapshot.candidate_gated_broad_selectivity_bucket_count, 1);
+        assert_eq!(snapshot.candidate_id_count, 12);
+    }
+
+    #[test]
+    fn candidate_decision_records_probe_error_disable() {
+        let mut snapshot = FilterPlannerDiagnosticsSnapshot::default();
+        record_candidate_decision(
+            &mut snapshot,
+            false,
+            false,
+            false,
+            true,
+            0,
+            true,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(snapshot.candidate_disabled_probe_error_bucket_count, 1);
+    }
+
+    #[test]
+    fn candidate_decision_records_empty_exact_match_reason() {
+        let mut snapshot = FilterPlannerDiagnosticsSnapshot::default();
+        record_candidate_decision(
+            &mut snapshot,
+            false,
+            false,
+            false,
+            false,
+            0,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(snapshot.candidate_empty_exact_match_bucket_count, 1);
+    }
+
+    #[test]
+    fn candidate_decision_records_no_indexed_exact_reason() {
+        let mut snapshot = FilterPlannerDiagnosticsSnapshot::default();
+        record_candidate_decision(
+            &mut snapshot,
+            false,
+            false,
+            false,
+            false,
+            0,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(snapshot.candidate_no_indexed_exact_bucket_count, 1);
+    }
+
+    #[test]
+    fn candidate_decision_records_range_stats_only_reason() {
+        let mut snapshot = FilterPlannerDiagnosticsSnapshot::default();
+        record_candidate_decision(
+            &mut snapshot,
+            false,
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(snapshot.candidate_range_stats_only_bucket_count, 1);
     }
 }
 
@@ -1562,8 +1986,17 @@ impl Drift for DriftService {
         let projection: HashSet<u32> = req.payload_projection_fields.iter().copied().collect();
         let needs_payload_eval = !parsed_filters.is_empty() || !projection.is_empty();
         let filter_plan = if parsed_filters.is_empty() {
+            write_last_filter_planner_diagnostics(
+                &collection,
+                FilterPlannerDiagnosticsSnapshot {
+                    enabled: diagnostics_enabled_from_env(),
+                    query_has_filters: false,
+                    ..FilterPlannerDiagnosticsSnapshot::default()
+                },
+            );
             None
         } else {
+            let planning_bucket_ids = collection.index.all_routable_bucket_ids();
             let routed_bucket_ids = collection.index.select_buckets(
                 &req.vector,
                 req.target_confidence,
@@ -1571,7 +2004,14 @@ impl Drift for DriftService {
                 req.tau,
             );
             Some(
-                plan_filter_aware_execution(&collection, &routed_bucket_ids, &parsed_filters).await,
+                plan_filter_aware_execution(
+                    &collection,
+                    &planning_bucket_ids,
+                    &routed_bucket_ids,
+                    &req.vector,
+                    &parsed_filters,
+                )
+                .await,
             )
         };
         let bucket_hint = filter_plan.as_ref().map(|p| p.bucket_ids.as_slice());

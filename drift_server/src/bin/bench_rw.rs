@@ -5,6 +5,9 @@ use drift_server::drift_proto::drift_server::Drift;
 use drift_server::drift_proto::{
     FieldFilter, InsertBatchRequest, PayloadRow, PayloadValue, SearchRequest, Vector,
 };
+use drift_server::filter_planner_diagnostics::{
+    FILTER_PLANNER_DIAGNOSTICS_ENV, diagnostics_enabled_from_env,
+};
 use drift_server::manager::CollectionManager;
 use drift_server::server::DriftService;
 use rand::prelude::*;
@@ -119,6 +122,15 @@ struct BenchSummary {
     filtered_candidate_fanout: Option<f64>,
     filtered_estimated_scanned_ids_avg: Option<f64>,
     filtered_estimated_scan_ratio: Option<f64>,
+    filtered_planner_produced_bucket_ratio: Option<f64>,
+    filtered_planner_applied_bucket_ratio: Option<f64>,
+    filtered_planner_gated_bucket_ratio: Option<f64>,
+    filtered_planner_probe_error_bucket_ratio: Option<f64>,
+    filtered_planner_empty_exact_bucket_ratio: Option<f64>,
+    filtered_planner_no_index_bucket_ratio: Option<f64>,
+    filtered_planner_range_stats_only_bucket_ratio: Option<f64>,
+    filtered_planner_other_absence_bucket_ratio: Option<f64>,
+    filtered_planner_diagnostics_enabled: Option<bool>,
     ci_guardrail_tier: Option<String>,
     effective_max_filtered_p95_ms: Option<f64>,
     effective_max_filtered_overhead_ratio: Option<f64>,
@@ -227,6 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let effective_max_filtered_overhead_ratio = args
         .max_filtered_overhead_ratio
         .or_else(|| ci_defaults.map(|defaults| defaults.max_filtered_overhead_ratio));
+    let planner_diagnostics_enabled = diagnostics_enabled_from_env();
     const TENANT_FIELD_ID: u32 = 1;
     const PRICE_FIELD_ID: u32 = 2;
 
@@ -431,8 +444,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         filtered_candidate_fanout,
         filtered_estimated_scanned_ids_avg,
         filtered_estimated_scan_ratio,
+        filtered_planner_produced_bucket_ratio,
+        filtered_planner_applied_bucket_ratio,
+        filtered_planner_gated_bucket_ratio,
+        filtered_planner_probe_error_bucket_ratio,
+        filtered_planner_empty_exact_bucket_ratio,
+        filtered_planner_no_index_bucket_ratio,
+        filtered_planner_range_stats_only_bucket_ratio,
+        filtered_planner_other_absence_bucket_ratio,
+        filtered_planner_diagnostics_enabled,
     ) = if args.filtered_query_count == 0 {
-        (None, None, None, None, None, None, None)
+        (
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None,
+        )
     } else {
         println!("\n🧪 Filtered Read Benchmark...");
 
@@ -464,6 +489,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut total_candidate_ids = 0usize;
         let mut total_scanned_ids = 0usize;
         let mut total_live_bucket_ids = 0usize;
+        let mut total_planner_probed_buckets = 0usize;
+        let mut total_planner_produced_buckets = 0usize;
+        let mut total_planner_applied_buckets = 0usize;
+        let mut total_planner_gated_buckets = 0usize;
+        let mut total_planner_probe_error_buckets = 0usize;
+        let mut total_planner_empty_exact_buckets = 0usize;
+        let mut total_planner_no_index_buckets = 0usize;
+        let mut total_planner_range_stats_only_buckets = 0usize;
+        let mut total_planner_other_absence_buckets = 0usize;
         let start_filtered = Instant::now();
         for i in 0..args.filtered_query_count {
             let tenant_idx = i % filter_cardinality;
@@ -494,6 +528,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             total_candidate_ids += hint_stats.candidate_id_count;
             total_scanned_ids += hint_stats.estimated_scanned_ids;
             total_live_bucket_ids += hint_stats.estimated_total_bucket_ids;
+            if planner_diagnostics_enabled {
+                let planner_diag = *coll.last_filter_planner_diagnostics.read();
+                total_planner_probed_buckets += planner_diag.probed_bucket_count;
+                total_planner_produced_buckets += planner_diag.candidate_produced_bucket_count;
+                total_planner_applied_buckets += planner_diag.candidate_applied_bucket_count;
+                total_planner_gated_buckets +=
+                    planner_diag.candidate_gated_broad_selectivity_bucket_count;
+                total_planner_probe_error_buckets +=
+                    planner_diag.candidate_disabled_probe_error_bucket_count;
+                total_planner_empty_exact_buckets +=
+                    planner_diag.candidate_empty_exact_match_bucket_count;
+                total_planner_no_index_buckets +=
+                    planner_diag.candidate_no_indexed_exact_bucket_count;
+                total_planner_range_stats_only_buckets +=
+                    planner_diag.candidate_range_stats_only_bucket_count;
+                total_planner_other_absence_buckets +=
+                    planner_diag.candidate_other_absence_bucket_count;
+            }
         }
         let filtered_duration = start_filtered.elapsed();
         let qps = args.filtered_query_count as f64 / filtered_duration.as_secs_f64();
@@ -532,6 +584,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             avg_scanned_ids, estimated_scan_ratio
         );
 
+        let (
+            planner_produced_bucket_ratio,
+            planner_applied_bucket_ratio,
+            planner_gated_bucket_ratio,
+            planner_probe_error_bucket_ratio,
+            planner_empty_exact_bucket_ratio,
+            planner_no_index_bucket_ratio,
+            planner_range_stats_only_bucket_ratio,
+            planner_other_absence_bucket_ratio,
+        ) = if planner_diagnostics_enabled {
+            let planner_ratio = |value: usize, total: usize| {
+                if total > 0 {
+                    value as f64 / total as f64
+                } else {
+                    0.0
+                }
+            };
+            let produced_ratio =
+                planner_ratio(total_planner_produced_buckets, total_planner_probed_buckets);
+            let applied_ratio =
+                planner_ratio(total_planner_applied_buckets, total_planner_probed_buckets);
+            let gated_ratio =
+                planner_ratio(total_planner_gated_buckets, total_planner_probed_buckets);
+            let probe_error_ratio = planner_ratio(
+                total_planner_probe_error_buckets,
+                total_planner_probed_buckets,
+            );
+            let empty_exact_ratio = planner_ratio(
+                total_planner_empty_exact_buckets,
+                total_planner_probed_buckets,
+            );
+            let no_index_ratio =
+                planner_ratio(total_planner_no_index_buckets, total_planner_probed_buckets);
+            let range_stats_only_ratio = planner_ratio(
+                total_planner_range_stats_only_buckets,
+                total_planner_probed_buckets,
+            );
+            let other_absence_ratio = planner_ratio(
+                total_planner_other_absence_buckets,
+                total_planner_probed_buckets,
+            );
+
+            println!(
+                "   • Planner diagnostics (per probed bucket): produced={:.3}, applied={:.3}, gated={:.3}, probe_error={:.3}",
+                produced_ratio, applied_ratio, gated_ratio, probe_error_ratio
+            );
+            println!(
+                "   • Planner absence reasons: empty_exact={:.3}, no_index={:.3}, range_stats_only={:.3}, other={:.3}",
+                empty_exact_ratio, no_index_ratio, range_stats_only_ratio, other_absence_ratio
+            );
+            (
+                Some(produced_ratio),
+                Some(applied_ratio),
+                Some(gated_ratio),
+                Some(probe_error_ratio),
+                Some(empty_exact_ratio),
+                Some(no_index_ratio),
+                Some(range_stats_only_ratio),
+                Some(other_absence_ratio),
+            )
+        } else {
+            println!(
+                "   • Planner diagnostics disabled (set {}=1 to enable)",
+                FILTER_PLANNER_DIAGNOSTICS_ENV
+            );
+            (None, None, None, None, None, None, None, None)
+        };
+
         (
             Some(qps),
             Some(f_p95),
@@ -540,6 +660,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(candidate_fanout),
             Some(avg_scanned_ids),
             Some(estimated_scan_ratio),
+            planner_produced_bucket_ratio,
+            planner_applied_bucket_ratio,
+            planner_gated_bucket_ratio,
+            planner_probe_error_bucket_ratio,
+            planner_empty_exact_bucket_ratio,
+            planner_no_index_bucket_ratio,
+            planner_range_stats_only_bucket_ratio,
+            planner_other_absence_bucket_ratio,
+            Some(planner_diagnostics_enabled),
         )
     };
 
@@ -612,6 +741,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             filtered_candidate_fanout,
             filtered_estimated_scanned_ids_avg,
             filtered_estimated_scan_ratio,
+            filtered_planner_produced_bucket_ratio,
+            filtered_planner_applied_bucket_ratio,
+            filtered_planner_gated_bucket_ratio,
+            filtered_planner_probe_error_bucket_ratio,
+            filtered_planner_empty_exact_bucket_ratio,
+            filtered_planner_no_index_bucket_ratio,
+            filtered_planner_range_stats_only_bucket_ratio,
+            filtered_planner_other_absence_bucket_ratio,
+            filtered_planner_diagnostics_enabled,
             ci_guardrail_tier: ci_defaults.map(|defaults| defaults.tier_label.to_string()),
             effective_max_filtered_p95_ms,
             effective_max_filtered_overhead_ratio,

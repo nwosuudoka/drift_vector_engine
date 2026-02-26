@@ -307,6 +307,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_with_bucket_hint_uses_explicit_ids() {
+        let dir = tempdir().unwrap();
+        let (index, disk) = create_index(&dir, 8);
+
+        // Bucket 42 is not part of the router's centroid set in this test setup.
+        disk.insert(42, 4242, 0.05);
+        disk.insert(0, 100, 0.1);
+
+        let query = vec![-10.0, -10.0];
+        let hinted = index
+            .search_with_bucket_hint(&query, 10, 0.9, 1.0, 100.0, Some(&[42]))
+            .await
+            .unwrap();
+        let hinted_ids: Vec<u64> = hinted.iter().map(|(id, _)| *id).collect();
+        assert!(hinted_ids.contains(&4242));
+        assert!(!hinted_ids.contains(&100));
+    }
+
+    #[tokio::test]
     async fn test_search_with_hints_respects_disk_candidate_ids() {
         let dir = tempdir().unwrap();
         let (index, disk) = create_index(&dir, 8);

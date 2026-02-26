@@ -1,5 +1,134 @@
 # Session Log
 
+## 2026-02-26 (item 26 instrumentation: planner diagnostics v1 + bench surfacing)
+- Goal:
+  - Implement env-gated planner decision diagnostics to identify why large-tier filtered scan ratio remains `1.0`.
+- Work completed:
+  - Added planner diagnostics module:
+    - `DRIFT_FILTER_PLANNER_DIAGNOSTICS` env toggle (truthy parser + cached `OnceLock` read).
+    - `FilterPlannerDiagnosticsSnapshot` with full decision matrix counters.
+  - Wired collection-local diagnostics snapshot storage in `Collection`.
+  - Instrumented server planner path:
+    - extended source probe metadata with classification hints.
+    - added deterministic absence classification precedence:
+      - `empty_exact_match` > `no_indexed_exact` > `range_stats_only` > `other`.
+    - recorded per-bucket produced/applied/gated/probe-error/absence counters.
+    - reset snapshot for unfiltered queries to avoid stale reads.
+  - Added planner diagnostics unit coverage:
+    - classification precedence
+    - produced+applied
+    - produced+gated
+    - probe-error-disabled
+    - empty/no-index/range-stats-only reasons
+  - Extended `bench_rw` output/summary:
+    - new optional JSON ratios:
+      - `filtered_planner_produced_bucket_ratio`
+      - `filtered_planner_applied_bucket_ratio`
+      - `filtered_planner_gated_bucket_ratio`
+      - `filtered_planner_probe_error_bucket_ratio`
+      - `filtered_planner_empty_exact_bucket_ratio`
+      - `filtered_planner_no_index_bucket_ratio`
+      - `filtered_planner_range_stats_only_bucket_ratio`
+      - `filtered_planner_other_absence_bucket_ratio`
+      - `filtered_planner_diagnostics_enabled`
+    - prints explicit disabled message when env toggle is off.
+  - Ran diagnostics-enabled large-tier benchmark validation (3 samples):
+    - `/tmp/bench_rw_ci_large_item26_diag_s1.json`
+    - `/tmp/bench_rw_ci_large_item26_diag_s2.json`
+    - `/tmp/bench_rw_ci_large_item26_diag_s3.json`
+    - aggregate:
+      - filtered p95: `39.66ms` avg (`39.09..40.32`)
+      - overhead ratio: `6.76x` avg (`6.55..6.89`)
+      - produced/applied ratios `1.0`
+      - gated/probe_error/absence ratios `0.0`
+      - candidate fanout and scan ratio still `1.0`
+- Files changed:
+  - `drift_server/src/filter_planner_diagnostics.rs`
+  - `drift_server/src/lib.rs`
+  - `drift_server/src/manager.rs`
+  - `drift_server/src/server.rs`
+  - `drift_server/src/bin/bench_rw.rs`
+  - `README.md`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server planner_heuristic_tests`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `cargo test -p drift_core index_tests::tests::test_search_with_hints_respects_disk_candidate_ids`
+  - `cargo test -p drift_server filter_planner_diagnostics::tests`
+  - `for i in 1 2 3; do DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 CI=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 15 --filtered-query-count 100 --filtered-warmup-queries 15 --filter-cardinality 128 --k 10 --summary-json-path /tmp/bench_rw_ci_large_item26_diag_s${i}.json; done`
+  - `jq '{filtered_candidate_fanout,filtered_estimated_scan_ratio,filtered_planner_produced_bucket_ratio,filtered_planner_applied_bucket_ratio,filtered_planner_gated_bucket_ratio,filtered_planner_probe_error_bucket_ratio,filtered_planner_empty_exact_bucket_ratio,filtered_planner_no_index_bucket_ratio,filtered_planner_range_stats_only_bucket_ratio,filtered_planner_other_absence_bucket_ratio,filtered_planner_diagnostics_enabled}' /tmp/bench_rw_ci_large_item26_diag_s1.json`
+  - `jq -s '{count:length, filtered_p95_ms:{min:(map(.filtered_p95_ms)|min),max:(map(.filtered_p95_ms)|max),avg:(map(.filtered_p95_ms)|add/length)}, overhead_ratio:{min:(map(.filtered_overhead_ratio)|min),max:(map(.filtered_overhead_ratio)|max),avg:(map(.filtered_overhead_ratio)|add/length)}, candidate_fanout:{min:(map(.filtered_candidate_fanout)|min),max:(map(.filtered_candidate_fanout)|max),avg:(map(.filtered_candidate_fanout)|add/length)}, scan_ratio:{min:(map(.filtered_estimated_scan_ratio)|min),max:(map(.filtered_estimated_scan_ratio)|max),avg:(map(.filtered_estimated_scan_ratio)|add/length)}, produced_ratio:{min:(map(.filtered_planner_produced_bucket_ratio)|min),max:(map(.filtered_planner_produced_bucket_ratio)|max),avg:(map(.filtered_planner_produced_bucket_ratio)|add/length)}, applied_ratio:{min:(map(.filtered_planner_applied_bucket_ratio)|min),max:(map(.filtered_planner_applied_bucket_ratio)|max),avg:(map(.filtered_planner_applied_bucket_ratio)|add/length)}}' /tmp/bench_rw_ci_large_item26_diag_s1.json /tmp/bench_rw_ci_large_item26_diag_s2.json /tmp/bench_rw_ci_large_item26_diag_s3.json`
+- Open issues:
+  - Pushdown is active but non-selective in this workload (`produced=applied=1.0`, fanout/scan ratio `1.0`), indicating benchmark data distribution is the likely limiter.
+- Next steps:
+  - Measure per-bucket tenant/value concentration in benchmark dataset.
+  - Run locality-skewed benchmark variants to quantify expected scan-ratio gains with current planner.
+  - Use those results to choose between data-layout changes and metadata-catalog work.
+
+## 2026-02-26 (item 26 benchmark validation: hybrid planner step vs large-tier telemetry)
+- Goal:
+  - Execute the next item 26 step by running large-tier filtered benchmarks after hybrid planner changes and verify pushdown telemetry impact.
+- Work completed:
+  - Ran 3 CI-profile large-tier benchmark samples (`60k vectors`, `filter_cardinality=128`) with summary artifacts:
+    - `/tmp/bench_rw_ci_large_item26_hybrid_s1.json`
+    - `/tmp/bench_rw_ci_large_item26_hybrid_s2.json`
+    - `/tmp/bench_rw_ci_large_item26_hybrid_s3.json`
+  - Compared new samples against prior large-tier baseline:
+    - baseline: `/tmp/bench_rw_ci_large_item25_final.json`
+  - Observed results:
+    - filtered p95 improved modestly (`42.25ms` avg vs `43.21ms`, `-2.23%`)
+    - overhead ratio improved (`6.28x` avg vs `7.35x`, `-14.53%`)
+    - candidate fanout unchanged at `1.0`
+    - estimated scan ratio unchanged at `1.0`
+    - estimated scanned IDs/query unchanged (`~468.95`)
+  - Updated `docs/NEXT.md` item 26 with benchmark artifacts/results and refined remaining work.
+- Files changed:
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `for i in 1 2 3; do CI=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 15 --filtered-query-count 100 --filtered-warmup-queries 15 --filter-cardinality 128 --k 10 --summary-json-path /tmp/bench_rw_ci_large_item26_hybrid_s${i}.json; done`
+  - `jq 'keys' /tmp/bench_rw_ci_large_item26_hybrid_s1.json`
+  - `jq -s '{...}' /tmp/bench_rw_ci_large_item26_hybrid_s*.json`
+  - `jq -n --argfile base /tmp/bench_rw_ci_large_item25_final.json --argfile runs /tmp/bench_rw_ci_large_item26_hybrid_runs.json '{...}'`
+- Open issues:
+  - Large-tier benchmark still shows no pushdown scan reduction (`fanout=1.0`, `scan_ratio=1.0`) despite hybrid bucket selection changes.
+- Next steps:
+  - Add planner instrumentation for candidate-map decision paths (produced, gated, disabled, fallback-kept).
+  - Re-run large-tier profile after instrumentation to isolate dominant cause.
+
+## 2026-02-26 (item 26/27 kickoff: hybrid filter-first bucket routing foundation)
+- Goal:
+  - Log and begin execution of hybrid routing strategy where filter-eligible buckets are selected first, then ordered by vector proximity.
+- Work completed:
+  - Updated server filter planner to probe the full routable bucket universe (instead of only vector-routed buckets) when filters are present.
+  - Added centroid-distance ordering for planned filter-matched buckets before dispatching search.
+  - Updated core hint semantics so bucket hints are treated as explicit scan scope in `search_with_hints`.
+  - Added targeted regression test to lock hint behavior:
+    - `index_tests::test_search_with_bucket_hint_uses_explicit_ids`
+  - Logged strategy and follow-up queue in `docs/NEXT.md` (item 26 progress + new item 27).
+- Files changed:
+  - `drift_server/src/server.rs`
+  - `drift_core/src/index.rs`
+  - `drift_core/src/index_tests.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_core index_tests::tests::test_search_with_bucket_hint_uses_explicit_ids`
+  - `cargo test -p drift_core index_tests::tests::test_search_with_bucket_hint_limits_disk_scan_scope`
+  - `cargo test -p drift_core index_tests::tests::test_search_with_hints_respects_disk_candidate_ids`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `cargo test -p drift_server planner_heuristic_tests`
+- Open issues:
+  - Item 26 benchmark validation remains pending; large-tier filtered telemetry needs post-change measurement.
+  - Query-time full-bucket probing may need a metadata catalog (item 27) to control planner overhead at scale.
+- Next steps:
+  - Run large-tier filtered benchmark captures and compare candidate fanout/scan ratios against pre-change baselines.
+  - Decide selectivity-gate adjustments based on measured planner/candidate behavior.
+  - Start metadata catalog design for filter-to-bucket routing shortcuts.
+
 ## 2026-02-26 (item 25: reassess large-tier CI overhead-ratio sensitivity)
 - Goal:
   - Recalibrate large-tier CI overhead guardrail to reduce false positives while preserving performance regression signal.
