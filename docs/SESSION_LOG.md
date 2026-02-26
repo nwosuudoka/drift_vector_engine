@@ -1,5 +1,48 @@
 # Session Log
 
+## 2026-02-26 (item 22: selectivity guardrails + candidate fanout telemetry)
+- Goal:
+  - Execute `docs/NEXT.md` item 22 by adding selectivity guardrails for candidate pushdown and surfacing measurable fanout/scanned-ID impact in benchmark output.
+- Work completed:
+  - Added planner selectivity heuristic in `drift_server/src/server.rs`:
+    - introduced `should_apply_candidate_pushdown(...)` with max-selectivity threshold.
+    - wired gate into `plan_filter_aware_execution(...)` so broad candidate maps are skipped.
+    - added focused heuristic unit tests in `server::planner_heuristic_tests`.
+  - Added index-level search-hint diagnostics in `drift_core/src/index.rs`:
+    - new `SearchHintStats` snapshot captures selected bucket count, candidate fanout, and estimated scanned/total IDs.
+    - `VectorIndex::search_with_hints(...)` now updates hint stats each query.
+    - exposed `VectorIndex::last_search_hint_stats()` for benchmark instrumentation.
+  - Extended benchmark telemetry and CI defaults in `drift_server/src/bin/bench_rw.rs`:
+    - filtered workload now records and prints:
+      - candidate fanout (`candidate/live`)
+      - estimated scanned IDs/query
+      - estimated scan ratio (`scanned/live`)
+    - JSON summary includes the new telemetry fields.
+    - when `CI` is set and filtered guardrails are not explicitly configured, defaults now apply:
+      - `max_filtered_p95_ms = 500`
+      - `max_filtered_overhead_ratio = 8.0`
+  - Extended existing candidate-pushdown test assertions in `drift_core/src/index_tests.rs` to validate hint-stat reporting.
+- Files changed:
+  - `drift_core/src/index.rs`
+  - `drift_core/src/index_tests.rs`
+  - `drift_server/src/server.rs`
+  - `drift_server/src/bin/bench_rw.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_core index_tests::tests::test_search_with_hints_respects_disk_candidate_ids`
+  - `cargo test -p drift_storage bucket_manager_tests::tests::test_bucket_manager_candidate_id_pushdown`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `cargo test -p drift_server` (first run had one failing stress test)
+  - `cargo test -p drift_server janitor_tests::stress_tests::test_consistent_reads_during_tiering -- --nocapture` (rerun passed)
+  - `cargo test --workspace`
+- Open issues:
+  - `janitor_tests::stress_tests::test_consistent_reads_during_tiering` showed one transient failure during the full `drift_server` run but passed on immediate targeted rerun and during full workspace regression.
+  - Candidate pushdown still targets indexed `exact` / non-null `any_of`; range filters remain stats-feasibility-only for pruning.
+- Next steps:
+  - Execute `docs/NEXT.md` item 23 (calibrate filtered guardrail thresholds from CI-like benchmark baselines).
+
 ## 2026-02-25 (item 21: ID-level candidate pushdown for filter-aware planning)
 - Goal:
   - Implement Phase E follow-up so metadata planner can push exact-index candidate IDs through search into disk scan.

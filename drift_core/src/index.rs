@@ -71,6 +71,15 @@ pub struct MergeProposal {
     pub moves: HashMap<u32, PartitionGroup>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SearchHintStats {
+    pub selected_bucket_count: usize,
+    pub candidate_bucket_count: usize,
+    pub candidate_id_count: usize,
+    pub estimated_total_bucket_ids: usize,
+    pub estimated_scanned_ids: usize,
+}
+
 pub struct VectorIndex {
     active: RwLock<Arc<MemTable>>,
     frozen: RwLock<Vec<FrozenTable>>,
@@ -81,6 +90,7 @@ pub struct VectorIndex {
     deleted_ids: RwLock<Arc<HashSet<u64>>>,
 
     next_bucket_id: AtomicU32,
+    last_search_hint_stats: RwLock<SearchHintStats>,
 
     dim: usize,
     capacity: usize,
@@ -108,6 +118,7 @@ impl VectorIndex {
             dim,
             capacity,
             next_bucket_id: AtomicU32::new(max_id + 1),
+            last_search_hint_stats: RwLock::new(SearchHintStats::default()),
         }
     }
 
@@ -344,6 +355,44 @@ impl VectorIndex {
             }
             (selected, router.metric())
         };
+        let mut hint_stats = SearchHintStats {
+            selected_bucket_count: bucket_ids.len(),
+            ..SearchHintStats::default()
+        };
+        if let Some(candidate_map) = candidate_ids {
+            let mut candidate_bucket_count = 0usize;
+            let mut candidate_id_count = 0usize;
+            for bucket_id in &bucket_ids {
+                if let Some(ids) = candidate_map.get(bucket_id)
+                    && !ids.is_empty()
+                {
+                    candidate_bucket_count += 1;
+                    candidate_id_count += ids.len();
+                }
+            }
+            hint_stats.candidate_bucket_count = candidate_bucket_count;
+            hint_stats.candidate_id_count = candidate_id_count;
+        }
+        for bucket_id in &bucket_ids {
+            let live_count = self
+                .storage
+                .get_bucket_stats(*bucket_id)
+                .map(|stats| stats.total_count.saturating_sub(stats.tombstone_count) as usize)
+                .unwrap_or(0);
+            hint_stats.estimated_total_bucket_ids += live_count;
+            let scanned_for_bucket = candidate_ids
+                .and_then(|candidate_map| candidate_map.get(bucket_id))
+                .map(|ids| ids.len())
+                .unwrap_or(live_count);
+            hint_stats.estimated_scanned_ids += scanned_for_bucket;
+        }
+        if hint_stats.estimated_total_bucket_ids == 0 && hint_stats.candidate_id_count > 0 {
+            hint_stats.estimated_total_bucket_ids = hint_stats.candidate_id_count;
+        }
+        if hint_stats.estimated_scanned_ids == 0 && hint_stats.candidate_id_count > 0 {
+            hint_stats.estimated_scanned_ids = hint_stats.candidate_id_count;
+        }
+        *self.last_search_hint_stats.write() = hint_stats;
 
         let (ram_tables, l0_view) = {
             let active = self.active.read();
@@ -418,6 +467,10 @@ impl VectorIndex {
 
     pub fn metric(&self) -> Metric {
         self.router.read().metric()
+    }
+
+    pub fn last_search_hint_stats(&self) -> SearchHintStats {
+        self.last_search_hint_stats.read().clone()
     }
 
     pub fn lookup_l0_payload_rows(&self, ids: &[u64]) -> HashMap<u64, PayloadRow> {

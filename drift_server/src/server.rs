@@ -25,6 +25,7 @@ use drift_storage::unified_format::{
     UnifiedPayloadValue,
 };
 use drift_storage::unified_reader::UnifiedReader;
+use drift_traits::StorageEngine;
 use opendal::{Operator, services};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -798,6 +799,21 @@ struct FilterAwareExecutionPlan {
     candidate_ids: HashMap<u32, HashSet<u64>>,
 }
 
+const CANDIDATE_PUSHDOWN_MAX_SELECTIVITY: f64 = 0.85;
+
+fn should_apply_candidate_pushdown(bucket_live_ids: usize, candidate_count: usize) -> bool {
+    if candidate_count == 0 {
+        return false;
+    }
+    if bucket_live_ids == 0 {
+        // Keep pushdown enabled when stats are unavailable; broad-case guardrail depends on stats.
+        return true;
+    }
+    let effective_live = bucket_live_ids.max(candidate_count);
+    let selectivity = candidate_count as f64 / effective_live as f64;
+    selectivity <= CANDIDATE_PUSHDOWN_MAX_SELECTIVITY
+}
+
 async fn source_filter_probe(
     reader: &UnifiedReader,
     filters: &[ParsedFilter],
@@ -1033,11 +1049,47 @@ async fn plan_filter_aware_execution(
         if keep_bucket {
             plan.bucket_ids.push(bucket_id);
             if !disable_candidates && has_bucket_candidates {
-                plan.candidate_ids.insert(bucket_id, bucket_candidates);
+                let bucket_live_ids = collection
+                    .bucket_manager
+                    .get_bucket_stats(bucket_id)
+                    .map(|stats| stats.total_count.saturating_sub(stats.tombstone_count) as usize)
+                    .unwrap_or(0);
+                if should_apply_candidate_pushdown(bucket_live_ids, bucket_candidates.len()) {
+                    plan.candidate_ids.insert(bucket_id, bucket_candidates);
+                } else {
+                    tracing::debug!(
+                        "Filter planner: skipping candidate pushdown for bucket {} due to broad selectivity (candidates={}, live_ids={})",
+                        bucket_id,
+                        bucket_candidates.len(),
+                        bucket_live_ids
+                    );
+                }
             }
         }
     }
     plan
+}
+
+#[cfg(test)]
+mod planner_heuristic_tests {
+    use super::should_apply_candidate_pushdown;
+
+    #[test]
+    fn candidate_pushdown_disables_broad_selectivity() {
+        assert!(!should_apply_candidate_pushdown(100, 95));
+        assert!(!should_apply_candidate_pushdown(1_000, 900));
+    }
+
+    #[test]
+    fn candidate_pushdown_keeps_selective_filters() {
+        assert!(should_apply_candidate_pushdown(100, 10));
+        assert!(should_apply_candidate_pushdown(1_000, 200));
+    }
+
+    #[test]
+    fn candidate_pushdown_keeps_candidates_when_stats_missing() {
+        assert!(should_apply_candidate_pushdown(0, 16));
+    }
 }
 
 async fn load_bucket_payload_rows(

@@ -63,6 +63,9 @@ fn tenant_filter(field_id: u32, tenant_idx: usize) -> FieldFilter {
     }
 }
 
+const CI_DEFAULT_MAX_FILTERED_P95_MS: f64 = 500.0;
+const CI_DEFAULT_MAX_FILTERED_OVERHEAD_RATIO: f64 = 8.0;
+
 #[derive(Debug, Serialize)]
 struct BenchSummary {
     dim: usize,
@@ -78,6 +81,9 @@ struct BenchSummary {
     filtered_p95_ms: Option<f64>,
     filtered_avg_hits: Option<f64>,
     filtered_overhead_ratio: Option<f64>,
+    filtered_candidate_fanout: Option<f64>,
+    filtered_estimated_scanned_ids_avg: Option<f64>,
+    filtered_estimated_scan_ratio: Option<f64>,
 }
 
 async fn wait_for_flush(
@@ -158,6 +164,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let filter_cardinality = args.filter_cardinality.max(1);
+    let ci_mode = std::env::var_os("CI").is_some();
+    let effective_max_filtered_p95_ms = args.max_filtered_p95_ms.or_else(|| {
+        (ci_mode && args.filtered_query_count > 0).then_some(CI_DEFAULT_MAX_FILTERED_P95_MS)
+    });
+    let effective_max_filtered_overhead_ratio = args.max_filtered_overhead_ratio.or_else(|| {
+        (ci_mode && args.filtered_query_count > 0).then_some(CI_DEFAULT_MAX_FILTERED_OVERHEAD_RATIO)
+    });
     const TENANT_FIELD_ID: u32 = 1;
     const PRICE_FIELD_ID: u32 = 2;
 
@@ -207,6 +220,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "   • Filter workload: queries={}, tenant_cardinality={}, projection={}",
         args.filtered_query_count, filter_cardinality, args.filtered_projection
     );
+    if ci_mode {
+        if args.max_filtered_p95_ms.is_none() && args.filtered_query_count > 0 {
+            println!(
+                "   • CI guardrail default: max_filtered_p95_ms={:.1}",
+                CI_DEFAULT_MAX_FILTERED_P95_MS
+            );
+        }
+        if args.max_filtered_overhead_ratio.is_none() && args.filtered_query_count > 0 {
+            println!(
+                "   • CI guardrail default: max_filtered_overhead_ratio={:.2}",
+                CI_DEFAULT_MAX_FILTERED_OVERHEAD_RATIO
+            );
+        }
+    }
 
     let mut rng = StdRng::seed_from_u64(args.seed);
     let mut tenant_query_vectors: Vec<Option<Vec<f32>>> = vec![None; filter_cardinality];
@@ -345,84 +372,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------
     // FILTERED READ BENCH
     // -------------------------------
-    let (filtered_qps, filtered_p95, filtered_avg_hits, filtered_overhead_ratio) =
-        if args.filtered_query_count == 0 {
-            (None, None, None, None)
+    let (
+        filtered_qps,
+        filtered_p95,
+        filtered_avg_hits,
+        filtered_overhead_ratio,
+        filtered_candidate_fanout,
+        filtered_estimated_scanned_ids_avg,
+        filtered_estimated_scan_ratio,
+    ) = if args.filtered_query_count == 0 {
+        (None, None, None, None, None, None, None)
+    } else {
+        println!("\n🧪 Filtered Read Benchmark...");
+
+        for i in 0..args.filtered_warmup_queries {
+            let tenant_idx = i % filter_cardinality;
+            let q = tenant_query_vectors[tenant_idx]
+                .clone()
+                .unwrap_or_else(|| gen_random_vector(&mut rng, args.dim));
+            let _ = service
+                .search(Request::new(SearchRequest {
+                    collection_name: collection.to_string(),
+                    vector: q,
+                    k: args.k as u32,
+                    target_confidence: args.target_confidence,
+                    lambda: args.lambda,
+                    tau: args.tau,
+                    filters: vec![tenant_filter(TENANT_FIELD_ID, tenant_idx)],
+                    payload_projection_fields: if args.filtered_projection {
+                        vec![TENANT_FIELD_ID, PRICE_FIELD_ID]
+                    } else {
+                        vec![]
+                    },
+                }))
+                .await?;
+        }
+
+        let mut filtered_latencies = Vec::with_capacity(args.filtered_query_count);
+        let mut total_hits = 0usize;
+        let mut total_candidate_ids = 0usize;
+        let mut total_scanned_ids = 0usize;
+        let mut total_live_bucket_ids = 0usize;
+        let start_filtered = Instant::now();
+        for i in 0..args.filtered_query_count {
+            let tenant_idx = i % filter_cardinality;
+            let q = tenant_query_vectors[tenant_idx]
+                .clone()
+                .unwrap_or_else(|| gen_random_vector(&mut rng, args.dim));
+            let q_start = Instant::now();
+            let resp = service
+                .search(Request::new(SearchRequest {
+                    collection_name: collection.to_string(),
+                    vector: q,
+                    k: args.k as u32,
+                    target_confidence: args.target_confidence,
+                    lambda: args.lambda,
+                    tau: args.tau,
+                    filters: vec![tenant_filter(TENANT_FIELD_ID, tenant_idx)],
+                    payload_projection_fields: if args.filtered_projection {
+                        vec![TENANT_FIELD_ID, PRICE_FIELD_ID]
+                    } else {
+                        vec![]
+                    },
+                }))
+                .await?
+                .into_inner();
+            filtered_latencies.push(q_start.elapsed());
+            total_hits += resp.results.len();
+            let hint_stats = coll.index.last_search_hint_stats();
+            total_candidate_ids += hint_stats.candidate_id_count;
+            total_scanned_ids += hint_stats.estimated_scanned_ids;
+            total_live_bucket_ids += hint_stats.estimated_total_bucket_ids;
+        }
+        let filtered_duration = start_filtered.elapsed();
+        let qps = args.filtered_query_count as f64 / filtered_duration.as_secs_f64();
+        filtered_latencies.sort();
+        let f_p50 = percentile(&filtered_latencies, 0.50);
+        let f_p95 = percentile(&filtered_latencies, 0.95);
+        let f_p99 = percentile(&filtered_latencies, 0.99);
+        let avg_hits = total_hits as f64 / args.filtered_query_count as f64;
+        let overhead = duration_ms(f_p95) / duration_ms(r_p95).max(1e-9);
+        let candidate_fanout = if total_live_bucket_ids > 0 {
+            total_candidate_ids as f64 / total_live_bucket_ids as f64
         } else {
-            println!("\n🧪 Filtered Read Benchmark...");
-
-            for i in 0..args.filtered_warmup_queries {
-                let tenant_idx = i % filter_cardinality;
-                let q = tenant_query_vectors[tenant_idx]
-                    .clone()
-                    .unwrap_or_else(|| gen_random_vector(&mut rng, args.dim));
-                let _ = service
-                    .search(Request::new(SearchRequest {
-                        collection_name: collection.to_string(),
-                        vector: q,
-                        k: args.k as u32,
-                        target_confidence: args.target_confidence,
-                        lambda: args.lambda,
-                        tau: args.tau,
-                        filters: vec![tenant_filter(TENANT_FIELD_ID, tenant_idx)],
-                        payload_projection_fields: if args.filtered_projection {
-                            vec![TENANT_FIELD_ID, PRICE_FIELD_ID]
-                        } else {
-                            vec![]
-                        },
-                    }))
-                    .await?;
-            }
-
-            let mut filtered_latencies = Vec::with_capacity(args.filtered_query_count);
-            let mut total_hits = 0usize;
-            let start_filtered = Instant::now();
-            for i in 0..args.filtered_query_count {
-                let tenant_idx = i % filter_cardinality;
-                let q = tenant_query_vectors[tenant_idx]
-                    .clone()
-                    .unwrap_or_else(|| gen_random_vector(&mut rng, args.dim));
-                let q_start = Instant::now();
-                let resp = service
-                    .search(Request::new(SearchRequest {
-                        collection_name: collection.to_string(),
-                        vector: q,
-                        k: args.k as u32,
-                        target_confidence: args.target_confidence,
-                        lambda: args.lambda,
-                        tau: args.tau,
-                        filters: vec![tenant_filter(TENANT_FIELD_ID, tenant_idx)],
-                        payload_projection_fields: if args.filtered_projection {
-                            vec![TENANT_FIELD_ID, PRICE_FIELD_ID]
-                        } else {
-                            vec![]
-                        },
-                    }))
-                    .await?
-                    .into_inner();
-                filtered_latencies.push(q_start.elapsed());
-                total_hits += resp.results.len();
-            }
-            let filtered_duration = start_filtered.elapsed();
-            let qps = args.filtered_query_count as f64 / filtered_duration.as_secs_f64();
-            filtered_latencies.sort();
-            let f_p50 = percentile(&filtered_latencies, 0.50);
-            let f_p95 = percentile(&filtered_latencies, 0.95);
-            let f_p99 = percentile(&filtered_latencies, 0.99);
-            let avg_hits = total_hits as f64 / args.filtered_query_count as f64;
-            let overhead = duration_ms(f_p95) / duration_ms(r_p95).max(1e-9);
-
-            println!("✅ Filtered Read Complete in {:.2?}", filtered_duration);
-            println!("   • Filtered QPS: {:.0} q/s", qps);
-            println!(
-                "   • Filtered Latency p50/p95/p99: {:.2?} / {:.2?} / {:.2?}",
-                f_p50, f_p95, f_p99
-            );
-            println!("   • Average result count: {:.2}", avg_hits);
-            println!("   • Filtered p95 / unfiltered p95: {:.2}x", overhead);
-
-            (Some(qps), Some(f_p95), Some(avg_hits), Some(overhead))
+            0.0
         };
+        let estimated_scan_ratio = if total_live_bucket_ids > 0 {
+            total_scanned_ids as f64 / total_live_bucket_ids as f64
+        } else {
+            0.0
+        };
+        let avg_scanned_ids = total_scanned_ids as f64 / args.filtered_query_count as f64;
+
+        println!("✅ Filtered Read Complete in {:.2?}", filtered_duration);
+        println!("   • Filtered QPS: {:.0} q/s", qps);
+        println!(
+            "   • Filtered Latency p50/p95/p99: {:.2?} / {:.2?} / {:.2?}",
+            f_p50, f_p95, f_p99
+        );
+        println!("   • Average result count: {:.2}", avg_hits);
+        println!("   • Filtered p95 / unfiltered p95: {:.2}x", overhead);
+        println!(
+            "   • Candidate fanout (candidate/live): {:.3}",
+            candidate_fanout
+        );
+        println!(
+            "   • Estimated scanned IDs/query: {:.1} ({:.3} of live IDs)",
+            avg_scanned_ids, estimated_scan_ratio
+        );
+
+        (
+            Some(qps),
+            Some(f_p95),
+            Some(avg_hits),
+            Some(overhead),
+            Some(candidate_fanout),
+            Some(avg_scanned_ids),
+            Some(estimated_scan_ratio),
+        )
+    };
 
     // -------------------------------
     // GUARDRAILS
@@ -439,7 +507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let filtered_p95_ms = filtered_p95.map(duration_ms);
-    if let Some(limit_ms) = args.max_filtered_p95_ms {
+    if let Some(limit_ms) = effective_max_filtered_p95_ms {
         match filtered_p95_ms {
             Some(value) if value > limit_ms => guardrail_failures.push(format!(
                 "filtered p95 {:.2}ms exceeds limit {:.2}ms",
@@ -452,7 +520,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(limit_ratio) = args.max_filtered_overhead_ratio {
+    if let Some(limit_ratio) = effective_max_filtered_overhead_ratio {
         match filtered_overhead_ratio {
             Some(value) if value > limit_ratio => guardrail_failures.push(format!(
                 "filtered/unfiltered p95 ratio {:.2}x exceeds limit {:.2}x",
@@ -490,6 +558,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             filtered_p95_ms,
             filtered_avg_hits,
             filtered_overhead_ratio,
+            filtered_candidate_fanout,
+            filtered_estimated_scanned_ids_avg,
+            filtered_estimated_scan_ratio,
         };
         let json = serde_json::to_string_pretty(&summary)?;
         std::fs::write(path, json)?;

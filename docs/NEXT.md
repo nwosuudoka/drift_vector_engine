@@ -1,11 +1,12 @@
 # Next Steps
 
-Last updated: 2026-02-25
+Last updated: 2026-02-26
 
 ## Current Execution Phase
 - Phase D API surface is complete (payload/filter + payload schema management).
 - Phase E performance work is active (filter-aware planning and index pushdown).
 - Phase E pushdown v1 is complete at bucket + ID levels for indexed `exact` / non-null `any_of` filters.
+- Phase E pushdown guardrails are now in place (selectivity gate + benchmark fanout/scanned-ID visibility).
 - Documentation surface is now synced for current API/runtime (`README.md`, `SYSTEM_VIEW.md`, `docs/API_SPEC.md`).
 
 ## Active Queue (Post-Item 15)
@@ -80,12 +81,34 @@ Last updated: 2026-02-25
       - `server_integration_tests::test_search_field_filters_exact_anyof_range_and_projection` (regression verification)
 
 ## Priority Queue
-- [ ] 22. Add selectivity guardrails for candidate pushdown and measure impact.
+- [x] 22. Add selectivity guardrails for candidate pushdown and measure impact.
   - Goal: avoid overhead for low-selectivity filters and quantify p95 gains.
   - Scope:
     - planner heuristic gate (skip candidate map when selectivity is too broad)
     - extend benchmark output to report candidate fanout / scanned IDs
     - define CI-friendly threshold defaults for filtered workloads
+  - Completed:
+    - Added planner selectivity gating for candidate pushdown (`should_apply_candidate_pushdown`) and wired it into filter-aware plan assembly.
+    - Added index search-hint diagnostics (`SearchHintStats`) to capture:
+      - candidate bucket/ID fanout
+      - estimated total live IDs
+      - estimated scanned IDs
+    - Extended `bench_rw` filtered benchmark output and JSON summary to report:
+      - candidate fanout
+      - estimated scanned IDs/query
+      - estimated scan ratio
+    - Added CI-friendly filtered guardrail defaults in `bench_rw` when `CI` is set:
+      - `max_filtered_p95_ms = 500`
+      - `max_filtered_overhead_ratio = 8.0`
+    - Added coverage:
+      - `server::planner_heuristic_tests::{candidate_pushdown_disables_broad_selectivity,candidate_pushdown_keeps_selective_filters,candidate_pushdown_keeps_candidates_when_stats_missing}`
+      - `index_tests::test_search_with_hints_respects_disk_candidate_ids` (extended with hint-stat assertions)
+- [ ] 23. Calibrate filtered guardrail defaults from benchmark baselines.
+  - Goal: tighten CI thresholds from "safe defaults" to environment-validated limits.
+  - Scope:
+    - run `bench_rw` on CI-like hardware and capture summary JSON artifacts
+    - choose target p95 + overhead limits per dataset scale tier
+    - document accepted thresholds in `docs/DECISIONS.md` and benchmark usage docs
 - [x] 1. Run full workspace regression once before commit.
   - Command: `cargo test --workspace`
 - [x] 2. Extend unified header/footer with metric + schema hash fields.

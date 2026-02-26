@@ -336,6 +336,12 @@ mod tests {
         assert!(hinted_ids.contains(&101));
         assert!(!hinted_ids.contains(&100));
         assert!(!hinted_ids.contains(&200));
+
+        let stats = index.last_search_hint_stats();
+        assert_eq!(stats.selected_bucket_count, 1);
+        assert_eq!(stats.candidate_bucket_count, 1);
+        assert_eq!(stats.candidate_id_count, 1);
+        assert_eq!(stats.estimated_scanned_ids, 1);
     }
 
     // --- TEST 3: END-TO-END FLOW ---
