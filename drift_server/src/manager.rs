@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::filter_metadata_catalog::FilterMetadataCatalog;
 use crate::filter_planner_diagnostics::FilterPlannerDiagnosticsSnapshot;
 use crate::janitor::{Janitor, JanitorConfig, JanitorVars};
 use crate::local_staging::LocalStagingManager;
@@ -39,6 +40,7 @@ pub struct Collection {
     pub bucket_manager: Arc<BucketManager>,
     pub payload_schema: Arc<ParkingRwLock<Option<CorePayloadSchema>>>,
     pub last_filter_planner_diagnostics: Arc<ParkingRwLock<FilterPlannerDiagnosticsSnapshot>>,
+    pub filter_metadata_catalog: Arc<ParkingRwLock<FilterMetadataCatalog>>,
     // We hold the handle so it runs in the background. Dropping this struct (e.g. shutdown) will abort it.
     pub janitor_task: tokio::task::JoinHandle<()>,
 }
@@ -537,6 +539,7 @@ impl CollectionManager {
             last_filter_planner_diagnostics: Arc::new(ParkingRwLock::new(
                 FilterPlannerDiagnosticsSnapshot::default(),
             )),
+            filter_metadata_catalog: Arc::new(ParkingRwLock::new(FilterMetadataCatalog::default())),
             janitor_task,
         });
 

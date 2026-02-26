@@ -1,5 +1,6 @@
 pub mod cleanup;
 pub mod config;
+pub mod filter_metadata_catalog;
 pub mod filter_planner_diagnostics;
 pub mod janitor;
 pub mod local_staging;

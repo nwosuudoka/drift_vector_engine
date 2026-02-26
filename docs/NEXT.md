@@ -230,6 +230,33 @@ Last updated: 2026-02-26
     - design a compact field-level bucket membership catalog (exact + range stats pointers).
     - define update lifecycle across flush/split/merge/promotion/recovery.
     - wire planner to consult catalog first, then fallback to direct metadata probe on miss/staleness.
+  - Migration strategy:
+    1. Build collection-local catalog state (in-memory) and feed it from existing planner probes without changing routing behavior.
+    2. Add catalog freshness model (bucket-path/version token + completeness markers per exact value key).
+    3. Planner preselection path:
+      - use only freshness-validated complete entries to narrow probe buckets for exact/any_of filters.
+      - keep conservative fallback to full probe set on miss/stale/incomplete coverage.
+    4. Lifecycle hooks:
+      - invalidate/reset affected entries on flush/split/merge/promotion/recovery path updates.
+    5. Benchmark/guardrail loop:
+      - add catalog hit-rate + preselection ratio telemetry in `bench_rw`.
+      - validate improvement in `filtered_candidate_fanout` and `filtered_estimated_scan_ratio`.
+  - Progress (2026-02-26):
+    - Added migration step 1 scaffold:
+      - new module `drift_server/src/filter_metadata_catalog.rs` with collection-local adaptive catalog.
+      - catalog stores per-bucket observed memberships:
+        - indexed exact fields
+        - range-stats fields
+        - exact value membership keys (field + logical type tag + encoded value bytes).
+      - planner now records successful probe observations into `Collection.filter_metadata_catalog`.
+      - bucket-path change resets stale bucket memberships; exact value memberships are capped per bucket.
+    - Current behavior:
+      - no query routing/selectivity behavior change yet (observability/foundation only).
+  - Remaining:
+    - add completeness/freshness tokens that are safe for planner pruning decisions.
+    - implement catalog-driven exact/any_of preselection under strict safety checks.
+    - wire janitor/recovery invalidation hooks so catalog stays correct under topology churn.
+    - add benchmark telemetry fields for catalog hit-rate and preselection impact.
 - [x] 1. Run full workspace regression once before commit.
   - Command: `cargo test --workspace`
 - [x] 2. Extend unified header/footer with metric + schema hash fields.

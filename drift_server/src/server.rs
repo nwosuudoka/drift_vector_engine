@@ -10,6 +10,9 @@ use crate::drift_proto::{
     HealthRequest, HealthResponse, InsertResponse, NvmeCacheMetrics, RecoveryGuardMetrics,
     TrainRequest, TrainResponse,
 };
+use crate::filter_metadata_catalog::{
+    BucketProbeObservation, ExactValueMembershipKey, logical_type_tag,
+};
 use crate::filter_planner_diagnostics::{
     FilterPlannerDiagnosticsSnapshot, diagnostics_enabled_from_env,
 };
@@ -25,7 +28,7 @@ use drift_storage::bucket_manager::StorageClass;
 use drift_storage::disk_manager::DiskManager;
 use drift_storage::unified_format::{
     UnifiedLobRef, UnifiedPayloadFieldStats, UnifiedPayloadRow, UnifiedPayloadStatsChunk,
-    UnifiedPayloadValue,
+    UnifiedPayloadValue, encode_exact_key,
 };
 use drift_storage::unified_reader::UnifiedReader;
 use drift_traits::StorageEngine;
@@ -798,6 +801,9 @@ struct FilterSourceProbe {
     saw_indexed_exact_filter: bool,
     saw_empty_exact_match: bool,
     saw_range_filter: bool,
+    indexed_exact_field_ids: HashSet<u32>,
+    range_filter_field_ids: HashSet<u32>,
+    matched_exact_value_keys: HashSet<ExactValueMembershipKey>,
 }
 
 #[derive(Default)]
@@ -905,6 +911,20 @@ fn should_apply_candidate_pushdown(bucket_live_ids: usize, candidate_count: usiz
     selectivity <= CANDIDATE_PUSHDOWN_MAX_SELECTIVITY
 }
 
+fn exact_value_membership_key(
+    field_id: u32,
+    logical_type: &drift_storage::unified_format::UnifiedLogicalType,
+    value: &UnifiedPayloadValue,
+) -> io::Result<Option<ExactValueMembershipKey>> {
+    Ok(
+        encode_exact_key(logical_type, value)?.map(|encoded_value| ExactValueMembershipKey {
+            field_id,
+            logical_type_tag: logical_type_tag(logical_type),
+            encoded_value,
+        }),
+    )
+}
+
 async fn source_filter_probe(
     reader: &UnifiedReader,
     filters: &[ParsedFilter],
@@ -912,11 +932,7 @@ async fn source_filter_probe(
     if filters.is_empty() {
         return Ok(FilterSourceProbe {
             might_match: true,
-            exact_candidate_ids: None,
-            saw_exact_filter: false,
-            saw_indexed_exact_filter: false,
-            saw_empty_exact_match: false,
-            saw_range_filter: false,
+            ..FilterSourceProbe::default()
         });
     }
 
@@ -931,46 +947,34 @@ async fn source_filter_probe(
         None
     };
 
-    let mut exact_candidate_ids: Option<HashSet<u64>> = None;
+    let mut probe = FilterSourceProbe {
+        might_match: true,
+        ..FilterSourceProbe::default()
+    };
     let mut used_exact_pushdown = false;
-    let mut saw_exact_filter = false;
-    let mut saw_indexed_exact_filter = false;
-    let mut saw_empty_exact_match = false;
-    let mut saw_range_filter = false;
 
     for filter in filters {
         match filter {
             ParsedFilter::Exact { field_id, value } => {
-                saw_exact_filter = true;
+                probe.saw_exact_filter = true;
                 if matches!(value, UnifiedPayloadValue::Null) {
                     continue;
                 }
 
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.might_match = false;
+                    return Ok(probe);
                 };
                 let Some(field) = schema.fields.iter().find(|f| f.field_id == *field_id) else {
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.might_match = false;
+                    return Ok(probe);
                 };
 
                 if !field.indexed {
                     continue;
                 }
-                saw_indexed_exact_filter = true;
+                probe.saw_indexed_exact_filter = true;
+                probe.indexed_exact_field_ids.insert(*field_id);
 
                 let matches: HashSet<u64> = reader
                     .filter_ids_exact(*field_id, value)
@@ -978,37 +982,33 @@ async fn source_filter_probe(
                     .into_iter()
                     .collect();
                 if matches.is_empty() {
-                    saw_empty_exact_match = true;
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.saw_empty_exact_match = true;
+                    probe.might_match = false;
+                    probe.exact_candidate_ids = None;
+                    return Ok(probe);
+                }
+
+                if let Some(key) =
+                    exact_value_membership_key(*field_id, &field.logical_type, value)?
+                {
+                    probe.matched_exact_value_keys.insert(key);
                 }
 
                 used_exact_pushdown = true;
-                if let Some(existing) = exact_candidate_ids.as_mut() {
+                if let Some(existing) = probe.exact_candidate_ids.as_mut() {
                     intersect_candidate_ids(existing, &matches);
                     if existing.is_empty() {
-                        saw_empty_exact_match = true;
-                        return Ok(FilterSourceProbe {
-                            might_match: false,
-                            exact_candidate_ids: None,
-                            saw_exact_filter,
-                            saw_indexed_exact_filter,
-                            saw_empty_exact_match,
-                            saw_range_filter,
-                        });
+                        probe.saw_empty_exact_match = true;
+                        probe.might_match = false;
+                        probe.exact_candidate_ids = None;
+                        return Ok(probe);
                     }
                 } else {
-                    exact_candidate_ids = Some(matches);
+                    probe.exact_candidate_ids = Some(matches);
                 }
             }
             ParsedFilter::AnyOf { field_id, values } => {
-                saw_exact_filter = true;
+                probe.saw_exact_filter = true;
                 if values
                     .iter()
                     .any(|value| matches!(value, UnifiedPayloadValue::Null))
@@ -1017,63 +1017,51 @@ async fn source_filter_probe(
                 }
 
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.might_match = false;
+                    return Ok(probe);
                 };
                 let Some(field) = schema.fields.iter().find(|f| f.field_id == *field_id) else {
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.might_match = false;
+                    return Ok(probe);
                 };
 
                 if !field.indexed {
                     continue;
                 }
-                saw_indexed_exact_filter = true;
+                probe.saw_indexed_exact_filter = true;
+                probe.indexed_exact_field_ids.insert(*field_id);
 
                 let mut matches = HashSet::new();
                 for value in values {
-                    matches.extend(reader.filter_ids_exact(*field_id, value).await?);
+                    let exact_ids = reader.filter_ids_exact(*field_id, value).await?;
+                    if exact_ids.is_empty() {
+                        continue;
+                    }
+                    matches.extend(exact_ids);
+                    if let Some(key) =
+                        exact_value_membership_key(*field_id, &field.logical_type, value)?
+                    {
+                        probe.matched_exact_value_keys.insert(key);
+                    }
                 }
                 if matches.is_empty() {
-                    saw_empty_exact_match = true;
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.saw_empty_exact_match = true;
+                    probe.might_match = false;
+                    probe.exact_candidate_ids = None;
+                    return Ok(probe);
                 }
 
                 used_exact_pushdown = true;
-                if let Some(existing) = exact_candidate_ids.as_mut() {
+                if let Some(existing) = probe.exact_candidate_ids.as_mut() {
                     intersect_candidate_ids(existing, &matches);
                     if existing.is_empty() {
-                        saw_empty_exact_match = true;
-                        return Ok(FilterSourceProbe {
-                            might_match: false,
-                            exact_candidate_ids: None,
-                            saw_exact_filter,
-                            saw_indexed_exact_filter,
-                            saw_empty_exact_match,
-                            saw_range_filter,
-                        });
+                        probe.saw_empty_exact_match = true;
+                        probe.might_match = false;
+                        probe.exact_candidate_ids = None;
+                        return Ok(probe);
                     }
                 } else {
-                    exact_candidate_ids = Some(matches);
+                    probe.exact_candidate_ids = Some(matches);
                 }
             }
             ParsedFilter::Range {
@@ -1083,30 +1071,19 @@ async fn source_filter_probe(
                 upper,
                 upper_inclusive,
             } => {
-                saw_range_filter = true;
+                probe.saw_range_filter = true;
+                probe.range_filter_field_ids.insert(*field_id);
                 let Some(schema) = schema.as_ref() else {
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.might_match = false;
+                    return Ok(probe);
                 };
                 if schema
                     .fields
                     .iter()
                     .all(|field| field.field_id != *field_id)
                 {
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.might_match = false;
+                    return Ok(probe);
                 }
 
                 let Some(stats) = payload_stats.as_ref() else {
@@ -1123,31 +1100,17 @@ async fn source_filter_probe(
                     )
                 });
                 if !any_chunk_matches {
-                    return Ok(FilterSourceProbe {
-                        might_match: false,
-                        exact_candidate_ids: None,
-                        saw_exact_filter,
-                        saw_indexed_exact_filter,
-                        saw_empty_exact_match,
-                        saw_range_filter,
-                    });
+                    probe.might_match = false;
+                    return Ok(probe);
                 }
             }
         }
     }
 
-    Ok(FilterSourceProbe {
-        might_match: true,
-        exact_candidate_ids: if used_exact_pushdown {
-            exact_candidate_ids
-        } else {
-            None
-        },
-        saw_exact_filter,
-        saw_indexed_exact_filter,
-        saw_empty_exact_match,
-        saw_range_filter,
-    })
+    if !used_exact_pushdown {
+        probe.exact_candidate_ids = None;
+    }
+    Ok(probe)
 }
 
 async fn plan_filter_aware_execution(
@@ -1235,6 +1198,7 @@ async fn plan_filter_aware_execution(
             }
             continue;
         };
+        let bucket_path = version.path.clone();
         let sources = payload_sources_for_class(&version.class, &version.path);
 
         let mut keep_bucket = false;
@@ -1247,6 +1211,9 @@ async fn plan_filter_aware_execution(
         let mut saw_range_filter = false;
         let mut candidate_applied = false;
         let mut candidate_gated = false;
+        let mut observed_indexed_exact_fields = HashSet::new();
+        let mut observed_range_stats_fields = HashSet::new();
+        let mut observed_exact_value_hits = HashSet::new();
 
         for source in sources {
             let probe = match source {
@@ -1266,18 +1233,32 @@ async fn plan_filter_aware_execution(
 
             match probe {
                 Ok(probe) => {
-                    saw_exact_filter |= probe.saw_exact_filter;
-                    saw_indexed_exact_filter |= probe.saw_indexed_exact_filter;
-                    saw_empty_exact_match |= probe.saw_empty_exact_match;
-                    saw_range_filter |= probe.saw_range_filter;
-                    if !probe.might_match {
+                    let FilterSourceProbe {
+                        might_match,
+                        exact_candidate_ids,
+                        saw_exact_filter: source_saw_exact_filter,
+                        saw_indexed_exact_filter: source_saw_indexed_exact_filter,
+                        saw_empty_exact_match: source_saw_empty_exact_match,
+                        saw_range_filter: source_saw_range_filter,
+                        indexed_exact_field_ids,
+                        range_filter_field_ids,
+                        matched_exact_value_keys,
+                    } = probe;
+                    saw_exact_filter |= source_saw_exact_filter;
+                    saw_indexed_exact_filter |= source_saw_indexed_exact_filter;
+                    saw_empty_exact_match |= source_saw_empty_exact_match;
+                    saw_range_filter |= source_saw_range_filter;
+                    observed_indexed_exact_fields.extend(indexed_exact_field_ids);
+                    observed_range_stats_fields.extend(range_filter_field_ids);
+                    observed_exact_value_hits.extend(matched_exact_value_keys);
+                    if !might_match {
                         continue;
                     }
                     keep_bucket = true;
                     if disable_candidates {
                         continue;
                     }
-                    if let Some(source_candidates) = probe.exact_candidate_ids {
+                    if let Some(source_candidates) = exact_candidate_ids {
                         has_bucket_candidates = true;
                         bucket_candidates.extend(source_candidates);
                     }
@@ -1292,6 +1273,21 @@ async fn plan_filter_aware_execution(
                     disable_candidates = true;
                 }
             }
+        }
+
+        if !disable_candidates {
+            collection
+                .filter_metadata_catalog
+                .write()
+                .observe_bucket_probe(
+                    bucket_id,
+                    BucketProbeObservation {
+                        bucket_path,
+                        indexed_exact_fields: observed_indexed_exact_fields,
+                        range_stats_fields: observed_range_stats_fields,
+                        exact_value_hits: observed_exact_value_hits,
+                    },
+                );
         }
 
         if diagnostics_enabled {

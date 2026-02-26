@@ -1,5 +1,43 @@
 # Session Log
 
+## 2026-02-26 (item 27 migration step 1: adaptive metadata catalog scaffold)
+- Goal:
+  - Define the metadata-catalog migration strategy in project state and start implementation with a no-behavior-change foundation.
+- Work completed:
+  - Added new adaptive catalog module:
+    - `drift_server/src/filter_metadata_catalog.rs`
+    - supports per-bucket observed memberships for:
+      - indexed exact fields
+      - range-stats fields
+      - exact value memberships (`field_id + logical_type_tag + encoded exact key`)
+    - includes bounded exact-value membership growth per bucket (`MAX_EXACT_VALUE_MEMBERSHIPS_PER_BUCKET`).
+    - resets stale memberships when a bucket path changes.
+  - Wired catalog into collection runtime state:
+    - `Collection.filter_metadata_catalog` added in `manager.rs`.
+  - Started migration feed path from planner probe:
+    - `server.rs` `FilterSourceProbe` now captures field/value-level observation details.
+    - successful bucket probes now write observations into the catalog.
+    - search behavior intentionally unchanged (no catalog-driven pruning yet).
+  - Updated queue state and strategy in `docs/NEXT.md` item 27 with phased migration plan.
+- Files changed:
+  - `drift_server/src/filter_metadata_catalog.rs`
+  - `drift_server/src/lib.rs`
+  - `drift_server/src/manager.rs`
+  - `drift_server/src/server.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server filter_metadata_catalog::tests`
+  - `cargo test -p drift_server planner_heuristic_tests`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+- Open issues:
+  - Catalog currently stores additive observations only; completeness/freshness tokens for safe planner pruning are not implemented yet.
+- Next steps:
+  - Add completeness/freshness markers so catalog entries can be safely used for bucket preselection.
+  - Add conservative planner preselection path for exact/any_of using validated complete entries only.
+  - Add lifecycle invalidation hooks for split/merge/promotion/recovery churn.
+
 ## 2026-02-26 (item 26 instrumentation: planner diagnostics v1 + bench surfacing)
 - Goal:
   - Implement env-gated planner decision diagnostics to identify why large-tier filtered scan ratio remains `1.0`.
