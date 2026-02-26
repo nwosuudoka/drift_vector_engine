@@ -1629,13 +1629,24 @@ impl Drift for DriftService {
 
         let mut payload_by_id: HashMap<u64, UnifiedPayloadRow> = HashMap::new();
         for (bucket_id, ids) in bucket_candidates {
-            let rows = load_bucket_payload_rows(&collection, bucket_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-            for id in ids {
-                if let Some(row) = rows.get(&id) {
-                    payload_by_id.insert(id, row.clone());
+            match load_bucket_payload_rows(&collection, bucket_id).await {
+                Ok(rows) => {
+                    for id in ids {
+                        if let Some(row) = rows.get(&id) {
+                            payload_by_id.insert(id, row.clone());
+                        } else {
+                            unresolved_ids.push(id);
+                        }
+                    }
                 }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        "Search payload lookup: bucket {} missing (likely concurrent maintenance); retrying unresolved IDs via L0 fallback",
+                        bucket_id
+                    );
+                    unresolved_ids.extend(ids);
+                }
+                Err(err) => return Err(Status::internal(err.to_string())),
             }
         }
 

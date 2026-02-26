@@ -1,5 +1,78 @@
 # Session Log
 
+## 2026-02-26 (item 24: stabilize large-tier benchmark run under janitor split pressure)
+- Goal:
+  - Eliminate intermittent large-run `bench_rw` failures (`bucket not found` and follow-on manifest tmp-path errors) under split/merge churn.
+- Work completed:
+  - Hardened payload-lookup path in `drift_server/src/server.rs`:
+    - when a KV-mapped bucket is missing during payload hydration, search no longer hard-fails.
+    - IDs from missing/partial bucket payload reads are now re-routed through unresolved-ID fallback (L0 payload lookup path).
+  - Added regression test:
+    - `server_integration_tests::test_search_tolerates_stale_kv_bucket_mapping_for_payload_lookup`
+    - test injects a stale KV bucket mapping and verifies filtered search still succeeds.
+  - Added benchmark lifecycle stabilization in `drift_server/src/bin/bench_rw.rs`:
+    - introduced `JanitorAbortGuard` to abort background janitor task before benchmark process teardown.
+    - avoids janitor writing into cleaned-up temp paths after early exits.
+  - Re-validated large-tier benchmark behavior under split pressure:
+    - no `bucket not found` or `Failed to write tmp manifest` observed in successful stabilization run.
+- Files changed:
+  - `drift_server/src/server.rs`
+  - `drift_server/src/server_integration_tests.rs`
+  - `drift_server/src/bin/bench_rw.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_tolerates_stale_kv_bucket_mapping_for_payload_lookup`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `CI=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 15 --filtered-query-count 100 --filtered-warmup-queries 15 --filter-cardinality 128 --k 10 --summary-json-path /tmp/bench_rw_ci_large_stabilized.json`
+  - `CI=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 15 --filtered-query-count 100 --filtered-warmup-queries 15 --filter-cardinality 128 --k 10 --max-filtered-overhead-ratio 9.0 --summary-json-path /tmp/bench_rw_ci_large_stabilized_relaxed.json`
+  - `cargo test -p drift_server`
+- Open issues:
+  - Large-tier CI guardrail overhead ratio (`7.5x`) showed run-to-run variance (one run at `7.84x`), which can still trigger failures unrelated to functional stability.
+- Next steps:
+  - Execute `docs/NEXT.md` item 25 (reassess large-tier CI overhead-ratio sensitivity).
+
+## 2026-02-26 (item 23: calibrate filtered guardrail defaults from benchmark baselines)
+- Goal:
+  - Execute `docs/NEXT.md` item 23 by calibrating CI filtered-search guardrail defaults from benchmark artifacts and documenting accepted thresholds.
+- Work completed:
+  - Ran release benchmark calibration profiles and captured artifacts:
+    - small: `4k vectors` (`/tmp/bench_rw_calib_small.json`)
+    - medium: `20k vectors` (`/tmp/bench_rw_calib_medium.json`)
+    - large: `60k vectors` (`/tmp/bench_rw_calib_large.json`)
+  - Replaced single global CI defaults in `drift_server/src/bin/bench_rw.rs` with tiered defaults keyed by `total_vectors`:
+    - small (`<=10k`): `12ms`, `7.0x`
+    - medium (`10,001..=50k`): `35ms`, `7.0x`
+    - large (`>50k`): `90ms`, `7.5x`
+  - Extended benchmark summary JSON with applied guardrail metadata:
+    - `ci_guardrail_tier`
+    - `effective_max_filtered_p95_ms`
+    - `effective_max_filtered_overhead_ratio`
+  - Validated CI-mode guardrail behavior on small and medium tiers:
+    - `/tmp/bench_rw_ci_small.json`
+    - `/tmp/bench_rw_ci_medium.json`
+  - Documented calibration decision and benchmark usage:
+    - `docs/DECISIONS.md`
+    - `README.md`
+- Files changed:
+  - `drift_server/src/bin/bench_rw.rs`
+  - `README.md`
+  - `docs/DECISIONS.md`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo run -p drift_server --bin bench_rw --release -- --dim 32 --total-vectors 4000 --batch-size 500 --query-count 80 --warmup-queries 15 --filtered-query-count 80 --filtered-warmup-queries 15 --filter-cardinality 32 --k 10 --summary-json-path /tmp/bench_rw_calib_small.json`
+  - `cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 20000 --batch-size 1000 --query-count 120 --warmup-queries 20 --filtered-query-count 120 --filtered-warmup-queries 20 --filter-cardinality 64 --k 10 --summary-json-path /tmp/bench_rw_calib_medium.json`
+  - `cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 150 --warmup-queries 25 --filtered-query-count 150 --filtered-warmup-queries 25 --filter-cardinality 128 --k 10 --summary-json-path /tmp/bench_rw_calib_large.json`
+  - `cargo fmt --all`
+  - `CI=1 cargo run -p drift_server --bin bench_rw --release -- --dim 32 --total-vectors 4000 --batch-size 500 --query-count 60 --warmup-queries 10 --filtered-query-count 60 --filtered-warmup-queries 10 --filter-cardinality 32 --k 10 --summary-json-path /tmp/bench_rw_ci_small.json`
+  - `CI=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 20000 --batch-size 1000 --query-count 80 --warmup-queries 12 --filtered-query-count 80 --filtered-warmup-queries 12 --filter-cardinality 64 --k 10 --summary-json-path /tmp/bench_rw_ci_medium.json`
+- Open issues:
+  - Large CI-mode validation run under default split pressure intermittently failed with janitor manifest write errors (`No such file or directory`) and terminal `bucket not found`; this is now tracked as next item 24.
+- Next steps:
+  - Execute `docs/NEXT.md` item 24 (stabilize large-tier benchmark run under janitor split pressure).
+
 ## 2026-02-26 (item 22: selectivity guardrails + candidate fanout telemetry)
 - Goal:
   - Execute `docs/NEXT.md` item 22 by adding selectivity guardrails for candidate pushdown and surfacing measurable fanout/scanned-ID impact in benchmark output.

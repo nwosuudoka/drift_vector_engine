@@ -172,6 +172,36 @@ cargo run -p drift_server --bin churn_sim --release
 cargo run -p drift_server --bin bench_rw --release -- --total-vectors 20000 --query-count 200
 ```
 
+Calibration profile commands (emit JSON artifacts for threshold tuning):
+
+```bash
+cargo run -p drift_server --bin bench_rw --release -- \
+  --dim 32 --total-vectors 4000 --batch-size 500 \
+  --query-count 80 --warmup-queries 15 \
+  --filtered-query-count 80 --filtered-warmup-queries 15 \
+  --filter-cardinality 32 --k 10 \
+  --summary-json-path /tmp/bench_rw_calib_small.json
+
+cargo run -p drift_server --bin bench_rw --release -- \
+  --dim 64 --total-vectors 20000 --batch-size 1000 \
+  --query-count 120 --warmup-queries 20 \
+  --filtered-query-count 120 --filtered-warmup-queries 20 \
+  --filter-cardinality 64 --k 10 \
+  --summary-json-path /tmp/bench_rw_calib_medium.json
+
+cargo run -p drift_server --bin bench_rw --release -- \
+  --dim 64 --total-vectors 60000 --batch-size 1500 \
+  --query-count 150 --warmup-queries 25 \
+  --filtered-query-count 150 --filtered-warmup-queries 25 \
+  --filter-cardinality 128 --k 10 \
+  --summary-json-path /tmp/bench_rw_calib_large.json
+```
+
+CI default filtered guardrails (when `CI=1` and explicit filtered limits are not passed):
+- small tier (`total_vectors <= 10_000`): `max_filtered_p95_ms=12`, `max_filtered_overhead_ratio=7.0`
+- medium tier (`10_001..=50_000`): `max_filtered_p95_ms=35`, `max_filtered_overhead_ratio=7.0`
+- large tier (`> 50_000`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=7.5`
+
 ## Workspace layout
 
 - `drift_core`: index, router, memtable, WAL, payload model, maintenance algorithms.

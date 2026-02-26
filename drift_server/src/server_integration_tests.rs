@@ -273,6 +273,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_tolerates_stale_kv_bucket_mapping_for_payload_lookup() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            port: 50066,
+            wal_dir: dir.path().join("wal"),
+            data_dir: dir.path().join("data"),
+            default_dim: 2,
+            max_bucket_capacity: 100,
+            ef_construction: 32,
+            ef_search: 32,
+            storage: StorageCommand::File(FileConfig {
+                path: dir.path().join("storage"),
+            }),
+        };
+
+        let service = DriftService {
+            manager: Arc::new(CollectionManager::new(config)),
+        };
+        let collection = "stale_kv_payload_lookup";
+
+        service
+            .create_collection(Request::new(CreateCollectionRequest {
+                collection_name: collection.to_string(),
+                dim: 2,
+                metric: MetricType::L2 as i32,
+                max_bucket_capacity: 0,
+            }))
+            .await
+            .expect("create_collection should succeed");
+
+        service
+            .insert_batch(Request::new(InsertBatchRequest {
+                collection_name: collection.to_string(),
+                vectors: vec![Vector {
+                    id: 7,
+                    values: vec![0.0, 0.0],
+                }],
+                payload_rows: vec![payload_row(vec![(1, payload_keyword("tenant_a"))])],
+            }))
+            .await
+            .expect("insert_batch should succeed");
+
+        let coll = service
+            .manager
+            .get_or_create(collection, Some(2), None, Some(Metric::L2))
+            .await
+            .expect("collection should exist");
+        let stale_bucket = 9_999u32.to_le_bytes();
+        coll.index
+            .get_kv()
+            .put(&7u64.to_le_bytes(), &stale_bucket)
+            .expect("kv put should succeed");
+
+        let response = service
+            .search(Request::new(SearchRequest {
+                collection_name: collection.to_string(),
+                vector: vec![0.0, 0.0],
+                k: 1,
+                target_confidence: 0.99,
+                lambda: 0.1,
+                tau: 10.0,
+                filters: vec![FieldFilter {
+                    field_id: 1,
+                    condition: Some(crate::drift_proto::field_filter::Condition::Exact(
+                        payload_keyword("tenant_a"),
+                    )),
+                }],
+                payload_projection_fields: vec![1],
+            }))
+            .await
+            .expect("search should tolerate stale kv bucket mapping")
+            .into_inner();
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].id, 7);
+    }
+
+    #[tokio::test]
     async fn test_payload_schema_management_and_insert_validation() {
         let dir = tempdir().unwrap();
         let config = Config {

@@ -63,8 +63,43 @@ fn tenant_filter(field_id: u32, tenant_idx: usize) -> FieldFilter {
     }
 }
 
-const CI_DEFAULT_MAX_FILTERED_P95_MS: f64 = 500.0;
-const CI_DEFAULT_MAX_FILTERED_OVERHEAD_RATIO: f64 = 8.0;
+const CI_SMALL_TIER_MAX_VECTORS: usize = 10_000;
+const CI_MEDIUM_TIER_MAX_VECTORS: usize = 50_000;
+const CI_SMALL_MAX_FILTERED_P95_MS: f64 = 12.0;
+const CI_MEDIUM_MAX_FILTERED_P95_MS: f64 = 35.0;
+const CI_LARGE_MAX_FILTERED_P95_MS: f64 = 90.0;
+const CI_SMALL_MAX_FILTERED_OVERHEAD_RATIO: f64 = 7.0;
+const CI_MEDIUM_MAX_FILTERED_OVERHEAD_RATIO: f64 = 7.0;
+const CI_LARGE_MAX_FILTERED_OVERHEAD_RATIO: f64 = 7.5;
+
+#[derive(Debug, Clone, Copy)]
+struct CiFilteredGuardrailDefaults {
+    tier_label: &'static str,
+    max_filtered_p95_ms: f64,
+    max_filtered_overhead_ratio: f64,
+}
+
+fn ci_filtered_guardrail_defaults(total_vectors: usize) -> CiFilteredGuardrailDefaults {
+    if total_vectors <= CI_SMALL_TIER_MAX_VECTORS {
+        return CiFilteredGuardrailDefaults {
+            tier_label: "small",
+            max_filtered_p95_ms: CI_SMALL_MAX_FILTERED_P95_MS,
+            max_filtered_overhead_ratio: CI_SMALL_MAX_FILTERED_OVERHEAD_RATIO,
+        };
+    }
+    if total_vectors <= CI_MEDIUM_TIER_MAX_VECTORS {
+        return CiFilteredGuardrailDefaults {
+            tier_label: "medium",
+            max_filtered_p95_ms: CI_MEDIUM_MAX_FILTERED_P95_MS,
+            max_filtered_overhead_ratio: CI_MEDIUM_MAX_FILTERED_OVERHEAD_RATIO,
+        };
+    }
+    CiFilteredGuardrailDefaults {
+        tier_label: "large",
+        max_filtered_p95_ms: CI_LARGE_MAX_FILTERED_P95_MS,
+        max_filtered_overhead_ratio: CI_LARGE_MAX_FILTERED_OVERHEAD_RATIO,
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct BenchSummary {
@@ -84,6 +119,25 @@ struct BenchSummary {
     filtered_candidate_fanout: Option<f64>,
     filtered_estimated_scanned_ids_avg: Option<f64>,
     filtered_estimated_scan_ratio: Option<f64>,
+    ci_guardrail_tier: Option<String>,
+    effective_max_filtered_p95_ms: Option<f64>,
+    effective_max_filtered_overhead_ratio: Option<f64>,
+}
+
+struct JanitorAbortGuard {
+    collection: Arc<drift_server::manager::Collection>,
+}
+
+impl JanitorAbortGuard {
+    fn new(collection: Arc<drift_server::manager::Collection>) -> Self {
+        Self { collection }
+    }
+}
+
+impl Drop for JanitorAbortGuard {
+    fn drop(&mut self) {
+        self.collection.janitor_task.abort();
+    }
 }
 
 async fn wait_for_flush(
@@ -165,12 +219,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let filter_cardinality = args.filter_cardinality.max(1);
     let ci_mode = std::env::var_os("CI").is_some();
-    let effective_max_filtered_p95_ms = args.max_filtered_p95_ms.or_else(|| {
-        (ci_mode && args.filtered_query_count > 0).then_some(CI_DEFAULT_MAX_FILTERED_P95_MS)
-    });
-    let effective_max_filtered_overhead_ratio = args.max_filtered_overhead_ratio.or_else(|| {
-        (ci_mode && args.filtered_query_count > 0).then_some(CI_DEFAULT_MAX_FILTERED_OVERHEAD_RATIO)
-    });
+    let ci_defaults = (ci_mode && args.filtered_query_count > 0)
+        .then_some(ci_filtered_guardrail_defaults(args.total_vectors));
+    let effective_max_filtered_p95_ms = args
+        .max_filtered_p95_ms
+        .or_else(|| ci_defaults.map(|defaults| defaults.max_filtered_p95_ms));
+    let effective_max_filtered_overhead_ratio = args
+        .max_filtered_overhead_ratio
+        .or_else(|| ci_defaults.map(|defaults| defaults.max_filtered_overhead_ratio));
     const TENANT_FIELD_ID: u32 = 1;
     const PRICE_FIELD_ID: u32 = 2;
 
@@ -193,7 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager: manager.clone(),
     };
     let collection = "bench_rw";
-    manager
+    let coll = manager
         .get_or_create(
             collection,
             Some(args.dim),
@@ -201,6 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Metric::L2),
         )
         .await?;
+    let _janitor_guard = JanitorAbortGuard::new(coll.clone());
 
     println!("🏁 Bench RW (v3)");
     println!(
@@ -222,15 +279,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if ci_mode {
         if args.max_filtered_p95_ms.is_none() && args.filtered_query_count > 0 {
+            let defaults =
+                ci_defaults.expect("ci defaults should be present when filtered workload runs");
             println!(
-                "   • CI guardrail default: max_filtered_p95_ms={:.1}",
-                CI_DEFAULT_MAX_FILTERED_P95_MS
-            );
-        }
-        if args.max_filtered_overhead_ratio.is_none() && args.filtered_query_count > 0 {
-            println!(
-                "   • CI guardrail default: max_filtered_overhead_ratio={:.2}",
-                CI_DEFAULT_MAX_FILTERED_OVERHEAD_RATIO
+                "   • CI guardrail defaults (tier={}): max_filtered_p95_ms={:.1}, max_filtered_overhead_ratio={:.2}",
+                defaults.tier_label,
+                defaults.max_filtered_p95_ms,
+                defaults.max_filtered_overhead_ratio
             );
         }
     }
@@ -297,10 +352,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Flush wait (best-effort)
-    let coll = manager
-        .get_or_create(collection, Some(args.dim), None, Some(Metric::L2))
-        .await
-        .unwrap();
     let (mem_len, frozen) = wait_for_flush(
         &coll,
         args.wait_active_empty,
@@ -561,6 +612,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             filtered_candidate_fanout,
             filtered_estimated_scanned_ids_avg,
             filtered_estimated_scan_ratio,
+            ci_guardrail_tier: ci_defaults.map(|defaults| defaults.tier_label.to_string()),
+            effective_max_filtered_p95_ms,
+            effective_max_filtered_overhead_ratio,
         };
         let json = serde_json::to_string_pretty(&summary)?;
         std::fs::write(path, json)?;

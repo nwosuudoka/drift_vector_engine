@@ -97,18 +97,59 @@ Last updated: 2026-02-26
       - candidate fanout
       - estimated scanned IDs/query
       - estimated scan ratio
-    - Added CI-friendly filtered guardrail defaults in `bench_rw` when `CI` is set:
-      - `max_filtered_p95_ms = 500`
-      - `max_filtered_overhead_ratio = 8.0`
+    - Added CI-friendly filtered guardrail default wiring in `bench_rw` when `CI` is set
+      (threshold values were calibrated in item 23).
     - Added coverage:
       - `server::planner_heuristic_tests::{candidate_pushdown_disables_broad_selectivity,candidate_pushdown_keeps_selective_filters,candidate_pushdown_keeps_candidates_when_stats_missing}`
       - `index_tests::test_search_with_hints_respects_disk_candidate_ids` (extended with hint-stat assertions)
-- [ ] 23. Calibrate filtered guardrail defaults from benchmark baselines.
+- [x] 23. Calibrate filtered guardrail defaults from benchmark baselines.
   - Goal: tighten CI thresholds from "safe defaults" to environment-validated limits.
   - Scope:
     - run `bench_rw` on CI-like hardware and capture summary JSON artifacts
     - choose target p95 + overhead limits per dataset scale tier
     - document accepted thresholds in `docs/DECISIONS.md` and benchmark usage docs
+  - Completed:
+    - Collected release baseline artifacts:
+      - `/tmp/bench_rw_calib_small.json` (`4k vectors`)
+      - `/tmp/bench_rw_calib_medium.json` (`20k vectors`)
+      - `/tmp/bench_rw_calib_large.json` (`60k vectors`)
+    - Updated `bench_rw` CI defaults from one global threshold to tiered limits by `total_vectors`:
+      - small (`<=10k`): `max_filtered_p95_ms=12`, `max_filtered_overhead_ratio=7.0`
+      - medium (`10,001..=50k`): `max_filtered_p95_ms=35`, `max_filtered_overhead_ratio=7.0`
+      - large (`>50k`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=7.5`
+    - Added summary JSON traceability fields:
+      - `ci_guardrail_tier`
+      - `effective_max_filtered_p95_ms`
+      - `effective_max_filtered_overhead_ratio`
+    - Verified CI-mode enforcement on small/medium tiers:
+      - `/tmp/bench_rw_ci_small.json`
+      - `/tmp/bench_rw_ci_medium.json`
+    - Documented thresholds and rationale in:
+      - `docs/DECISIONS.md`
+      - `README.md` benchmark section
+- [x] 24. Stabilize large-tier benchmark run under janitor split pressure.
+  - Goal: eliminate intermittent `bucket not found` failures in `bench_rw` large runs.
+  - Scope:
+    - reproduce and isolate `Janitor: Failed to write tmp manifest` path under high split/merge churn
+    - verify manifest/staging path lifetime during benchmark execution
+    - add regression coverage for benchmark lifecycle stability
+  - Completed:
+    - Hardened server search payload lookup against transient stale KV bucket mappings:
+      - missing payload bucket now falls back to unresolved-ID flow instead of returning internal error.
+      - row-miss within a resolved bucket also falls back to unresolved-ID flow.
+    - Added regression coverage:
+      - `server_integration_tests::test_search_tolerates_stale_kv_bucket_mapping_for_payload_lookup`
+    - Added benchmark lifecycle guard:
+      - `bench_rw` now uses `JanitorAbortGuard` to abort the background janitor task before tempdir teardown.
+    - Validation:
+      - targeted integration and crate tests pass.
+      - large CI-mode benchmark under default split pressure now reaches filtered phase and completes without `bucket not found` / manifest path errors (`/tmp/bench_rw_ci_large_stabilized_relaxed.json`).
+- [ ] 25. Reassess large-tier CI overhead-ratio sensitivity.
+  - Goal: reduce false-positive guardrail failures for large tier while preserving regression signal.
+  - Scope:
+    - rerun large-tier profile multiple times and measure p95 overhead variance
+    - decide whether to keep `7.5x` or raise slightly with documented rationale
+    - update `docs/DECISIONS.md` if threshold changes
 - [x] 1. Run full workspace regression once before commit.
   - Command: `cargo test --workspace`
 - [x] 2. Extend unified header/footer with metric + schema hash fields.
