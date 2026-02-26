@@ -116,7 +116,7 @@ Last updated: 2026-02-26
     - Updated `bench_rw` CI defaults from one global threshold to tiered limits by `total_vectors`:
       - small (`<=10k`): `max_filtered_p95_ms=12`, `max_filtered_overhead_ratio=7.0`
       - medium (`10,001..=50k`): `max_filtered_p95_ms=35`, `max_filtered_overhead_ratio=7.0`
-      - large (`>50k`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=7.5`
+      - large (`>50k`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=10.0`
     - Added summary JSON traceability fields:
       - `ci_guardrail_tier`
       - `effective_max_filtered_p95_ms`
@@ -144,12 +144,37 @@ Last updated: 2026-02-26
     - Validation:
       - targeted integration and crate tests pass.
       - large CI-mode benchmark under default split pressure now reaches filtered phase and completes without `bucket not found` / manifest path errors (`/tmp/bench_rw_ci_large_stabilized_relaxed.json`).
-- [ ] 25. Reassess large-tier CI overhead-ratio sensitivity.
+- [x] 25. Reassess large-tier CI overhead-ratio sensitivity.
   - Goal: reduce false-positive guardrail failures for large tier while preserving regression signal.
   - Scope:
     - rerun large-tier profile multiple times and measure p95 overhead variance
     - decide whether to keep `7.5x` or raise slightly with documented rationale
     - update `docs/DECISIONS.md` if threshold changes
+  - Completed:
+    - Collected 5 successful large-tier CI-like samples (`60k vectors`) with relaxed explicit guardrails:
+      - `/tmp/bench_rw_ci_large_var_s1.json`
+      - `/tmp/bench_rw_ci_large_var_s2.json`
+      - `/tmp/bench_rw_ci_large_var_s3.json`
+      - `/tmp/bench_rw_ci_large_var_s4.json`
+      - `/tmp/bench_rw_ci_large_var_s5.json`
+    - Observed filtered/unfiltered p95 overhead ratio distribution:
+      - min: `6.53x`
+      - median: `7.56x`
+      - max: `9.30x`
+      - avg: `7.78x`
+    - Updated large-tier CI default overhead ratio in `bench_rw`:
+      - from `7.5x` -> `10.0x`
+    - Verified large-tier CI-mode benchmark now passes with default thresholds:
+      - `/tmp/bench_rw_ci_large_item25_final.json`
+    - Synced docs:
+      - `README.md`
+      - `docs/DECISIONS.md`
+- [ ] 26. Evaluate pushdown effectiveness for large-tier exact filters.
+  - Goal: reduce filtered overhead by lowering scanned-ID ratio in large-tier workload.
+  - Scope:
+    - inspect why `filtered_candidate_fanout` and `estimated_scan_ratio` remain `1.0`
+    - validate whether planner selectivity gate is disabling useful candidate maps
+    - define follow-up optimization target for large-tier filtered p95
 - [x] 1. Run full workspace regression once before commit.
   - Command: `cargo test --workspace`
 - [x] 2. Extend unified header/footer with metric + schema hash fields.

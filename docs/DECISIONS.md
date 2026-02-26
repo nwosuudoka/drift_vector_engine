@@ -5,10 +5,11 @@ Last updated: 2026-02-26
 ## 2026-02-26: Tiered CI defaults for filtered-search guardrails in `bench_rw`
 - Decision:
   - Calibrate CI default filtered guardrails by dataset scale tier (`total_vectors`) instead of using one global default.
+  - Recalibrate large-tier overhead ratio after repeated run variance sampling.
   - Tier mapping:
     - small (`<= 10,000`): `max_filtered_p95_ms=12`, `max_filtered_overhead_ratio=7.0`
     - medium (`10,001..=50,000`): `max_filtered_p95_ms=35`, `max_filtered_overhead_ratio=7.0`
-    - large (`> 50,000`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=7.5`
+    - large (`> 50,000`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=10.0`
 - Baseline calibration data (release mode, local CI-like run profile):
   - small (`4,000 vectors`): filtered p95 `5.17ms`, overhead ratio `5.18x`
   - medium (`20,000 vectors`): filtered p95 `16.84ms`, overhead ratio `4.99x`
@@ -16,6 +17,7 @@ Last updated: 2026-02-26
 - Rationale:
   - Previous CI defaults (`500ms`, `8.0x`) were too loose to catch practical regressions.
   - A tiered model keeps enough margin for runtime variance while making failures meaningful.
+  - Large-tier repeated sampling (`60,000` vectors, 5 successful CI-like runs) showed overhead ratio range `6.53x..9.30x`; `7.5x` produced false positives.
 - Impact:
   - `CI=1` bench runs now apply stricter defaults automatically when filtered workload is enabled and no explicit limits are passed.
   - Summary JSON now records applied tier + effective filtered limits for artifact traceability.

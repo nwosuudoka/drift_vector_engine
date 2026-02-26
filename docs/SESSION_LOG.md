@@ -1,5 +1,46 @@
 # Session Log
 
+## 2026-02-26 (item 25: reassess large-tier CI overhead-ratio sensitivity)
+- Goal:
+  - Recalibrate large-tier CI overhead guardrail to reduce false positives while preserving performance regression signal.
+- Work completed:
+  - Ran repeated large-tier benchmark sampling (`60k vectors`) in CI mode with relaxed explicit guardrails to gather variance data.
+  - Captured 5 successful artifacts:
+    - `/tmp/bench_rw_ci_large_var_s1.json`
+    - `/tmp/bench_rw_ci_large_var_s2.json`
+    - `/tmp/bench_rw_ci_large_var_s3.json`
+    - `/tmp/bench_rw_ci_large_var_s4.json`
+    - `/tmp/bench_rw_ci_large_var_s5.json`
+  - Computed overhead ratio stats from captured runs:
+    - min `6.53x`
+    - median `7.56x`
+    - max `9.30x`
+    - avg `7.78x`
+  - Updated large-tier CI default overhead ratio in `bench_rw`:
+    - `CI_LARGE_MAX_FILTERED_OVERHEAD_RATIO`: `7.5` -> `10.0`
+  - Verified large-tier CI-mode benchmark passes with default thresholds:
+    - `/tmp/bench_rw_ci_large_item25_final.json`
+  - Updated docs to match calibrated threshold:
+    - `README.md`
+    - `docs/DECISIONS.md`
+    - `docs/NEXT.md`
+- Files changed:
+  - `drift_server/src/bin/bench_rw.rs`
+  - `README.md`
+  - `docs/DECISIONS.md`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `for i in 1 2 3 4 5 6 7 8 9 10; do ... CI=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 15 --filtered-query-count 100 --filtered-warmup-queries 15 --filter-cardinality 128 --k 10 --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 99 --summary-json-path /tmp/bench_rw_ci_large_attempt_${i}.json ...; done`
+  - `jq -s 'map(.filtered_overhead_ratio) | {count:length, min:min, max:max, avg:(add/length), sorted:(sort), median:(sort[(length/2|floor)])}' /tmp/bench_rw_ci_large_var_s*.json`
+  - `CI=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 15 --filtered-query-count 100 --filtered-warmup-queries 15 --filter-cardinality 128 --k 10 --summary-json-path /tmp/bench_rw_ci_large_item25_final.json`
+  - `cargo fmt --all`
+  - `cargo test -p drift_server --bin bench_rw`
+- Open issues:
+  - None blocking for item 25; large-tier threshold now reflects measured variance.
+- Next steps:
+  - Execute `docs/NEXT.md` item 26 (evaluate pushdown effectiveness for large-tier exact filters).
+
 ## 2026-02-26 (item 24: stabilize large-tier benchmark run under janitor split pressure)
 - Goal:
   - Eliminate intermittent large-run `bench_rw` failures (`bucket not found` and follow-on manifest tmp-path errors) under split/merge churn.

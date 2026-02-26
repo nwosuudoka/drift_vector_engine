@@ -200,7 +200,7 @@ cargo run -p drift_server --bin bench_rw --release -- \
 CI default filtered guardrails (when `CI=1` and explicit filtered limits are not passed):
 - small tier (`total_vectors <= 10_000`): `max_filtered_p95_ms=12`, `max_filtered_overhead_ratio=7.0`
 - medium tier (`10_001..=50_000`): `max_filtered_p95_ms=35`, `max_filtered_overhead_ratio=7.0`
-- large tier (`> 50_000`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=7.5`
+- large tier (`> 50_000`): `max_filtered_p95_ms=90`, `max_filtered_overhead_ratio=10.0`
 
 ## Workspace layout
 
