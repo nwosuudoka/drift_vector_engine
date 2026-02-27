@@ -341,6 +341,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bucket_manager_dense_scan_shortlist_keeps_top_oversample() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let coordinator = Arc::new(BucketCoordinator::new());
+        let manager = BucketManager::new(op.clone(), op.clone(), 4, coordinator, Metric::L2);
+        let dim = 2;
+        let bucket_id = 11;
+
+        let ids = vec![10, 20, 30, 40, 50];
+        let vecs = vec![
+            vec![5.0, 0.0], // far
+            vec![1.0, 0.0], // close
+            vec![4.0, 0.0], // far
+            vec![0.2, 0.0], // closest
+            vec![2.0, 0.0], // medium
+        ];
+        create_bucket_file(dir.path(), "b11.driftu", &ids, &vecs, dim).await;
+        manager.register_bucket_with_count(
+            bucket_id,
+            "b11.driftu".to_string(),
+            StorageClass::Local,
+            ids.len() as u32,
+        );
+
+        let query = vec![0.0, 0.0];
+        let results = manager
+            .search_and_refine_with_candidates(&[bucket_id], &query, 10, 2, None)
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 40);
+        assert_eq!(results[1].0, 20);
+    }
+
+    #[tokio::test]
     async fn test_bucket_drift_tracking_accumulation() {
         let dir = tempdir().unwrap();
         let op = create_local_operator(dir.path());

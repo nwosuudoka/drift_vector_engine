@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::filter_metadata_catalog::FilterMetadataCatalog;
 use crate::filter_planner_diagnostics::FilterPlannerDiagnosticsSnapshot;
+use crate::global_filter_routing_index::GlobalFilterRoutingIndex;
 use crate::janitor::{Janitor, JanitorConfig, JanitorVars};
 use crate::local_staging::LocalStagingManager;
 use crate::manifest::ServerManifestManager;
@@ -41,6 +42,7 @@ pub struct Collection {
     pub payload_schema: Arc<ParkingRwLock<Option<CorePayloadSchema>>>,
     pub last_filter_planner_diagnostics: Arc<ParkingRwLock<FilterPlannerDiagnosticsSnapshot>>,
     pub filter_metadata_catalog: Arc<ParkingRwLock<FilterMetadataCatalog>>,
+    pub global_filter_routing_index: Arc<ParkingRwLock<GlobalFilterRoutingIndex>>,
     // We hold the handle so it runs in the background. Dropping this struct (e.g. shutdown) will abort it.
     pub janitor_task: tokio::task::JoinHandle<()>,
 }
@@ -107,6 +109,39 @@ impl CollectionManager {
             },
             Err(_) => default,
         }
+    }
+
+    fn clear_filter_metadata_catalog_for_recovery(
+        collection_name: &str,
+        catalog: &Arc<ParkingRwLock<FilterMetadataCatalog>>,
+    ) {
+        let mut guard = catalog.write();
+        let stats = guard.stats();
+        if stats.bucket_count > 0 {
+            info!(
+                "Manager: clearing filter metadata catalog for '{}' before recovery (buckets={}, exact_values={})",
+                collection_name, stats.bucket_count, stats.exact_value_memberships
+            );
+        }
+        guard.clear();
+    }
+
+    fn clear_global_filter_routing_index_for_recovery(
+        collection_name: &str,
+        index: &Arc<ParkingRwLock<GlobalFilterRoutingIndex>>,
+    ) {
+        let mut guard = index.write();
+        let stats = guard.stats();
+        if stats.id_entry_count > 0 || stats.value_entry_count > 0 {
+            info!(
+                "Manager: clearing global filter routing index for '{}' before recovery (ids={}, values={}, value_bucket_pairs={})",
+                collection_name,
+                stats.id_entry_count,
+                stats.value_entry_count,
+                stats.value_bucket_pair_count
+            );
+        }
+        guard.clear();
     }
 
     fn recreate_kv_store(kv_base_path: &Path) -> std::io::Result<Arc<BitStore>> {
@@ -438,6 +473,12 @@ impl CollectionManager {
             coordinator.clone(),
             metric,
         ));
+        let filter_metadata_catalog =
+            Arc::new(ParkingRwLock::new(FilterMetadataCatalog::default()));
+        Self::clear_filter_metadata_catalog_for_recovery(name, &filter_metadata_catalog);
+        let global_filter_routing_index =
+            Arc::new(ParkingRwLock::new(GlobalFilterRoutingIndex::default()));
+        Self::clear_global_filter_routing_index_for_recovery(name, &global_filter_routing_index);
 
         // --- RECOVERY (Step 1: Router) ---
         // ⚡ This .await is why we needed tokio::sync::RwLock!
@@ -509,6 +550,8 @@ impl CollectionManager {
             staging: staging.clone(),
             persistence: persistence.clone(),
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: filter_metadata_catalog.clone(),
+            global_filter_routing_index: global_filter_routing_index.clone(),
             coordinator,
             vars: JanitorVars {
                 promotion_threshold_bytes: 16 * 1024 * 1024,
@@ -539,7 +582,8 @@ impl CollectionManager {
             last_filter_planner_diagnostics: Arc::new(ParkingRwLock::new(
                 FilterPlannerDiagnosticsSnapshot::default(),
             )),
-            filter_metadata_catalog: Arc::new(ParkingRwLock::new(FilterMetadataCatalog::default())),
+            filter_metadata_catalog,
+            global_filter_routing_index,
             janitor_task,
         });
 

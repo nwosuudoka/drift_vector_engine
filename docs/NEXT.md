@@ -1,6 +1,6 @@
 # Next Steps
 
-Last updated: 2026-02-26
+Last updated: 2026-02-27
 
 ## Current Execution Phase
 - Phase D API surface is complete (payload/filter + payload schema management).
@@ -219,12 +219,231 @@ Last updated: 2026-02-26
         - `filtered_planner_probe_error_bucket_ratio=0.0`
         - all absence-reason ratios `0.0`
         - `filtered_candidate_fanout=1.0`, `filtered_estimated_scan_ratio=1.0`
+    - Added item 26 locality measurement harness in `bench_rw`:
+      - new workload controls:
+        - `--tenant-assignment-mode {round-robin|vector-bin|tenant-clustered}`
+        - `--tenant-cluster-noise <f32>`
+      - new summary JSON fields:
+        - `tenant_assignment_mode`
+        - `configured_filter_cardinality`
+        - `effective_filter_cardinality`
+        - `tenant_locality_bucket_count`
+        - `tenant_locality_kv_entries_scanned`
+        - `tenant_locality_kv_entries_skipped`
+        - `tenant_locality_avg_distinct_tenants_per_bucket`
+        - `tenant_locality_avg_dominant_tenant_share`
+        - `tenant_locality_avg_tenant_bucket_coverage_ratio`
+      - large-tier locality variants (`60k`, `filter_cardinality=128`):
+        - `/tmp/bench_rw_item26_locality_round_robin.json`
+        - `/tmp/bench_rw_item26_locality_vector_bin.json`
+        - `/tmp/bench_rw_item26_locality_tenant_clustered.json`
+      - observed distribution + planner behavior:
+        - `round_robin`: coverage `1.000`, filtered p95 `38.66ms`, planner produced `1.0`, catalog pruned `0.0`
+        - `vector_bin`: coverage `1.000`, filtered p95 `38.36ms`, planner produced `1.0`, catalog pruned `0.0`
+        - `tenant_clustered`: coverage `0.346`, filtered p95 `17.27ms`, planner produced `0.193`, empty_exact `0.807`, catalog pruned `0.108`
+      - note:
+        - `filtered_candidate_fanout` and `filtered_estimated_scan_ratio` still report `1.0` in all three variants, indicating these ratios are not yet capturing global pruning benefit.
+    - Started global zonemap metadata path (range-aware catalog preselection):
+      - extended `FilterMetadataCatalog` with per-bucket range field zonemaps:
+        - `field_id -> {has_non_null_values, min, max}`
+      - added range clause coverage classification:
+        - `classify_bucket_range_clauses(...)` with conservative outcomes
+          (`CompleteNoMatch`, `CompleteMayMatch`, `Incomplete`, `Stale`, `Missing`)
+      - planner now extracts both exact and range catalog clauses and combines them during preselection:
+        - prune bucket if either exact or range coverage is `CompleteNoMatch`
+        - fallback-keep on incomplete/missing/stale
+      - range probe path now captures zonemap observations from payload stats and writes them into catalog.
+      - validation:
+        - `cargo test -p drift_server filter_metadata_catalog::tests`
+        - `cargo test -p drift_server planner_heuristic_tests`
+        - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+    - Added global scan-denominator telemetry and range benchmark mode in `bench_rw`:
+      - new filtered summary fields:
+        - `filtered_prefilter_routable_live_ids_avg`
+        - `filtered_estimated_global_scan_ratio`
+      - new filtered workload controls:
+        - `--filtered-predicate-mode {tenant-exact|price-range}`
+        - `--filtered-range-window <usize>`
+      - filtered console output now reports scanned ratio against both:
+        - post-prune live IDs (existing)
+        - full pre-filter routable live-ID snapshot (new)
+      - smoke artifacts:
+        - `/tmp/bench_rw_item26_global_metric_smoke.json`
+        - `/tmp/bench_rw_item26_range_smoke.json`
+      - observed:
+        - tenant-exact smoke: `filtered_estimated_scan_ratio=1.0`, `filtered_estimated_global_scan_ratio=0.031`
+        - price-range smoke: `filtered_estimated_scan_ratio=1.0`, `filtered_estimated_global_scan_ratio=0.143`, `filtered_planner_range_stats_only_bucket_ratio=1.0`
+    - Ran large-tier range-heavy diagnostics samples (`60k`, `price_range`, window `256`, 3 samples):
+      - artifacts:
+        - `/tmp/bench_rw_ci_large_item26_range_s1.json`
+        - `/tmp/bench_rw_ci_large_item26_range_s2.json`
+        - `/tmp/bench_rw_ci_large_item26_range_s3.json`
+      - aggregate:
+        - filtered p95: `49.75ms` avg (`44.43..54.70`)
+        - overhead ratio: `7.41x` avg (`6.07..8.97`)
+        - filtered avg hits: `0.28`
+        - planner range-stats-only ratio: `1.0`
+        - catalog pruned bucket ratio: `0.0`
+      - telemetry note:
+        - `filtered_candidate_fanout=0.0`, `filtered_estimated_scan_ratio=0.0`, `filtered_estimated_global_scan_ratio=0.0` in all 3 runs due bucket-stats unavailability in this churny profile; these scans are currently undercounted.
+    - Started global exact-routing index migration step (scaffold):
+      - added new module: `drift_server/src/global_filter_routing_index.rs`
+      - in-memory structures:
+        - id sidecar: `id -> {bucket_id, exact value keys}`
+        - value routing counts: `(field,value) -> bucket -> live_count`
+      - implemented mutation/query APIs:
+        - upsert id values
+        - remove id
+        - invalidate bucket
+        - exact clause bucket lookup (OR within clause, AND across clauses)
+      - wired collection-local state:
+        - `Collection.global_filter_routing_index`
+      - added recovery-start clear hook + manager test coverage.
+    - Completed global exact-routing migration step 2 (mutation lifecycle + planner-safe consult):
+      - janitor wiring:
+        - flush now upserts per-id exact routing entries and removes tombstoned IDs.
+        - split now rebuilds full child bucket routing snapshots and invalidates source bucket routing.
+        - merge now rebuilds rewritten target bucket routing snapshots and invalidates zombie routing.
+        - promotion now rebuilds full bucket routing snapshot from merged/tombstone-filtered payload rows.
+      - manager wiring:
+        - `JanitorConfig` now carries `global_filter_routing_index` so lifecycle updates run in background janitor path.
+      - planner wiring:
+        - added conservative exact preselection over `global_filter_routing_index` before catalog probing.
+        - prune rule is strict:
+          - prune only when queried exact value is absent for a clause AND bucket is marked complete for that exact field.
+          - keep bucket on incomplete coverage (no false-negative pruning).
+      - validation:
+        - `cargo test -p drift_server global_filter_routing_index::tests`
+        - `cargo test -p drift_server janitor_tests::tests::test_janitor_flush_lifecycle`
+        - `cargo test -p drift_server planner_heuristic_tests`
+        - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+        - `cargo test -p drift_server manager_tests::tests::test_manager_restart_recovery_clears_global_filter_routing_index`
+        - `cargo test -p drift_core index_tests::tests::test_search_with_hints_respects_disk_candidate_ids`
+      - quick benchmark smoke (`12k`, tenant-clustered):
+        - artifact: `/tmp/bench_rw_global_routing_smoke.json`
+        - observed:
+          - `filtered_p95_ms=6.13`
+          - `filtered_overhead_ratio=2.98x`
+          - `filtered_candidate_fanout=1.0`
+          - `filtered_estimated_scan_ratio=1.0`
+          - `filtered_estimated_global_scan_ratio=0.0156`
+          - `filtered_planner_catalog_pruned_bucket_ratio=0.0`
+          - `tenant_locality_avg_tenant_bucket_coverage_ratio=1.0`
+      - large-tier validation (`60k`, tenant-clustered, diagnostics enabled, 3 samples):
+        - artifacts:
+          - `/tmp/bench_rw_ci_large_globalrouting_s1.json`
+          - `/tmp/bench_rw_ci_large_globalrouting_s2.json`
+          - `/tmp/bench_rw_ci_large_globalrouting_s3.json`
+        - aggregate:
+          - filtered p95: `18.17ms` avg (`14.50..20.94`)
+          - overhead ratio: `2.56x` avg (`2.27..2.97`)
+          - candidate fanout: `0.998` avg (`0.993..1.000`)
+          - scan ratio: `0.998` avg (`0.993..1.000`)
+          - global scan ratio: `0.0078` avg
+          - planner produced bucket ratio: `1.0`
+          - planner catalog pruned bucket ratio: `0.0`
+          - planner catalog incomplete bucket ratio: `0.844`
+          - tenant bucket coverage ratio: `0.352`
+    - Completed global exact-routing migration step 3 (benchmark visibility metric):
+      - planner diagnostics now track global exact preselection counters:
+        - `global_exact_preselect_eligible_query`
+        - `global_exact_preselect_input_bucket_count`
+        - `global_exact_preselect_pruned_bucket_count`
+      - `bench_rw` summary/console now emit:
+        - `filtered_planner_global_exact_eligible_query_ratio`
+        - `filtered_planner_global_exact_pruned_bucket_ratio`
+      - refreshed large-tier validation (`60k`, tenant-clustered, diagnostics enabled, 3 samples):
+        - artifacts:
+          - `/tmp/bench_rw_ci_large_globalrouting_v2_s1.json`
+          - `/tmp/bench_rw_ci_large_globalrouting_v2_s2.json`
+          - `/tmp/bench_rw_ci_large_globalrouting_v2_s3.json`
+        - aggregate:
+          - filtered p95: `16.77ms` avg (`13.51..20.78`)
+          - overhead ratio: `2.49x` avg (`2.27..2.77`)
+          - candidate fanout: `1.000`
+          - scan ratio: `1.000`
+          - global scan ratio: `0.0078` avg
+          - planner global exact eligible query ratio: `1.000`
+          - planner global exact pruned bucket ratio: `0.822`
+          - planner catalog pruned bucket ratio: `0.0`
+          - planner catalog incomplete bucket ratio: `0.850`
+    - Completed large-tier execution step 2 (dense-bucket shortlist path):
+      - optimized dense candidate scans in `BucketManager::search_and_refine_with_candidates(...)`:
+        - replaced full collect+sort with bounded top-`oversample_factor` heap maintenance.
+        - preserves top candidate semantics while reducing dense-bucket sort/memory work.
+      - added regression coverage:
+        - `bucket_manager_tests::test_bucket_manager_dense_scan_shortlist_keeps_top_oversample`
+      - large-tier validation samples:
+        - `/tmp/bench_rw_ci_large_dense_shortlist_s1.json`
+        - `/tmp/bench_rw_ci_large_dense_shortlist_s2.json`
+        - `/tmp/bench_rw_ci_large_dense_shortlist_s3.json`
+      - aggregate:
+        - filtered p95: `15.24ms` avg (`13.45..18.13`)
+        - overhead ratio: `3.03x` avg (`2.70..3.50`)
+        - candidate fanout / scan ratio: `1.0 / 1.0`
+        - global scan ratio: `0.00778` avg
+        - planner global exact pruned bucket ratio: `0.828`
+      - comparison vs `/tmp/bench_rw_ci_large_globalrouting_v2_s{1,2,3}.json`:
+        - filtered p95 improved (`16.77ms -> 15.24ms`)
+        - overhead ratio regressed (`2.49x -> 3.03x`)
+        - scan-accounting metrics unchanged (`candidate_fanout=1.0`, `scan_ratio=1.0`)
+    - Completed large-tier execution step 3 (scan-accounting semantics update):
+      - `bench_rw` primary filtered ratios now use pre-filter routable denominator:
+        - `filtered_candidate_fanout = candidate_ids / prefilter_routable_live_ids`
+        - `filtered_estimated_scan_ratio = scanned_ids / prefilter_routable_live_ids`
+      - retained explicit post-prune visibility via new summary fields:
+        - `filtered_post_prune_candidate_fanout`
+        - `filtered_post_prune_estimated_scan_ratio`
+      - compatibility:
+        - `filtered_estimated_global_scan_ratio` now matches the pre-filter denominator scan ratio and is retained for downstream consumers.
+      - hardened scan-accounting fallback for missing bucket stats:
+        - when per-query `SearchHintStats` scanned/live estimates are zero but selected buckets are known, `bench_rw` now estimates scanned/live IDs from average pre-filter live IDs per routable bucket.
+        - added summary visibility fields:
+          - `filtered_scan_accounting_fallback_query_count`
+          - `filtered_scan_accounting_fallback_query_ratio`
+    - Completed large-tier execution step 4 (post-license benchmark validation + delete-sync closure):
+      - reran large-tier exact diagnostics samples (3x):
+        - `/tmp/bench_rw_ci_large_scanacct_exact_s1.json`
+        - `/tmp/bench_rw_ci_large_scanacct_exact_s2.json`
+        - `/tmp/bench_rw_ci_large_scanacct_exact_s3.json`
+      - exact aggregate:
+        - filtered p95: `13.65ms` avg
+        - overhead ratio: `2.63x` avg
+        - `filtered_candidate_fanout`: `0.00779` avg
+        - `filtered_estimated_scan_ratio`: `0.00807` avg
+        - `filtered_post_prune_candidate_fanout`: `0.967` avg
+        - `filtered_post_prune_estimated_scan_ratio`: `1.0` avg
+        - fallback ratio: `0.0` avg
+        - planner global exact pruned bucket ratio: `0.828` avg
+      - exact comparison vs `/tmp/bench_rw_ci_large_globalrouting_v2_s{1,2,3}.json`:
+        - filtered p95 improved (`16.77ms -> 13.65ms`)
+        - overhead ratio slightly higher (`2.49x -> 2.63x`)
+        - pre-filter ratios now explicitly reflect global pruning (`candidate_fanout`/`scan_ratio` moved from `1.0` to ~`0.008` under new denominator semantics)
+      - reran large-tier range-heavy diagnostics samples (3x):
+        - `/tmp/bench_rw_ci_large_scanacct_range_s1.json`
+        - `/tmp/bench_rw_ci_large_scanacct_range_s2.json`
+        - `/tmp/bench_rw_ci_large_scanacct_range_s3.json`
+      - range-heavy aggregate:
+        - filtered p95: `36.02ms` avg
+        - overhead ratio: `6.45x` avg
+        - `filtered_candidate_fanout`: `0.0` avg
+        - `filtered_estimated_scan_ratio`: `1.0` avg
+        - `filtered_post_prune_estimated_scan_ratio`: `1.0` avg
+        - fallback ratio: `1.0` avg (all queries)
+        - planner range-stats-only ratio: `1.0` avg
+        - planner catalog pruned bucket ratio: `0.0` avg
+      - range-heavy comparison vs `/tmp/bench_rw_ci_large_item26_range_s{1,2,3}.json`:
+        - prior undercount issue resolved (`filtered_estimated_scan_ratio`/`global_scan_ratio` from `0.0` -> `1.0`)
+        - filtered p95 improved (`49.75ms -> 36.02ms`)
+        - overhead ratio improved (`7.41x -> 6.45x`)
+      - delete-sync closure (current policy):
+        - no public delete RPC exists in `drift_server/proto/drift.proto`.
+        - runtime direct delete usage is simulation-only (`bin/churn_sim.rs`).
+        - immediate direct-delete routing-index mutation is deferred; janitor-flush reconciliation remains the chosen strategy.
   - Remaining:
-    - verify tenant/value distribution per bucket in benchmark dataset to confirm why exact postings are broad (`candidate_count ~= live_count`).
-    - add benchmark variants with stronger tenant locality (or higher cardinality) to measure achievable scan-ratio reduction from existing pushdown.
     - decide whether to prioritize data-layout-aware partitioning/catalog changes versus query-time metadata indexing.
     - decide whether adaptive field-to-bucket metadata indexing is required for planner cost control.
-- [ ] 27. Define adaptive metadata catalog for filter-to-bucket routing (v2).
+- [x] 27. Define adaptive metadata catalog for filter-to-bucket routing (v2).
   - Goal: avoid probing every bucket at query time while preserving filter-first correctness.
   - Scope:
     - design a compact field-level bucket membership catalog (exact + range stats pointers).
@@ -250,13 +469,79 @@ Last updated: 2026-02-26
         - exact value membership keys (field + logical type tag + encoded value bytes).
       - planner now records successful probe observations into `Collection.filter_metadata_catalog`.
       - bucket-path change resets stale bucket memberships; exact value memberships are capped per bucket.
+    - Added migration step 2 conservative preselection path:
+      - catalog now records exact key presence as tri-state (`present` / `absent`) per bucket key.
+      - freshness gate now requires both:
+        - matching bucket path
+        - matching bucket live-count snapshot (`total_count - tombstones`)
+      - planner now derives exact/any_of clause keys and performs preselection:
+        - prunes only `CompleteNoMatch` buckets
+        - falls back to probing on `missing` / `stale` / `incomplete` coverage.
+      - added unit coverage for clause classification:
+        - complete match
+        - complete no-match
+        - incomplete
+        - stale path
+        - stale stats
+    - Added migration step 3 telemetry and stale-entry invalidation:
+      - planner diagnostics snapshot now records catalog preselection counters:
+        - eligible query flag
+        - input/pruned bucket counts
+        - complete/incomplete/stale/missing bucket classifications
+      - stale catalog entries are now invalidated immediately during query-time preselection.
+      - `bench_rw` now prints and emits summary JSON fields:
+        - `filtered_planner_catalog_eligible_query_ratio`
+        - `filtered_planner_catalog_pruned_bucket_ratio`
+        - `filtered_planner_catalog_complete_may_match_bucket_ratio`
+        - `filtered_planner_catalog_incomplete_bucket_ratio`
+        - `filtered_planner_catalog_stale_bucket_ratio`
+        - `filtered_planner_catalog_missing_bucket_ratio`
+      - proactive lifecycle invalidation hooks added in janitor:
+        - flush: invalidates touched buckets
+        - split: invalidates parent + child bucket IDs
+        - merge: invalidates zombie + rewritten targets
+        - promotion: invalidates bucket on class/path transitions
+      - validation samples:
+        - `/tmp/bench_rw_ci_large_item27_catalog_telemetry_s1.json`
+        - `/tmp/bench_rw_ci_large_item27_catalog_telemetry_s2.json`
+        - aggregate (2 samples):
+          - `catalog_eligible_query_ratio=1.0`
+          - `catalog_pruned_bucket_ratio=0.0`
+          - `catalog_complete_may_match_bucket_ratio=0.133`
+          - `catalog_incomplete_bucket_ratio=0.867`
+          - scan ratio unchanged (`1.0`)
+    - Initial large-tier validation sample after step 2:
+      - `/tmp/bench_rw_ci_large_item27_preselect_s1.json`
+      - observed:
+        - filtered p95: `40.93ms`
+        - overhead ratio: `6.51x`
+        - candidate fanout/scan ratio: `1.0 / 1.0`
+      - note:
+        - no measurable scan-ratio change yet in this workload/profile.
     - Current behavior:
-      - no query routing/selectivity behavior change yet (observability/foundation only).
-  - Remaining:
-    - add completeness/freshness tokens that are safe for planner pruning decisions.
-    - implement catalog-driven exact/any_of preselection under strict safety checks.
-    - wire janitor/recovery invalidation hooks so catalog stays correct under topology churn.
-    - add benchmark telemetry fields for catalog hit-rate and preselection impact.
+      - planner can now prune buckets from probe set only when catalog evidence is complete + fresh.
+      - candidate-ID pushdown behavior remains unchanged.
+    - Added migration step 4b recovery-start reset semantics:
+      - manager now explicitly clears collection-local filter metadata catalog at startup before recovery.
+      - added coverage:
+        - `manager_tests::tests::test_manager_restart_recovery_clears_filter_metadata_catalog`
+        - `filter_metadata_catalog::tests::clear_removes_all_entries`
+    - Completed migration step 5 benchmark loop with repeated telemetry samples:
+      - successful artifacts:
+        - `/tmp/bench_rw_ci_large_item27_catalog_telemetry_s1.json`
+        - `/tmp/bench_rw_ci_large_item27_catalog_telemetry_s2.json`
+        - `/tmp/bench_rw_ci_large_item27_catalog_telemetry_s3.json`
+        - `/tmp/bench_rw_ci_large_item27_catalog_telemetry_s5.json`
+        - `/tmp/bench_rw_ci_large_item27_catalog_telemetry_s6.json`
+      - transient failed attempt:
+        - `s4` aborted by known janitor tempdir teardown race (`Failed to write tmp manifest` / missing local bucket path).
+      - aggregate (5 successful samples):
+        - `catalog_eligible_query_ratio=1.0`
+        - `catalog_pruned_bucket_ratio=0.0`
+        - `catalog_complete_may_match_bucket_ratio=0.132`
+        - `catalog_incomplete_bucket_ratio=0.868`
+        - `filtered_candidate_fanout=1.0`
+        - `filtered_estimated_scan_ratio=1.0`
 - [x] 1. Run full workspace regression once before commit.
   - Command: `cargo test --workspace`
 - [x] 2. Extend unified header/footer with metric + schema hash fields.

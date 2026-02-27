@@ -924,6 +924,12 @@ mod janitor_reaper_integration_tests {
             staging: staging.clone(),
             persistence: persistence.clone(),
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator: coordinator.clone(),
             vars: JanitorVars {
                 promotion_threshold_bytes: 100,

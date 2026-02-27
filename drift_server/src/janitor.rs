@@ -1,4 +1,8 @@
 use crate::cleanup::CleanupApi;
+use crate::filter_metadata_catalog::FilterMetadataCatalog;
+use crate::global_filter_routing_index::{
+    GlobalFilterRoutingIndex, extract_indexed_exact_value_keys, indexed_exact_field_ids,
+};
 use crate::local_staging::LocalStagingManager;
 use crate::manifest::ServerManifestManager;
 use crate::persistence::PersistenceManager;
@@ -15,6 +19,7 @@ use drift_storage::unified_format::{
     UnifiedPayloadValue,
 };
 use drift_traits::StorageEngine;
+use parking_lot::RwLock as ParkingRwLock;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{
@@ -374,6 +379,8 @@ pub struct JanitorConfig {
     pub staging: Arc<LocalStagingManager>,
     pub persistence: Arc<PersistenceManager>,
     pub bucket_manager: Arc<BucketManager>,
+    pub filter_metadata_catalog: Arc<ParkingRwLock<FilterMetadataCatalog>>,
+    pub global_filter_routing_index: Arc<ParkingRwLock<GlobalFilterRoutingIndex>>,
     pub coordinator: Arc<BucketCoordinator>,
     pub vars: JanitorVars,
 }
@@ -385,6 +392,8 @@ pub struct Janitor {
     persistence: Arc<PersistenceManager>,
     cleanup: CleanupApi,
     bucket_manager: Arc<BucketManager>,
+    filter_metadata_catalog: Arc<ParkingRwLock<FilterMetadataCatalog>>,
+    global_filter_routing_index: Arc<ParkingRwLock<GlobalFilterRoutingIndex>>,
     reaper: Mutex<Reaper>,
     coordinator: Arc<BucketCoordinator>,
     vars: JanitorVars,
@@ -404,10 +413,164 @@ impl Janitor {
             persistence: config.persistence,
             cleanup,
             bucket_manager: config.bucket_manager,
+            filter_metadata_catalog: config.filter_metadata_catalog,
+            global_filter_routing_index: config.global_filter_routing_index,
             reaper,
             coordinator: config.coordinator,
             vars: config.vars,
         }
+    }
+
+    fn invalidate_catalog_buckets(&self, bucket_ids: &[u32]) {
+        if bucket_ids.is_empty() {
+            return;
+        }
+        let mut catalog = self.filter_metadata_catalog.write();
+        for bucket_id in bucket_ids {
+            catalog.invalidate_bucket(*bucket_id);
+        }
+    }
+
+    fn invalidate_routing_buckets(&self, bucket_ids: &[u32]) {
+        if bucket_ids.is_empty() {
+            return;
+        }
+        let mut routing = self.global_filter_routing_index.write();
+        for bucket_id in bucket_ids {
+            routing.invalidate_bucket(*bucket_id);
+        }
+    }
+
+    fn remove_routing_ids(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut routing = self.global_filter_routing_index.write();
+        for id in ids {
+            routing.remove_id(*id);
+        }
+    }
+
+    fn upsert_routing_entries_incremental(
+        &self,
+        bucket_id: u32,
+        payload_schema: Option<&UnifiedPayloadSchema>,
+        payload_rows: Option<&[UnifiedPayloadRow]>,
+        ids: &[u64],
+    ) -> io::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut routing = self.global_filter_routing_index.write();
+        match (payload_schema, payload_rows) {
+            (Some(schema), Some(rows)) => {
+                if rows.len() != ids.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "routing incremental payload row mismatch for bucket {}: ids={}, payload_rows={}",
+                            bucket_id,
+                            ids.len(),
+                            rows.len()
+                        ),
+                    ));
+                }
+                for (id, row) in ids.iter().zip(rows.iter()) {
+                    let keys = extract_indexed_exact_value_keys(schema, row)?;
+                    routing.upsert_id_values(*id, bucket_id, keys);
+                }
+            }
+            (Some(_), None) if !ids.is_empty() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "routing incremental payload rows missing for bucket {} with {} ids",
+                        bucket_id,
+                        ids.len()
+                    ),
+                ));
+            }
+            (None, Some(rows)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "routing incremental payload rows present without schema for bucket {} (payload_rows={})",
+                        bucket_id,
+                        rows.len()
+                    ),
+                ));
+            }
+            (None, None) | (Some(_), None) => {
+                for id in ids {
+                    routing.remove_id(*id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild_routing_bucket_from_snapshot(
+        &self,
+        bucket_id: u32,
+        payload_schema: Option<&UnifiedPayloadSchema>,
+        payload_rows: Option<&[UnifiedPayloadRow]>,
+        ids: &[u64],
+    ) -> io::Result<()> {
+        let mut routing = self.global_filter_routing_index.write();
+        routing.invalidate_bucket(bucket_id);
+
+        match (payload_schema, payload_rows) {
+            (Some(schema), Some(rows)) => {
+                if rows.len() != ids.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "routing rebuild payload row mismatch for bucket {}: ids={}, payload_rows={}",
+                            bucket_id,
+                            ids.len(),
+                            rows.len()
+                        ),
+                    ));
+                }
+                for (id, row) in ids.iter().zip(rows.iter()) {
+                    let keys = extract_indexed_exact_value_keys(schema, row)?;
+                    routing.upsert_id_values(*id, bucket_id, keys);
+                }
+                routing
+                    .set_bucket_complete_exact_fields(bucket_id, indexed_exact_field_ids(schema));
+            }
+            (Some(_schema), None) if !ids.is_empty() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "routing rebuild payload rows missing for bucket {} with {} ids",
+                        bucket_id,
+                        ids.len()
+                    ),
+                ));
+            }
+            (Some(schema), None) => {
+                routing
+                    .set_bucket_complete_exact_fields(bucket_id, indexed_exact_field_ids(schema));
+            }
+            (None, Some(rows)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "routing rebuild payload rows present without schema for bucket {} (payload_rows={})",
+                        bucket_id,
+                        rows.len()
+                    ),
+                ));
+            }
+            (None, None) => {
+                for id in ids {
+                    routing.remove_id(*id);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_kv_mapping(&self, bucket_id: u32, ids: &[u64]) {
@@ -690,10 +853,12 @@ impl Janitor {
         };
 
         let mut manifest_updates = Vec::new();
+        let mut flushed_bucket_ids = Vec::new();
         // ⚡ CHANGE: Store updates for the Router (ID, Count, Centroid)
         let mut router_updates = Vec::new();
 
         for (bucket_id, group) in &partitions {
+            flushed_bucket_ids.push(*bucket_id);
             let payload_schema = group
                 .payload_schema
                 .as_ref()
@@ -716,6 +881,12 @@ impl Janitor {
 
             // A1. Update KV (VectorID -> BucketID)
             self.update_kv_mapping(*bucket_id, &group.ids);
+            self.upsert_routing_entries_incremental(
+                *bucket_id,
+                payload_schema.as_ref(),
+                payload_rows.as_deref(),
+                &group.ids,
+            )?;
 
             // B. Ensure Registered
             if self.bucket_manager.get_version(*bucket_id).is_none() {
@@ -774,6 +945,7 @@ impl Janitor {
         if !all_tombstones.is_empty() {
             all_tombstones.sort_unstable();
             all_tombstones.dedup();
+            self.remove_routing_ids(&all_tombstones);
             let run_id = uuid::Uuid::new_v4().to_string();
             let ts_file = self
                 .persistence
@@ -818,6 +990,7 @@ impl Janitor {
         // 5. Acknowledge
         self.index.acknowledge_flush(&wal_ids)?;
         self.sync_kv_best_effort("flush");
+        self.invalidate_catalog_buckets(flushed_bucket_ids.as_slice());
 
         Ok(())
     }
@@ -1014,6 +1187,7 @@ impl Janitor {
                 promoting_class,
                 current_count,
             );
+            self.invalidate_catalog_buckets(&[bucket_id]);
 
             // --- ⚡ EXPLICIT MERGE & FILTER LOGIC ---
             let dim = self.index.get_dim();
@@ -1183,6 +1357,12 @@ impl Janitor {
                     final_payload_rows.as_deref(),
                 )
                 .await?;
+            self.rebuild_routing_bucket_from_snapshot(
+                bucket_id,
+                merged_schema.as_ref(),
+                final_payload_rows.as_deref(),
+                &final_ids,
+            )?;
 
             // --- END EXPLICIT LOGIC ---
 
@@ -1218,6 +1398,7 @@ impl Janitor {
                 tiered_class,
                 final_count,
             );
+            self.invalidate_catalog_buckets(&[bucket_id]);
 
             // Keep router counts in sync after promotion.
             self.index.update_router_count(bucket_id, final_count, None);
@@ -1384,10 +1565,10 @@ impl Janitor {
         // Update KV mapping for new buckets
         self.update_kv_mapping(id_left, &proposal.left.ids);
         self.update_kv_mapping(id_right, &proposal.right.ids);
+        let loopback_ids: Vec<u64> = proposal.loopback.iter().map(|(id, _)| *id).collect();
 
         // Remove KV mapping for loopback (now L0-only)
-        if !proposal.loopback.is_empty() {
-            let loopback_ids: Vec<u64> = proposal.loopback.iter().map(|(id, _)| *id).collect();
+        if !loopback_ids.is_empty() {
             self.remove_kv_mapping(&loopback_ids);
         }
 
@@ -1396,6 +1577,18 @@ impl Janitor {
             .register_bucket(id_left, file_l, StorageClass::Local);
         self.bucket_manager
             .register_bucket(id_right, file_r, StorageClass::Local);
+        self.rebuild_routing_bucket_from_snapshot(
+            id_left,
+            source_schema.as_ref(),
+            left_payload_rows.as_deref(),
+            &proposal.left.ids,
+        )?;
+        self.rebuild_routing_bucket_from_snapshot(
+            id_right,
+            source_schema.as_ref(),
+            right_payload_rows.as_deref(),
+            &proposal.right.ids,
+        )?;
 
         // 4. Atomic Commit (Manifest + Router)
         // We perform all metadata updates in one go.
@@ -1459,6 +1652,11 @@ impl Janitor {
             .delete_local_best_effort(&old_staging, "split-old-staging")
             .await;
         self.sync_kv_best_effort("split");
+        self.invalidate_routing_buckets(&[bucket_id]);
+        if !loopback_ids.is_empty() {
+            self.remove_routing_ids(&loopback_ids);
+        }
+        self.invalidate_catalog_buckets(&[bucket_id, id_left, id_right]);
 
         info!(
             "Janitor: Split Complete. {} -> {}, {}",
@@ -1488,6 +1686,8 @@ impl Janitor {
             // 1. Remove from Metadata
             self.manifest.apply_atomic(|m| m.remove_bucket(zombie_id))?;
             self.index.apply_merge_update(zombie_id, &[]).await;
+            self.invalidate_routing_buckets(&[zombie_id]);
+            self.invalidate_catalog_buckets(&[zombie_id]);
 
             // 2. ⚡ NEW: Delete Physical File
             let zombie_file = self.staging.get_active_filename(zombie_id);
@@ -1501,6 +1701,8 @@ impl Janitor {
         if proposal.moves.is_empty() {
             self.manifest.apply_atomic(|m| m.remove_bucket(zombie_id))?;
             self.index.apply_merge_update(zombie_id, &[]).await;
+            self.invalidate_routing_buckets(&[zombie_id]);
+            self.invalidate_catalog_buckets(&[zombie_id]);
             return Ok(());
         }
 
@@ -1670,6 +1872,12 @@ impl Janitor {
 
             // Update KV mapping for all IDs now owned by target_id
             self.update_kv_mapping(*target_id, &merged_group.ids);
+            self.rebuild_routing_bucket_from_snapshot(
+                *target_id,
+                merged_schema.as_ref(),
+                merged_rows.as_deref(),
+                &merged_group.ids,
+            )?;
 
             // Track update: (ID, Count, Sum, Centroid, Filename)
             manifest_updates.push((
@@ -1718,6 +1926,11 @@ impl Janitor {
             self.bucket_manager
                 .update_bucket_drift(*id, sum, *count as u32)?;
         }
+        let mut invalidated = Vec::with_capacity(manifest_updates.len() + 1);
+        invalidated.push(zombie_id);
+        invalidated.extend(manifest_updates.iter().map(|(id, _, _, _, _)| *id));
+        self.invalidate_routing_buckets(&[zombie_id]);
+        self.invalidate_catalog_buckets(invalidated.as_slice());
 
         // 6. Cleanup
         let zombie_file = self.staging.get_active_filename(zombie_id);

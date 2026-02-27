@@ -2,6 +2,7 @@ pub mod cleanup;
 pub mod config;
 pub mod filter_metadata_catalog;
 pub mod filter_planner_diagnostics;
+pub mod global_filter_routing_index;
 pub mod janitor;
 pub mod local_staging;
 pub mod manager;

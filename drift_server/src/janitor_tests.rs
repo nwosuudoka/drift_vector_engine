@@ -84,6 +84,12 @@ mod tests {
             staging: staging.clone(),
             persistence,
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator: coordinator.clone(),
             vars: JanitorVars {
                 promotion_threshold_bytes: u64::MAX,
@@ -199,6 +205,12 @@ mod tests {
             staging: staging.clone(),
             persistence,
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator,
             vars: JanitorVars {
                 promotion_threshold_bytes: u64::MAX,
@@ -372,6 +384,12 @@ mod stress_tests {
             staging: staging,
             persistence,
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator: coordinator.clone(),
             vars: JanitorVars {
                 promotion_threshold_bytes: promotion_threshold,
@@ -583,6 +601,12 @@ mod janitor_split_test {
             staging: staging.clone(),
             persistence,
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator: coordinator.clone(),
             vars: JanitorVars::default(),
         });
@@ -718,6 +742,12 @@ mod janitor_split_test {
             staging: staging.clone(),
             persistence,
             bucket_manager,
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator,
             vars: JanitorVars::default(),
         });
@@ -1130,6 +1160,12 @@ mod janitor_scatter_merge_test {
             staging: staging.clone(),
             persistence,
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator,
             vars: JanitorVars {
                 check_interval: Duration::from_millis(10),
@@ -1649,6 +1685,12 @@ mod janitor_promotion_test {
             staging: staging.clone(),
             persistence: persistence.clone(),
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator: coordinator.clone(),
             vars: JanitorVars {
                 promotion_threshold_bytes: 1, // Force promotion (file > 1 byte)

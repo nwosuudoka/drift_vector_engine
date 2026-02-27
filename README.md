@@ -205,6 +205,14 @@ CI default filtered guardrails (when `CI=1` and explicit filtered limits are not
 Optional planner diagnostics for filtered benchmarks:
 - Enable with `DRIFT_FILTER_PLANNER_DIAGNOSTICS=1`.
 - `bench_rw` will print planner decision ratios per probed bucket and include these summary JSON fields:
+  - `filtered_candidate_fanout` (candidate / pre-filter routable live IDs)
+  - `filtered_post_prune_candidate_fanout` (candidate / post-prune live IDs)
+  - `filtered_estimated_scan_ratio` (scanned / pre-filter routable live IDs)
+  - `filtered_post_prune_estimated_scan_ratio` (scanned / post-prune live IDs)
+  - `filtered_scan_accounting_fallback_query_count` (queries where scanned/live accounting used fallback estimation)
+  - `filtered_scan_accounting_fallback_query_ratio` (fallback query count / filtered query count)
+  - `filtered_prefilter_routable_live_ids_avg` (full routable universe snapshot per query)
+  - `filtered_estimated_global_scan_ratio` (same denominator as `filtered_estimated_scan_ratio`; retained for compatibility)
   - `filtered_planner_produced_bucket_ratio`
   - `filtered_planner_applied_bucket_ratio`
   - `filtered_planner_gated_bucket_ratio`
@@ -213,7 +221,35 @@ Optional planner diagnostics for filtered benchmarks:
   - `filtered_planner_no_index_bucket_ratio`
   - `filtered_planner_range_stats_only_bucket_ratio`
   - `filtered_planner_other_absence_bucket_ratio`
+  - `filtered_planner_catalog_eligible_query_ratio`
+  - `filtered_planner_catalog_pruned_bucket_ratio`
+  - `filtered_planner_catalog_complete_may_match_bucket_ratio`
+  - `filtered_planner_catalog_incomplete_bucket_ratio`
+  - `filtered_planner_catalog_stale_bucket_ratio`
+  - `filtered_planner_catalog_missing_bucket_ratio`
   - `filtered_planner_diagnostics_enabled`
+
+Locality experiment controls:
+- `--tenant-assignment-mode`:
+  - `round-robin` (default): `tenant_i = id % filter_cardinality`
+  - `vector-bin`: tenant from quantized first vector dimension (weak geometry correlation probe)
+  - `tenant-clustered`: vectors generated around tenant centroids (strong locality probe)
+- `--tenant-cluster-noise`: jitter range for `tenant-clustered` generation.
+- Filter predicate controls:
+  - `--filtered-predicate-mode {tenant-exact|price-range}` (default `tenant-exact`)
+  - `--filtered-range-window`: contiguous ID window size for `price-range` queries.
+- `bench_rw` summary JSON also emits locality diagnostics:
+  - `filtered_predicate_mode`
+  - `filtered_range_window`
+  - `tenant_assignment_mode`
+  - `configured_filter_cardinality`
+  - `effective_filter_cardinality`
+  - `tenant_locality_bucket_count`
+  - `tenant_locality_kv_entries_scanned`
+  - `tenant_locality_kv_entries_skipped`
+  - `tenant_locality_avg_distinct_tenants_per_bucket`
+  - `tenant_locality_avg_dominant_tenant_share`
+  - `tenant_locality_avg_tenant_bucket_coverage_ratio`
 
 ## Workspace layout
 

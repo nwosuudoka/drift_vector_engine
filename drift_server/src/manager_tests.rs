@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod tests {
     use crate::config::{Config, FileConfig, StorageCommand};
+    use crate::filter_metadata_catalog::{BucketProbeObservation, ExactValueMembershipKey};
     use crate::manager::CollectionManager;
     use drift_core::math::Metric;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
@@ -211,6 +213,87 @@ mod tests {
         );
 
         assert_eq!(rebuilt_bucket, expected_bucket);
+    }
+
+    #[tokio::test]
+    async fn test_manager_restart_recovery_clears_filter_metadata_catalog() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let name = "catalog_recovery_reset";
+
+        {
+            let manager = Arc::new(CollectionManager::new(config.clone()));
+            let coll = manager
+                .get_or_create(name, Some(DIM), None, Some(Metric::L2))
+                .await
+                .unwrap();
+
+            coll.filter_metadata_catalog.write().observe_bucket_probe(
+                10,
+                BucketProbeObservation {
+                    bucket_path: "bucket_10".to_string(),
+                    bucket_live_count: Some(3),
+                    indexed_exact_fields: HashSet::from([1]),
+                    range_stats_fields: HashSet::new(),
+                    exact_value_presence: HashMap::new(),
+                    range_field_zone_maps: HashMap::new(),
+                },
+            );
+
+            assert_eq!(coll.filter_metadata_catalog.read().stats().bucket_count, 1);
+        }
+
+        let manager2 = Arc::new(CollectionManager::new(config));
+        let coll2 = manager2
+            .get_or_create(name, Some(DIM), None, None)
+            .await
+            .unwrap();
+        let stats = coll2.filter_metadata_catalog.read().stats();
+        assert_eq!(stats.bucket_count, 0);
+        assert_eq!(stats.exact_value_memberships, 0);
+    }
+
+    #[tokio::test]
+    async fn test_manager_restart_recovery_clears_global_filter_routing_index() {
+        let dir = tempdir().unwrap();
+        let config = test_config(dir.path());
+        let name = "global_routing_recovery_reset";
+
+        {
+            let manager = Arc::new(CollectionManager::new(config.clone()));
+            let coll = manager
+                .get_or_create(name, Some(DIM), None, Some(Metric::L2))
+                .await
+                .unwrap();
+
+            coll.global_filter_routing_index.write().upsert_id_values(
+                55,
+                7,
+                vec![ExactValueMembershipKey {
+                    field_id: 1,
+                    logical_type_tag: 1,
+                    encoded_value: b"tenant_1".to_vec(),
+                }],
+            );
+
+            assert_eq!(
+                coll.global_filter_routing_index
+                    .read()
+                    .stats()
+                    .id_entry_count,
+                1
+            );
+        }
+
+        let manager2 = Arc::new(CollectionManager::new(config));
+        let coll2 = manager2
+            .get_or_create(name, Some(DIM), None, None)
+            .await
+            .unwrap();
+        let stats = coll2.global_filter_routing_index.read().stats();
+        assert_eq!(stats.id_entry_count, 0);
+        assert_eq!(stats.value_entry_count, 0);
+        assert_eq!(stats.value_bucket_pair_count, 0);
     }
 }
 

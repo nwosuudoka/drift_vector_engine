@@ -11,11 +11,14 @@ use crate::drift_proto::{
     TrainRequest, TrainResponse,
 };
 use crate::filter_metadata_catalog::{
-    BucketProbeObservation, ExactValueMembershipKey, logical_type_tag,
+    BucketExactClauseCoverage, BucketProbeObservation, BucketRangeClauseCoverage,
+    ExactFieldQueryClause, ExactValueMembershipKey, ExactValuePresence, RangeFieldQueryClause,
+    RangeFieldZoneMap, logical_type_tag,
 };
 use crate::filter_planner_diagnostics::{
     FilterPlannerDiagnosticsSnapshot, diagnostics_enabled_from_env,
 };
+use crate::global_filter_routing_index::GlobalFilterRoutingIndex;
 use crate::manager::{Collection, CollectionManager};
 use crate::recovery::RecoveryManager;
 use drift_core::math::Metric;
@@ -27,8 +30,8 @@ use drift_core::payload::{
 use drift_storage::bucket_manager::StorageClass;
 use drift_storage::disk_manager::DiskManager;
 use drift_storage::unified_format::{
-    UnifiedLobRef, UnifiedPayloadFieldStats, UnifiedPayloadRow, UnifiedPayloadStatsChunk,
-    UnifiedPayloadValue, encode_exact_key,
+    UnifiedLobRef, UnifiedLogicalType, UnifiedPayloadFieldStats, UnifiedPayloadRow,
+    UnifiedPayloadStatsChunk, UnifiedPayloadValue, encode_exact_key,
 };
 use drift_storage::unified_reader::UnifiedReader;
 use drift_traits::StorageEngine;
@@ -789,6 +792,62 @@ fn range_filter_might_match_chunk(
     )
 }
 
+fn aggregate_range_zone_map_for_field(
+    chunks: &[UnifiedPayloadStatsChunk],
+    field_id: u32,
+) -> Option<RangeFieldZoneMap> {
+    let mut saw_field_stats = false;
+    let mut has_non_null_values = false;
+    let mut min_value: Option<UnifiedPayloadValue> = None;
+    let mut max_value: Option<UnifiedPayloadValue> = None;
+
+    for chunk in chunks {
+        let Some(stats) = chunk.fields.iter().find(|field| field.field_id == field_id) else {
+            continue;
+        };
+        saw_field_stats = true;
+
+        if stats.null_count >= chunk.row_count {
+            continue;
+        }
+        has_non_null_values = true;
+
+        let (Some(chunk_min), Some(chunk_max)) = (stats.min.clone(), stats.max.clone()) else {
+            return Some(RangeFieldZoneMap {
+                has_non_null_values: true,
+                min: None,
+                max: None,
+            });
+        };
+
+        min_value = match min_value.take() {
+            Some(current) => match compare_payload_values(&current, &chunk_min) {
+                Some(Ordering::Greater) => Some(chunk_min),
+                Some(_) => Some(current),
+                None => None,
+            },
+            None => Some(chunk_min),
+        };
+        max_value = match max_value.take() {
+            Some(current) => match compare_payload_values(&current, &chunk_max) {
+                Some(Ordering::Less) => Some(chunk_max),
+                Some(_) => Some(current),
+                None => None,
+            },
+            None => Some(chunk_max),
+        };
+    }
+
+    if !saw_field_stats {
+        return None;
+    }
+    Some(RangeFieldZoneMap {
+        has_non_null_values,
+        min: min_value,
+        max: max_value,
+    })
+}
+
 fn intersect_candidate_ids(existing: &mut HashSet<u64>, next: &HashSet<u64>) {
     existing.retain(|id| next.contains(id));
 }
@@ -803,7 +862,8 @@ struct FilterSourceProbe {
     saw_range_filter: bool,
     indexed_exact_field_ids: HashSet<u32>,
     range_filter_field_ids: HashSet<u32>,
-    matched_exact_value_keys: HashSet<ExactValueMembershipKey>,
+    exact_value_presence: HashMap<ExactValueMembershipKey, ExactValuePresence>,
+    range_field_zone_maps: HashMap<u32, RangeFieldZoneMap>,
 }
 
 #[derive(Default)]
@@ -911,9 +971,24 @@ fn should_apply_candidate_pushdown(bucket_live_ids: usize, candidate_count: usiz
     selectivity <= CANDIDATE_PUSHDOWN_MAX_SELECTIVITY
 }
 
+fn logical_type_for_exact_filter_value(value: &UnifiedPayloadValue) -> Option<UnifiedLogicalType> {
+    match value {
+        UnifiedPayloadValue::Null => None,
+        UnifiedPayloadValue::Bool(_) => Some(UnifiedLogicalType::Bool),
+        UnifiedPayloadValue::Int64(_) => Some(UnifiedLogicalType::Int64),
+        UnifiedPayloadValue::Float32(_) => Some(UnifiedLogicalType::Float32),
+        UnifiedPayloadValue::Float64(_) => Some(UnifiedLogicalType::Float64),
+        UnifiedPayloadValue::TimestampMicros(_) => Some(UnifiedLogicalType::TimestampMicros),
+        UnifiedPayloadValue::Keyword(_) => Some(UnifiedLogicalType::Keyword),
+        UnifiedPayloadValue::Text(_) => Some(UnifiedLogicalType::Text),
+        UnifiedPayloadValue::Bytes(_) => Some(UnifiedLogicalType::Bytes),
+        UnifiedPayloadValue::LobRef(_) => Some(UnifiedLogicalType::LobRef),
+    }
+}
+
 fn exact_value_membership_key(
     field_id: u32,
-    logical_type: &drift_storage::unified_format::UnifiedLogicalType,
+    logical_type: &UnifiedLogicalType,
     value: &UnifiedPayloadValue,
 ) -> io::Result<Option<ExactValueMembershipKey>> {
     Ok(
@@ -923,6 +998,241 @@ fn exact_value_membership_key(
             encoded_value,
         }),
     )
+}
+
+fn exact_value_membership_key_from_value(
+    field_id: u32,
+    value: &UnifiedPayloadValue,
+) -> io::Result<Option<ExactValueMembershipKey>> {
+    let Some(logical_type) = logical_type_for_exact_filter_value(value) else {
+        return Ok(None);
+    };
+    exact_value_membership_key(field_id, &logical_type, value)
+}
+
+struct CatalogFilterClauses {
+    exact_clauses: Vec<ExactFieldQueryClause>,
+    range_clauses: Vec<RangeFieldQueryClause>,
+}
+
+fn extract_catalog_filter_clauses(
+    filters: &[ParsedFilter],
+) -> io::Result<Option<CatalogFilterClauses>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+
+    let mut exact_clauses = Vec::new();
+    let mut range_clauses = Vec::new();
+    for filter in filters {
+        match filter {
+            ParsedFilter::Exact { field_id, value } => {
+                let Some(key) = exact_value_membership_key_from_value(*field_id, value)? else {
+                    // Null exact filters are not covered by exact index postings.
+                    continue;
+                };
+                exact_clauses.push(ExactFieldQueryClause {
+                    field_id: *field_id,
+                    value_keys: vec![key],
+                });
+            }
+            ParsedFilter::AnyOf { field_id, values } => {
+                if values
+                    .iter()
+                    .any(|value| matches!(value, UnifiedPayloadValue::Null))
+                {
+                    continue;
+                }
+                let mut seen = HashSet::new();
+                let mut keys = Vec::new();
+                for value in values {
+                    let Some(key) = exact_value_membership_key_from_value(*field_id, value)? else {
+                        continue;
+                    };
+                    if seen.insert(key.clone()) {
+                        keys.push(key);
+                    }
+                }
+                if keys.is_empty() {
+                    continue;
+                }
+                exact_clauses.push(ExactFieldQueryClause {
+                    field_id: *field_id,
+                    value_keys: keys,
+                });
+            }
+            ParsedFilter::Range {
+                field_id,
+                lower,
+                lower_inclusive,
+                upper,
+                upper_inclusive,
+            } => range_clauses.push(RangeFieldQueryClause {
+                field_id: *field_id,
+                lower: lower.clone(),
+                lower_inclusive: *lower_inclusive,
+                upper: upper.clone(),
+                upper_inclusive: *upper_inclusive,
+            }),
+        }
+    }
+    if exact_clauses.is_empty() && range_clauses.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(CatalogFilterClauses {
+        exact_clauses,
+        range_clauses,
+    }))
+}
+
+fn preselect_bucket_ids_with_global_routing_index(
+    routing: &GlobalFilterRoutingIndex,
+    probe_bucket_ids: &[u32],
+    exact_clauses: &[ExactFieldQueryClause],
+) -> Vec<u32> {
+    if exact_clauses.is_empty() {
+        return probe_bucket_ids.to_vec();
+    }
+
+    let clause_buckets: Vec<HashSet<u32>> = exact_clauses
+        .iter()
+        .map(|clause| routing.buckets_for_exact_clause(clause))
+        .collect();
+    let mut selected = Vec::with_capacity(probe_bucket_ids.len());
+
+    'bucket: for &bucket_id in probe_bucket_ids {
+        for (clause, clause_bucket_ids) in exact_clauses.iter().zip(clause_buckets.iter()) {
+            if clause_bucket_ids.contains(&bucket_id) {
+                continue;
+            }
+            if routing.bucket_exact_field_complete(bucket_id, clause.field_id) {
+                continue 'bucket;
+            }
+        }
+        selected.push(bucket_id);
+    }
+
+    selected
+}
+
+fn preselect_probe_buckets_with_global_exact_routing(
+    collection: &Collection,
+    probe_bucket_ids: &[u32],
+    exact_clauses: &[ExactFieldQueryClause],
+) -> Vec<u32> {
+    let routing = collection.global_filter_routing_index.read();
+    preselect_bucket_ids_with_global_routing_index(&routing, probe_bucket_ids, exact_clauses)
+}
+
+#[derive(Default, Clone, Copy)]
+struct CatalogPreselectionStats {
+    input_bucket_count: usize,
+    pruned_bucket_count: usize,
+    complete_may_match_bucket_count: usize,
+    incomplete_bucket_count: usize,
+    stale_bucket_count: usize,
+    missing_bucket_count: usize,
+}
+
+struct CatalogPreselectionResult {
+    selected_bucket_ids: Vec<u32>,
+    stats: CatalogPreselectionStats,
+}
+
+fn preselect_probe_buckets_with_catalog(
+    collection: &Collection,
+    probe_bucket_ids: &[u32],
+    clauses: &CatalogFilterClauses,
+) -> CatalogPreselectionResult {
+    let mut catalog = collection.filter_metadata_catalog.write();
+    let mut selected_bucket_ids = Vec::with_capacity(probe_bucket_ids.len());
+    let mut stats = CatalogPreselectionStats {
+        input_bucket_count: probe_bucket_ids.len(),
+        ..CatalogPreselectionStats::default()
+    };
+
+    for &bucket_id in probe_bucket_ids {
+        let Some(version) = collection.bucket_manager.get_version(bucket_id) else {
+            stats.missing_bucket_count += 1;
+            selected_bucket_ids.push(bucket_id);
+            continue;
+        };
+        let live_count = collection
+            .bucket_manager
+            .get_bucket_stats(bucket_id)
+            .map(|stats| stats.total_count.saturating_sub(stats.tombstone_count));
+        let Some(live_count) = live_count else {
+            stats.missing_bucket_count += 1;
+            selected_bucket_ids.push(bucket_id);
+            continue;
+        };
+        let exact_coverage = if clauses.exact_clauses.is_empty() {
+            BucketExactClauseCoverage::CompleteMayMatch
+        } else {
+            catalog.classify_bucket_exact_clauses(
+                bucket_id,
+                &version.path,
+                Some(live_count),
+                &clauses.exact_clauses,
+            )
+        };
+        let range_coverage = if clauses.range_clauses.is_empty() {
+            BucketRangeClauseCoverage::CompleteMayMatch
+        } else {
+            catalog.classify_bucket_range_clauses(
+                bucket_id,
+                &version.path,
+                Some(live_count),
+                &clauses.range_clauses,
+            )
+        };
+
+        if matches!(
+            exact_coverage,
+            BucketExactClauseCoverage::StaleBucketPath
+                | BucketExactClauseCoverage::StaleBucketStats
+        ) || matches!(
+            range_coverage,
+            BucketRangeClauseCoverage::StaleBucketPath
+                | BucketRangeClauseCoverage::StaleBucketStats
+        ) {
+            stats.stale_bucket_count += 1;
+            catalog.invalidate_bucket(bucket_id);
+            selected_bucket_ids.push(bucket_id);
+            continue;
+        }
+
+        if matches!(exact_coverage, BucketExactClauseCoverage::MissingBucket)
+            || matches!(range_coverage, BucketRangeClauseCoverage::MissingBucket)
+        {
+            stats.missing_bucket_count += 1;
+            selected_bucket_ids.push(bucket_id);
+            continue;
+        }
+
+        if matches!(exact_coverage, BucketExactClauseCoverage::CompleteNoMatch)
+            || matches!(range_coverage, BucketRangeClauseCoverage::CompleteNoMatch)
+        {
+            stats.pruned_bucket_count += 1;
+            continue;
+        }
+
+        if matches!(exact_coverage, BucketExactClauseCoverage::Incomplete)
+            || matches!(range_coverage, BucketRangeClauseCoverage::Incomplete)
+        {
+            stats.incomplete_bucket_count += 1;
+            selected_bucket_ids.push(bucket_id);
+            continue;
+        }
+
+        stats.complete_may_match_bucket_count += 1;
+        selected_bucket_ids.push(bucket_id);
+    }
+
+    CatalogPreselectionResult {
+        selected_bucket_ids,
+        stats,
+    }
 }
 
 async fn source_filter_probe(
@@ -981,17 +1291,24 @@ async fn source_filter_probe(
                     .await?
                     .into_iter()
                     .collect();
+                let membership_key =
+                    exact_value_membership_key(*field_id, &field.logical_type, value)?;
                 if matches.is_empty() {
+                    if let Some(key) = membership_key {
+                        probe
+                            .exact_value_presence
+                            .insert(key, ExactValuePresence::Absent);
+                    }
                     probe.saw_empty_exact_match = true;
                     probe.might_match = false;
                     probe.exact_candidate_ids = None;
                     return Ok(probe);
                 }
 
-                if let Some(key) =
-                    exact_value_membership_key(*field_id, &field.logical_type, value)?
-                {
-                    probe.matched_exact_value_keys.insert(key);
+                if let Some(key) = membership_key {
+                    probe
+                        .exact_value_presence
+                        .insert(key, ExactValuePresence::Present);
                 }
 
                 used_exact_pushdown = true;
@@ -1034,14 +1351,21 @@ async fn source_filter_probe(
                 let mut matches = HashSet::new();
                 for value in values {
                     let exact_ids = reader.filter_ids_exact(*field_id, value).await?;
+                    let membership_key =
+                        exact_value_membership_key(*field_id, &field.logical_type, value)?;
                     if exact_ids.is_empty() {
+                        if let Some(key) = membership_key {
+                            probe
+                                .exact_value_presence
+                                .insert(key, ExactValuePresence::Absent);
+                        }
                         continue;
                     }
                     matches.extend(exact_ids);
-                    if let Some(key) =
-                        exact_value_membership_key(*field_id, &field.logical_type, value)?
-                    {
-                        probe.matched_exact_value_keys.insert(key);
+                    if let Some(key) = membership_key {
+                        probe
+                            .exact_value_presence
+                            .insert(key, ExactValuePresence::Present);
                     }
                 }
                 if matches.is_empty() {
@@ -1089,6 +1413,9 @@ async fn source_filter_probe(
                 let Some(stats) = payload_stats.as_ref() else {
                     continue;
                 };
+                if let Some(zone_map) = aggregate_range_zone_map_for_field(stats, *field_id) {
+                    probe.range_field_zone_maps.insert(*field_id, zone_map);
+                }
                 let any_chunk_matches = stats.iter().any(|chunk| {
                     range_filter_might_match_chunk(
                         chunk,
@@ -1136,11 +1463,70 @@ async fn plan_filter_aware_execution(
         return plan;
     }
 
-    let probe_bucket_ids = if planning_bucket_ids.is_empty() {
-        routed_bucket_ids
+    let mut probe_bucket_ids = if planning_bucket_ids.is_empty() {
+        routed_bucket_ids.to_vec()
     } else {
-        planning_bucket_ids
+        planning_bucket_ids.to_vec()
     };
+    match extract_catalog_filter_clauses(filters) {
+        Ok(Some(clauses)) => {
+            if !clauses.exact_clauses.is_empty() {
+                let global_exact_input_bucket_count = probe_bucket_ids.len();
+                let routed = preselect_probe_buckets_with_global_exact_routing(
+                    collection,
+                    &probe_bucket_ids,
+                    &clauses.exact_clauses,
+                );
+                let global_exact_pruned_bucket_count =
+                    global_exact_input_bucket_count.saturating_sub(routed.len());
+                if routed.len() < probe_bucket_ids.len() {
+                    tracing::debug!(
+                        "Filter planner: global exact routing pruned {} bucket(s) from probe set of {}",
+                        probe_bucket_ids.len().saturating_sub(routed.len()),
+                        probe_bucket_ids.len()
+                    );
+                }
+                if diagnostics_enabled {
+                    diagnostics.global_exact_preselect_eligible_query = true;
+                    diagnostics.global_exact_preselect_input_bucket_count =
+                        global_exact_input_bucket_count;
+                    diagnostics.global_exact_preselect_pruned_bucket_count =
+                        global_exact_pruned_bucket_count;
+                }
+                probe_bucket_ids = routed;
+            }
+            let result =
+                preselect_probe_buckets_with_catalog(collection, &probe_bucket_ids, &clauses);
+            if diagnostics_enabled {
+                diagnostics.catalog_exact_clause_eligible_query = true;
+                diagnostics.catalog_preselect_input_bucket_count = result.stats.input_bucket_count;
+                diagnostics.catalog_preselect_pruned_bucket_count =
+                    result.stats.pruned_bucket_count;
+                diagnostics.catalog_preselect_complete_may_match_bucket_count =
+                    result.stats.complete_may_match_bucket_count;
+                diagnostics.catalog_preselect_incomplete_bucket_count =
+                    result.stats.incomplete_bucket_count;
+                diagnostics.catalog_preselect_stale_bucket_count = result.stats.stale_bucket_count;
+                diagnostics.catalog_preselect_missing_bucket_count =
+                    result.stats.missing_bucket_count;
+            }
+            if result.stats.pruned_bucket_count > 0 {
+                tracing::debug!(
+                    "Filter planner: catalog preselection pruned {} bucket(s) from probe set of {}",
+                    result.stats.pruned_bucket_count,
+                    probe_bucket_ids.len()
+                );
+            }
+            probe_bucket_ids = result.selected_bucket_ids;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            tracing::debug!(
+                "Filter planner: failed to derive catalog clauses: {}; falling back to full probe set",
+                err
+            );
+        }
+    }
     if probe_bucket_ids.is_empty() {
         let plan = FilterAwareExecutionPlan {
             bucket_ids: routed_bucket_ids.to_vec(),
@@ -1174,7 +1560,7 @@ async fn plan_filter_aware_execution(
         bucket_ids: Vec::with_capacity(probe_bucket_ids.len()),
         candidate_ids: HashMap::new(),
     };
-    for &bucket_id in probe_bucket_ids {
+    for &bucket_id in &probe_bucket_ids {
         if diagnostics_enabled {
             diagnostics.probed_bucket_count += 1;
         }
@@ -1213,7 +1599,11 @@ async fn plan_filter_aware_execution(
         let mut candidate_gated = false;
         let mut observed_indexed_exact_fields = HashSet::new();
         let mut observed_range_stats_fields = HashSet::new();
-        let mut observed_exact_value_hits = HashSet::new();
+        let mut observed_exact_value_presence: HashMap<
+            ExactValueMembershipKey,
+            ExactValuePresence,
+        > = HashMap::new();
+        let mut observed_range_field_zone_maps: HashMap<u32, RangeFieldZoneMap> = HashMap::new();
 
         for source in sources {
             let probe = match source {
@@ -1242,7 +1632,8 @@ async fn plan_filter_aware_execution(
                         saw_range_filter: source_saw_range_filter,
                         indexed_exact_field_ids,
                         range_filter_field_ids,
-                        matched_exact_value_keys,
+                        exact_value_presence,
+                        range_field_zone_maps,
                     } = probe;
                     saw_exact_filter |= source_saw_exact_filter;
                     saw_indexed_exact_filter |= source_saw_indexed_exact_filter;
@@ -1250,7 +1641,17 @@ async fn plan_filter_aware_execution(
                     saw_range_filter |= source_saw_range_filter;
                     observed_indexed_exact_fields.extend(indexed_exact_field_ids);
                     observed_range_stats_fields.extend(range_filter_field_ids);
-                    observed_exact_value_hits.extend(matched_exact_value_keys);
+                    for (key, source_presence) in exact_value_presence {
+                        observed_exact_value_presence
+                            .entry(key)
+                            .and_modify(|existing| {
+                                if matches!(source_presence, ExactValuePresence::Present) {
+                                    *existing = ExactValuePresence::Present;
+                                }
+                            })
+                            .or_insert(source_presence);
+                    }
+                    observed_range_field_zone_maps.extend(range_field_zone_maps);
                     if !might_match {
                         continue;
                     }
@@ -1283,9 +1684,14 @@ async fn plan_filter_aware_execution(
                     bucket_id,
                     BucketProbeObservation {
                         bucket_path,
+                        bucket_live_count: collection
+                            .bucket_manager
+                            .get_bucket_stats(bucket_id)
+                            .map(|stats| stats.total_count.saturating_sub(stats.tombstone_count)),
                         indexed_exact_fields: observed_indexed_exact_fields,
                         range_stats_fields: observed_range_stats_fields,
-                        exact_value_hits: observed_exact_value_hits,
+                        exact_value_presence: observed_exact_value_presence,
+                        range_field_zone_maps: observed_range_field_zone_maps,
                     },
                 );
         }
@@ -1356,9 +1762,61 @@ async fn plan_filter_aware_execution(
 mod planner_heuristic_tests {
     use super::{
         CandidateAbsenceReason, FilterPlannerDiagnosticsSnapshot,
-        classify_candidate_absence_reason, record_candidate_decision,
-        should_apply_candidate_pushdown,
+        classify_candidate_absence_reason, preselect_bucket_ids_with_global_routing_index,
+        record_candidate_decision, should_apply_candidate_pushdown,
     };
+    use crate::filter_metadata_catalog::{ExactFieldQueryClause, ExactValueMembershipKey};
+    use crate::global_filter_routing_index::GlobalFilterRoutingIndex;
+    use std::collections::HashSet;
+
+    fn exact_key(field_id: u32, value: &str) -> ExactValueMembershipKey {
+        ExactValueMembershipKey {
+            field_id,
+            logical_type_tag: 1,
+            encoded_value: value.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn global_routing_preselect_prunes_only_complete_absent_buckets() {
+        let mut routing = GlobalFilterRoutingIndex::default();
+        let tenant_a = exact_key(1, "tenant_a");
+
+        routing.upsert_id_values(10, 1, vec![tenant_a.clone()]);
+        routing.set_bucket_complete_exact_fields(1, HashSet::from([1]));
+        routing.set_bucket_complete_exact_fields(2, HashSet::from([1]));
+
+        let selected = preselect_bucket_ids_with_global_routing_index(
+            &routing,
+            &[1, 2],
+            &[ExactFieldQueryClause {
+                field_id: 1,
+                value_keys: vec![tenant_a.clone()],
+            }],
+        );
+
+        assert_eq!(selected, vec![1]);
+    }
+
+    #[test]
+    fn global_routing_preselect_keeps_incomplete_absent_buckets() {
+        let mut routing = GlobalFilterRoutingIndex::default();
+        let tenant_a = exact_key(1, "tenant_a");
+
+        routing.upsert_id_values(10, 1, vec![tenant_a.clone()]);
+        routing.set_bucket_complete_exact_fields(1, HashSet::from([1]));
+
+        let selected = preselect_bucket_ids_with_global_routing_index(
+            &routing,
+            &[1, 2],
+            &[ExactFieldQueryClause {
+                field_id: 1,
+                value_keys: vec![tenant_a],
+            }],
+        );
+
+        assert_eq!(selected, vec![1, 2]);
+    }
 
     #[test]
     fn candidate_pushdown_disables_broad_selectivity() {

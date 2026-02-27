@@ -90,6 +90,12 @@ mod tests {
             staging,
             persistence: persistence.clone(),
             bucket_manager: bucket_manager.clone(),
+            filter_metadata_catalog: Arc::new(parking_lot::RwLock::new(
+                crate::filter_metadata_catalog::FilterMetadataCatalog::default(),
+            )),
+            global_filter_routing_index: Arc::new(parking_lot::RwLock::new(
+                crate::global_filter_routing_index::GlobalFilterRoutingIndex::default(),
+            )),
             coordinator,
             vars: JanitorVars {
                 check_interval: Duration::from_millis(100),

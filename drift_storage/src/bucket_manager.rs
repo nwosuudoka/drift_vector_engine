@@ -8,7 +8,7 @@ use futures::future::join_all;
 use opendal::Operator;
 use parking_lot::RwLock;
 use std::cmp;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -82,6 +82,55 @@ impl TombstoneView for LocalTombstoneView {
     }
     fn len(&self) -> usize {
         self.inner.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScoredVector {
+    id: u64,
+    dist: f32,
+}
+
+impl PartialEq for ScoredVector {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.dist.to_bits() == other.dist.to_bits()
+    }
+}
+
+impl Eq for ScoredVector {}
+
+impl PartialOrd for ScoredVector {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredVector {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+fn push_bounded_shortlist(
+    shortlist: &mut BinaryHeap<ScoredVector>,
+    cap: usize,
+    scored: ScoredVector,
+) {
+    if cap == 0 {
+        return;
+    }
+    if shortlist.len() < cap {
+        shortlist.push(scored);
+        return;
+    }
+
+    if let Some(current_worst) = shortlist.peek()
+        && scored < *current_worst
+    {
+        let _ = shortlist.pop();
+        shortlist.push(scored);
     }
 }
 
@@ -338,7 +387,9 @@ impl StorageEngine for BucketManager {
                             if let Ok((ids, flat_vectors)) = reader.read_all_vectors_flat().await {
                                 let scorer = strategy_for(metric);
                                 let dim = query.len();
-                                let mut exact_matches = Vec::new();
+                                // Dense buckets can have large candidate sets. Keep only the
+                                // best oversample window while scanning to avoid full sort cost.
+                                let mut shortlist = BinaryHeap::new();
 
                                 for (row_idx, id) in ids.into_iter().enumerate() {
                                     if bucket_view.contains(id) {
@@ -355,15 +406,21 @@ impl StorageEngine for BucketManager {
                                         break;
                                     }
                                     let candidate = &flat_vectors[start..end];
-                                    exact_matches.push((id, scorer.score(&query, candidate)));
+                                    push_bounded_shortlist(
+                                        &mut shortlist,
+                                        oversample_factor,
+                                        ScoredVector {
+                                            id,
+                                            dist: scorer.score(&query, candidate),
+                                        },
+                                    );
                                 }
 
-                                exact_matches.sort_by(|a, b| {
-                                    a.1.partial_cmp(&b.1).unwrap_or(cmp::Ordering::Equal)
-                                });
-                                if exact_matches.len() > oversample_factor {
-                                    exact_matches.truncate(oversample_factor);
-                                }
+                                let exact_matches: Vec<(u64, f32)> = shortlist
+                                    .into_sorted_vec()
+                                    .into_iter()
+                                    .map(|scored| (scored.id, scored.dist))
+                                    .collect();
                                 refined_results.extend(exact_matches);
                             }
                         }
