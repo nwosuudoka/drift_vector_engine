@@ -1,17 +1,22 @@
+use crate::global_metadata_snapshot::{
+    ExactValuePresenceSnapshotEntry, FilterCatalogBucketSnapshot, FilterCatalogSnapshot,
+    RangeFieldZoneMapSnapshotEntry,
+};
+use bincode::{Decode, Encode};
 use drift_storage::unified_format::{UnifiedLogicalType, UnifiedPayloadValue};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 pub const MAX_EXACT_VALUE_MEMBERSHIPS_PER_BUCKET: usize = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct ExactValueMembershipKey {
     pub field_id: u32,
     pub logical_type_tag: u16,
     pub encoded_value: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum ExactValuePresence {
     Present,
     Absent,
@@ -32,7 +37,7 @@ pub struct RangeFieldQueryClause {
     pub upper_inclusive: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct RangeFieldZoneMap {
     pub has_non_null_values: bool,
     pub min: Option<UnifiedPayloadValue>,
@@ -258,6 +263,95 @@ impl FilterMetadataCatalog {
 
     pub fn clear(&mut self) {
         self.buckets.clear();
+    }
+
+    pub fn export_snapshot(&self) -> FilterCatalogSnapshot {
+        let mut buckets: Vec<FilterCatalogBucketSnapshot> = self
+            .buckets
+            .iter()
+            .map(|(bucket_id, entry)| {
+                let mut indexed_exact_fields: Vec<u32> =
+                    entry.indexed_exact_fields.iter().copied().collect();
+                indexed_exact_fields.sort_unstable();
+
+                let mut range_stats_fields: Vec<u32> =
+                    entry.range_stats_fields.iter().copied().collect();
+                range_stats_fields.sort_unstable();
+
+                let mut exact_value_presence: Vec<ExactValuePresenceSnapshotEntry> = entry
+                    .exact_value_presence
+                    .iter()
+                    .map(|(key, presence)| ExactValuePresenceSnapshotEntry {
+                        key: key.clone(),
+                        presence: *presence,
+                    })
+                    .collect();
+                exact_value_presence.sort_by(|lhs, rhs| {
+                    lhs.key
+                        .field_id
+                        .cmp(&rhs.key.field_id)
+                        .then_with(|| lhs.key.logical_type_tag.cmp(&rhs.key.logical_type_tag))
+                        .then_with(|| lhs.key.encoded_value.cmp(&rhs.key.encoded_value))
+                });
+
+                let mut range_field_zone_maps: Vec<RangeFieldZoneMapSnapshotEntry> = entry
+                    .range_field_zone_maps
+                    .iter()
+                    .map(|(field_id, zone_map)| RangeFieldZoneMapSnapshotEntry {
+                        field_id: *field_id,
+                        zone_map: zone_map.clone(),
+                    })
+                    .collect();
+                range_field_zone_maps.sort_by(|lhs, rhs| lhs.field_id.cmp(&rhs.field_id));
+
+                FilterCatalogBucketSnapshot {
+                    bucket_id: *bucket_id,
+                    bucket_path: entry.bucket_path.clone(),
+                    bucket_live_count: entry.bucket_live_count,
+                    indexed_exact_fields,
+                    range_stats_fields,
+                    exact_value_presence,
+                    range_field_zone_maps,
+                }
+            })
+            .collect();
+        buckets.sort_by(|lhs, rhs| lhs.bucket_id.cmp(&rhs.bucket_id));
+        FilterCatalogSnapshot { buckets }
+    }
+
+    pub fn import_snapshot(&mut self, snapshot: &FilterCatalogSnapshot) {
+        self.clear();
+        for bucket in &snapshot.buckets {
+            let mut entry = BucketCatalogEntry {
+                bucket_path: bucket.bucket_path.clone(),
+                bucket_live_count: bucket.bucket_live_count,
+                indexed_exact_fields: bucket.indexed_exact_fields.iter().copied().collect(),
+                range_stats_fields: bucket.range_stats_fields.iter().copied().collect(),
+                exact_value_presence: HashMap::new(),
+                range_field_zone_maps: bucket
+                    .range_field_zone_maps
+                    .iter()
+                    .map(|entry| (entry.field_id, entry.zone_map.clone()))
+                    .collect(),
+            };
+
+            for presence in &bucket.exact_value_presence {
+                if entry.exact_value_presence.len() >= MAX_EXACT_VALUE_MEMBERSHIPS_PER_BUCKET
+                    && !entry.exact_value_presence.contains_key(&presence.key)
+                {
+                    continue;
+                }
+                entry
+                    .exact_value_presence
+                    .insert(presence.key.clone(), presence.presence);
+            }
+
+            for field_id in entry.range_field_zone_maps.keys().copied() {
+                entry.range_stats_fields.insert(field_id);
+            }
+
+            self.buckets.insert(bucket.bucket_id, entry);
+        }
     }
 }
 
@@ -789,5 +883,48 @@ mod tests {
         assert_eq!(stats.bucket_count, 0);
         assert_eq!(stats.indexed_exact_field_memberships, 0);
         assert_eq!(stats.exact_value_memberships, 0);
+    }
+
+    #[test]
+    fn catalog_snapshot_roundtrip_preserves_bucket_state() {
+        let mut catalog = FilterMetadataCatalog::default();
+        catalog.observe_bucket_probe(
+            7,
+            BucketProbeObservation {
+                bucket_path: "bucket_7_v1".to_string(),
+                bucket_live_count: Some(22),
+                indexed_exact_fields: HashSet::from([1]),
+                range_stats_fields: HashSet::from([2]),
+                exact_value_presence: exact_presence([(
+                    exact_key(1, 10),
+                    ExactValuePresence::Present,
+                )]),
+                range_field_zone_maps: HashMap::from([(
+                    2,
+                    range_zone_map(
+                        Some(UnifiedPayloadValue::Int64(1)),
+                        Some(UnifiedPayloadValue::Int64(100)),
+                    ),
+                )]),
+            },
+        );
+
+        let snapshot = catalog.export_snapshot();
+        let mut restored = FilterMetadataCatalog::default();
+        restored.import_snapshot(&snapshot);
+
+        assert_eq!(restored.stats().bucket_count, 1);
+        assert_eq!(
+            restored.classify_bucket_exact_clauses(
+                7,
+                "bucket_7_v1",
+                Some(22),
+                &[ExactFieldQueryClause {
+                    field_id: 1,
+                    value_keys: vec![exact_key(1, 10)],
+                }],
+            ),
+            BucketExactClauseCoverage::CompleteMayMatch
+        );
     }
 }

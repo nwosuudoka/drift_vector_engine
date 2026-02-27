@@ -1,5 +1,104 @@
 # Session Log
 
+## 2026-02-27 (global metadata persistence migration step 2/3: persistence IO + janitor publish + manager hydrate + default-on toggle)
+- Goal:
+  - Continue the global metadata persistence migration by wiring snapshot IO, manifest pointer publication, and startup hydration.
+- Work completed:
+  - Extended snapshot contract:
+    - `GlobalRoutingSnapshot` now includes per-bucket freshness tokens (`bucket_id`, `bucket_path`, `bucket_live_count`).
+  - Added snapshot export/import APIs:
+    - `GlobalFilterRoutingIndex::{export_snapshot, import_snapshot}`
+    - `FilterMetadataCatalog::{export_snapshot, import_snapshot}`
+  - Added persistence APIs:
+    - `PersistenceManager::write_global_metadata_snapshot(...)`
+    - `PersistenceManager::read_global_metadata_snapshot_path(...)`
+    - plus `RemoteGlobalMetadataWriteResult` and remote object naming helper.
+  - Added janitor checkpoint wiring (default-on; env opt-out supported):
+    - new env flags:
+      - `DRIFT_GLOBAL_METADATA_PERSIST`
+      - `DRIFT_GLOBAL_METADATA_CHECKPOINT_INTERVAL_MS`
+    - janitor now marks metadata dirty on routing/catalog mutation paths and periodically checkpoints snapshot state.
+    - successful checkpoint atomically updates manifest pointer and rotates prior snapshot object best-effort.
+  - Added manager hydration wiring (default-on; env opt-out supported):
+    - on startup, manager reads manifest global metadata pointer and hydrates routing/catalog snapshot state.
+    - hydration uses conservative freshness filtering against current bucket path/live-count to avoid stale false negatives.
+    - persisted tombstones and WAL replay deletes are removed from hydrated routing index.
+  - Updated toggle semantics:
+    - global metadata persistence is now enabled by default.
+    - explicit opt-out values disable it: `0`, `false`, `no`, `off`.
+  - Added focused tests:
+    - `global_filter_routing_index::tests::routing_snapshot_roundtrip_preserves_entries`
+    - `filter_metadata_catalog::tests::catalog_snapshot_roundtrip_preserves_bucket_state`
+    - `persistence_tests::persistence_integration_tests::test_persistence_writes_and_reads_global_metadata_snapshot`
+- Files changed:
+  - `drift_server/src/global_metadata_snapshot.rs`
+  - `drift_server/src/global_filter_routing_index.rs`
+  - `drift_server/src/filter_metadata_catalog.rs`
+  - `drift_server/src/persistence.rs`
+  - `drift_server/src/manager.rs`
+  - `drift_server/src/janitor.rs`
+  - `drift_server/src/persistence_tests.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server global_metadata_snapshot::tests`
+  - `cargo test -p drift_server global_filter_routing_index::tests::routing_snapshot_roundtrip_preserves_entries`
+  - `cargo test -p drift_server filter_metadata_catalog::tests::catalog_snapshot_roundtrip_preserves_bucket_state`
+  - `cargo test -p drift_server persistence_integration_tests::test_persistence_writes_and_reads_global_metadata_snapshot`
+  - `cargo test -p drift_server manager_tests::tests::test_manager_restart_recovery_clears_filter_metadata_catalog`
+  - `cargo test -p drift_server manager_tests::tests::test_manager_restart_recovery_clears_global_filter_routing_index`
+  - `cargo test -p drift_core manifest_tests`
+- Open issues:
+  - Cold-start benchmark evidence for first-query selectivity gains with hydrated metadata is still pending.
+- Next steps:
+  - run exact/range cold-start `bench_rw` comparisons with persistence enabled.
+  - decide default-on rollout policy and cleanup/reaper strategy for historical `global_metadata_*.driftmeta` objects.
+
+## 2026-02-27 (global metadata persistence migration step 1/2: snapshot contract + manifest pointer schema)
+- Goal:
+  - Start persistence migration for global routing/catalog metadata by adding the durable snapshot contract and manifest pointer schema, without changing planner runtime behavior yet.
+- Work completed:
+  - Added versioned snapshot contract module:
+    - `drift_server/src/global_metadata_snapshot.rs`
+    - includes routing + catalog snapshot shapes and bincode v2 encode/decode helpers.
+  - Added focused snapshot tests:
+    - `global_metadata_snapshot::tests::snapshot_roundtrip_preserves_routing_and_catalog_data`
+    - `global_metadata_snapshot::tests::decode_rejects_zero_format_version`
+  - Extended manifest protobuf schema with global metadata pointer fields:
+    - `global_metadata_path`
+    - `global_metadata_fingerprint`
+    - `global_metadata_format_version`
+  - Added manifest wrapper helpers in `drift_core`:
+    - `global_metadata_pointer()`
+    - `update_global_metadata_pointer(...)`
+    - `clear_global_metadata_pointer()`
+  - Added manifest test coverage:
+    - `manifest_tests::tests::test_global_metadata_pointer_roundtrip`
+  - Added bincode encode/decode derives on filter metadata types used by the snapshot contract:
+    - `ExactValueMembershipKey`
+    - `ExactValuePresence`
+    - `RangeFieldZoneMap`
+- Files changed:
+  - `drift_core/proto/manifest.proto`
+  - `drift_core/src/manifest.rs`
+  - `drift_core/src/manifest_tests.rs`
+  - `drift_server/src/filter_metadata_catalog.rs`
+  - `drift_server/src/global_metadata_snapshot.rs`
+  - `drift_server/src/lib.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo test -p drift_core manifest_tests::tests::test_global_metadata_pointer_roundtrip`
+  - `cargo test -p drift_server global_metadata_snapshot::tests`
+  - `cargo fmt --all`
+- Open issues:
+  - Snapshot contract is defined but not yet wired to persistence IO, janitor checkpoint publication, or recovery hydration.
+- Next steps:
+  - add `PersistenceManager` read/write methods for global metadata snapshot objects.
+  - add janitor dirty/checkpoint flow and manifest pointer publication on successful snapshot write.
+  - add startup recovery hydration from manifest pointer with conservative stale/missing fallback.
+
 ## 2026-02-27 (item 26 execution step 4: post-license exact/range reruns + delete-sync closure)
 - Goal:
   - Run the pending large-tier benchmark validation after Xcode license acceptance and close delete-sync policy in docs.

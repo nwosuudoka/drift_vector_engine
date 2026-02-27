@@ -28,6 +28,13 @@ impl BucketPayloadIndexMeta {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GlobalMetadataPointer {
+    pub path: String,
+    pub fingerprint: String,
+    pub format_version: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct ManifestWrapper {
     pub inner: Manifest,
@@ -55,6 +62,9 @@ impl ManifestWrapper {
                 centroids: vec![],
                 buckets: vec![],
                 tombstone_files: vec![],
+                global_metadata_path: String::new(),
+                global_metadata_fingerprint: String::new(),
+                global_metadata_format_version: 0,
             },
         }
     }
@@ -137,6 +147,35 @@ impl ManifestWrapper {
 
     pub fn get_dim(&self) -> u32 {
         self.inner.dim
+    }
+
+    pub fn global_metadata_pointer(&self) -> Option<GlobalMetadataPointer> {
+        if self.inner.global_metadata_path.is_empty() {
+            return None;
+        }
+
+        Some(GlobalMetadataPointer {
+            path: self.inner.global_metadata_path.clone(),
+            fingerprint: self.inner.global_metadata_fingerprint.clone(),
+            format_version: self.inner.global_metadata_format_version,
+        })
+    }
+
+    pub fn update_global_metadata_pointer(
+        &mut self,
+        path: String,
+        fingerprint: String,
+        format_version: u32,
+    ) {
+        self.inner.global_metadata_path = path;
+        self.inner.global_metadata_fingerprint = fingerprint;
+        self.inner.global_metadata_format_version = format_version;
+    }
+
+    pub fn clear_global_metadata_pointer(&mut self) {
+        self.inner.global_metadata_path.clear();
+        self.inner.global_metadata_fingerprint.clear();
+        self.inner.global_metadata_format_version = 0;
     }
 
     pub fn metric(&self) -> Result<Metric, String> {

@@ -202,4 +202,31 @@ mod tests {
         manifest.inner.metric = "invalid".to_string();
         assert!(manifest.metric().is_err());
     }
+
+    #[test]
+    fn test_global_metadata_pointer_roundtrip() {
+        let mut manifest = ManifestWrapper::new(32, Metric::L2);
+        assert!(manifest.global_metadata_pointer().is_none());
+
+        manifest.update_global_metadata_pointer(
+            "global_metadata_abc.driftmeta".to_string(),
+            "len=1024|etag=abc".to_string(),
+            1,
+        );
+        let pointer = manifest
+            .global_metadata_pointer()
+            .expect("pointer should be present");
+        assert_eq!(pointer.path, "global_metadata_abc.driftmeta");
+        assert_eq!(pointer.fingerprint, "len=1024|etag=abc");
+        assert_eq!(pointer.format_version, 1);
+
+        let bytes = manifest.to_bytes();
+        let loaded = ManifestWrapper::from_bytes(&bytes).expect("manifest should deserialize");
+        let loaded_pointer = loaded
+            .global_metadata_pointer()
+            .expect("pointer should survive serialization");
+        assert_eq!(loaded_pointer.path, "global_metadata_abc.driftmeta");
+        assert_eq!(loaded_pointer.fingerprint, "len=1024|etag=abc");
+        assert_eq!(loaded_pointer.format_version, 1);
+    }
 }

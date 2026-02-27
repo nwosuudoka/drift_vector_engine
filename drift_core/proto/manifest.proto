@@ -19,6 +19,11 @@ message Manifest {
   
   // Global Delete Tracking
   repeated string tombstone_files = 7; // List of active tombstone run_ids
+
+  // Global metadata snapshot pointer (routing/catalog sidecar state)
+  string global_metadata_path = 8;
+  string global_metadata_fingerprint = 9;
+  uint32 global_metadata_format_version = 10;
 }
 
 message Centroid {

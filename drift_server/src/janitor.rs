@@ -3,6 +3,9 @@ use crate::filter_metadata_catalog::FilterMetadataCatalog;
 use crate::global_filter_routing_index::{
     GlobalFilterRoutingIndex, extract_indexed_exact_value_keys, indexed_exact_field_ids,
 };
+use crate::global_metadata_snapshot::{
+    GLOBAL_METADATA_SNAPSHOT_FORMAT_VERSION, GlobalMetadataSnapshot, RoutingBucketTokenSnapshot,
+};
 use crate::local_staging::LocalStagingManager;
 use crate::manifest::ServerManifestManager;
 use crate::persistence::PersistenceManager;
@@ -21,6 +24,7 @@ use drift_storage::unified_format::{
 use drift_traits::StorageEngine;
 use parking_lot::RwLock as ParkingRwLock;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, VecDeque},
@@ -31,6 +35,9 @@ use tokio::time;
 use tracing::{error, info, warn};
 
 const KV_SYNC_INTERVAL_MS_ENV: &str = "DRIFT_KV_SYNC_INTERVAL_MS";
+const GLOBAL_METADATA_PERSIST_ENV: &str = "DRIFT_GLOBAL_METADATA_PERSIST";
+const GLOBAL_METADATA_CHECKPOINT_INTERVAL_MS_ENV: &str =
+    "DRIFT_GLOBAL_METADATA_CHECKPOINT_INTERVAL_MS";
 
 fn kv_sync_interval_from_env() -> Duration {
     let default = Duration::from_millis(5_000);
@@ -41,6 +48,42 @@ fn kv_sync_interval_from_env() -> Duration {
                 warn!(
                     "Janitor: invalid {}='{}'; using default {}ms",
                     KV_SYNC_INTERVAL_MS_ENV,
+                    raw,
+                    default.as_millis()
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
+fn global_metadata_persist_enabled_from_env() -> bool {
+    match std::env::var(GLOBAL_METADATA_PERSIST_ENV) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => false,
+            "1" | "true" | "yes" | "on" => true,
+            other => {
+                warn!(
+                    "Janitor: invalid {}='{}'; defaulting to enabled",
+                    GLOBAL_METADATA_PERSIST_ENV, other
+                );
+                true
+            }
+        },
+        Err(_) => true,
+    }
+}
+
+fn global_metadata_checkpoint_interval_from_env() -> Duration {
+    let default = Duration::from_millis(15_000);
+    match std::env::var(GLOBAL_METADATA_CHECKPOINT_INTERVAL_MS_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(ms) if ms > 0 => Duration::from_millis(ms),
+            _ => {
+                warn!(
+                    "Janitor: invalid {}='{}'; using default {}ms",
+                    GLOBAL_METADATA_CHECKPOINT_INTERVAL_MS_ENV,
                     raw,
                     default.as_millis()
                 );
@@ -397,6 +440,9 @@ pub struct Janitor {
     reaper: Mutex<Reaper>,
     coordinator: Arc<BucketCoordinator>,
     vars: JanitorVars,
+    global_metadata_persist_enabled: bool,
+    global_metadata_checkpoint_interval: Duration,
+    global_metadata_dirty: AtomicBool,
 }
 
 impl Janitor {
@@ -406,6 +452,8 @@ impl Janitor {
             config.staging.clone(),
             config.persistence.clone(),
         ));
+        let global_metadata_persist_enabled = global_metadata_persist_enabled_from_env();
+        let global_metadata_checkpoint_interval = global_metadata_checkpoint_interval_from_env();
         Self {
             index: config.index,
             manifest: config.manifest,
@@ -418,7 +466,104 @@ impl Janitor {
             reaper,
             coordinator: config.coordinator,
             vars: config.vars,
+            global_metadata_persist_enabled,
+            global_metadata_checkpoint_interval,
+            global_metadata_dirty: AtomicBool::new(false),
         }
+    }
+
+    fn mark_global_metadata_dirty(&self) {
+        if self.global_metadata_persist_enabled {
+            self.global_metadata_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    async fn checkpoint_global_metadata_if_due(
+        &self,
+        last_checkpoint: &mut Instant,
+        reason: &str,
+        force: bool,
+    ) {
+        if !self.global_metadata_persist_enabled {
+            return;
+        }
+        if !force && last_checkpoint.elapsed() < self.global_metadata_checkpoint_interval {
+            return;
+        }
+        if !force && !self.global_metadata_dirty.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut snapshot = GlobalMetadataSnapshot::default();
+        snapshot.format_version = GLOBAL_METADATA_SNAPSHOT_FORMAT_VERSION;
+        snapshot.routing = self.global_filter_routing_index.read().export_snapshot();
+        snapshot.catalog = self.filter_metadata_catalog.read().export_snapshot();
+        snapshot.routing.bucket_tokens = self.capture_routing_bucket_tokens();
+
+        let previous_pointer = self.manifest.get_state().global_metadata_pointer();
+        let write_result = match self
+            .persistence
+            .write_global_metadata_snapshot(&snapshot)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(
+                    "Janitor: failed to persist global metadata snapshot (reason={}): {}",
+                    reason, err
+                );
+                *last_checkpoint = Instant::now();
+                return;
+            }
+        };
+
+        let update_result = self.manifest.apply_atomic(|manifest| {
+            manifest.update_global_metadata_pointer(
+                write_result.object_path.clone(),
+                write_result.object_fingerprint.clone(),
+                write_result.format_version,
+            );
+        });
+        if let Err(err) = update_result {
+            warn!(
+                "Janitor: failed to publish global metadata pointer to manifest (reason={}): {}",
+                reason, err
+            );
+            *last_checkpoint = Instant::now();
+            return;
+        }
+
+        if let Some(previous) = previous_pointer
+            && !previous.path.is_empty()
+            && previous.path != write_result.object_path
+        {
+            self.cleanup
+                .delete_remote_best_effort(&previous.path, "global-metadata-rotate")
+                .await;
+        }
+
+        self.global_metadata_dirty.store(false, Ordering::Relaxed);
+        *last_checkpoint = Instant::now();
+    }
+
+    fn capture_routing_bucket_tokens(&self) -> Vec<RoutingBucketTokenSnapshot> {
+        let manifest_state = self.manifest.get_state();
+        let mut tokens = Vec::new();
+        for bucket in manifest_state.get_buckets() {
+            let Some(version) = self.bucket_manager.get_version(bucket.id) else {
+                continue;
+            };
+            let Some(stats) = self.bucket_manager.get_bucket_stats(bucket.id) else {
+                continue;
+            };
+            tokens.push(RoutingBucketTokenSnapshot {
+                bucket_id: bucket.id,
+                bucket_path: version.path.clone(),
+                bucket_live_count: stats.total_count.saturating_sub(stats.tombstone_count),
+            });
+        }
+        tokens.sort_by(|lhs, rhs| lhs.bucket_id.cmp(&rhs.bucket_id));
+        tokens
     }
 
     fn invalidate_catalog_buckets(&self, bucket_ids: &[u32]) {
@@ -429,6 +574,7 @@ impl Janitor {
         for bucket_id in bucket_ids {
             catalog.invalidate_bucket(*bucket_id);
         }
+        self.mark_global_metadata_dirty();
     }
 
     fn invalidate_routing_buckets(&self, bucket_ids: &[u32]) {
@@ -439,6 +585,7 @@ impl Janitor {
         for bucket_id in bucket_ids {
             routing.invalidate_bucket(*bucket_id);
         }
+        self.mark_global_metadata_dirty();
     }
 
     fn remove_routing_ids(&self, ids: &[u64]) {
@@ -449,6 +596,7 @@ impl Janitor {
         for id in ids {
             routing.remove_id(*id);
         }
+        self.mark_global_metadata_dirty();
     }
 
     fn upsert_routing_entries_incremental(
@@ -507,6 +655,7 @@ impl Janitor {
                 }
             }
         }
+        self.mark_global_metadata_dirty();
         Ok(())
     }
 
@@ -570,6 +719,7 @@ impl Janitor {
                 }
             }
         }
+        self.mark_global_metadata_dirty();
         Ok(())
     }
 
@@ -815,6 +965,7 @@ impl Janitor {
         let mut interval = time::interval(self.vars.check_interval);
         let kv_sync_interval = kv_sync_interval_from_env();
         let mut last_kv_sync = Instant::now();
+        let mut last_global_metadata_checkpoint = Instant::now();
         info!("Janitor: Started.");
 
         loop {
@@ -842,6 +993,13 @@ impl Janitor {
                 self.sync_kv_best_effort("periodic");
                 last_kv_sync = Instant::now();
             }
+
+            self.checkpoint_global_metadata_if_due(
+                &mut last_global_metadata_checkpoint,
+                "periodic",
+                false,
+            )
+            .await;
         }
     }
 

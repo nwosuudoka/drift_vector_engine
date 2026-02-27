@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::filter_metadata_catalog::FilterMetadataCatalog;
 use crate::filter_planner_diagnostics::FilterPlannerDiagnosticsSnapshot;
 use crate::global_filter_routing_index::GlobalFilterRoutingIndex;
+use crate::global_metadata_snapshot::{FilterCatalogSnapshot, GlobalRoutingSnapshot};
 use crate::janitor::{Janitor, JanitorConfig, JanitorVars};
 use crate::local_staging::LocalStagingManager;
 use crate::manifest::ServerManifestManager;
@@ -20,7 +21,7 @@ use drift_traits::StorageEngine;
 use opendal::Operator;
 use opendal::services::Fs;
 use parking_lot::{Mutex, RwLock as ParkingRwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +33,7 @@ const KV_VALIDATE_MAX_BUCKETS_ENV: &str = "DRIFT_KV_VALIDATE_MAX_BUCKETS";
 const KV_VALIDATE_IDS_PER_BUCKET_ENV: &str = "DRIFT_KV_VALIDATE_IDS_PER_BUCKET";
 const KV_VALIDATE_MAX_BUCKETS_DEFAULT: usize = 8;
 const KV_VALIDATE_IDS_PER_BUCKET_DEFAULT: usize = 4;
+const GLOBAL_METADATA_PERSIST_ENV: &str = "DRIFT_GLOBAL_METADATA_PERSIST";
 
 pub struct Collection {
     pub index: Arc<VectorIndex>,
@@ -142,6 +144,148 @@ impl CollectionManager {
             );
         }
         guard.clear();
+    }
+
+    fn global_metadata_persist_enabled() -> bool {
+        match std::env::var(GLOBAL_METADATA_PERSIST_ENV) {
+            Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "no" | "off" => false,
+                "1" | "true" | "yes" | "on" => true,
+                other => {
+                    warn!(
+                        "Manager: invalid {}='{}'; defaulting to enabled",
+                        GLOBAL_METADATA_PERSIST_ENV, other
+                    );
+                    true
+                }
+            },
+            Err(_) => true,
+        }
+    }
+
+    fn bucket_live_count(bucket_manager: &Arc<BucketManager>, bucket_id: u32) -> Option<u32> {
+        bucket_manager
+            .get_bucket_stats(bucket_id)
+            .map(|stats| stats.total_count.saturating_sub(stats.tombstone_count))
+    }
+
+    async fn hydrate_global_metadata_from_manifest(
+        collection_name: &str,
+        manifest: &Arc<ServerManifestManager>,
+        persistence: &Arc<PersistenceManager>,
+        bucket_manager: &Arc<BucketManager>,
+        filter_metadata_catalog: &Arc<ParkingRwLock<FilterMetadataCatalog>>,
+        global_filter_routing_index: &Arc<ParkingRwLock<GlobalFilterRoutingIndex>>,
+    ) {
+        let pointer = manifest.get_state().global_metadata_pointer();
+        let Some(pointer) = pointer else {
+            return;
+        };
+
+        let snapshot = match persistence
+            .read_global_metadata_snapshot_path(&pointer.path)
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                warn!(
+                    "Manager: global metadata pointer for '{}' references missing object '{}'",
+                    collection_name, pointer.path
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    "Manager: failed to read global metadata snapshot for '{}' from '{}': {}",
+                    collection_name, pointer.path, err
+                );
+                return;
+            }
+        };
+
+        if pointer.format_version != 0 && pointer.format_version != snapshot.format_version {
+            warn!(
+                "Manager: global metadata format mismatch for '{}': manifest={} snapshot={}; skipping hydration",
+                collection_name, pointer.format_version, snapshot.format_version
+            );
+            return;
+        }
+
+        let valid_routing_buckets: HashSet<u32> = snapshot
+            .routing
+            .bucket_tokens
+            .iter()
+            .filter_map(|token| {
+                let version = bucket_manager.get_version(token.bucket_id)?;
+                let live_count = Self::bucket_live_count(bucket_manager, token.bucket_id)?;
+                (version.path == token.bucket_path && live_count == token.bucket_live_count)
+                    .then_some(token.bucket_id)
+            })
+            .collect();
+
+        let mut routing_snapshot = GlobalRoutingSnapshot::default();
+        routing_snapshot.bucket_tokens = snapshot
+            .routing
+            .bucket_tokens
+            .iter()
+            .filter(|token| valid_routing_buckets.contains(&token.bucket_id))
+            .cloned()
+            .collect();
+        routing_snapshot.id_entries = snapshot
+            .routing
+            .id_entries
+            .iter()
+            .filter(|entry| valid_routing_buckets.contains(&entry.bucket_id))
+            .cloned()
+            .collect();
+        routing_snapshot.complete_exact_fields_by_bucket = snapshot
+            .routing
+            .complete_exact_fields_by_bucket
+            .iter()
+            .filter(|entry| valid_routing_buckets.contains(&entry.bucket_id))
+            .cloned()
+            .collect();
+
+        let mut catalog_snapshot = FilterCatalogSnapshot::default();
+        catalog_snapshot.buckets = snapshot
+            .catalog
+            .buckets
+            .iter()
+            .filter(|bucket| {
+                let Some(version) = bucket_manager.get_version(bucket.bucket_id) else {
+                    return false;
+                };
+                if version.path != bucket.bucket_path {
+                    return false;
+                }
+                match bucket.bucket_live_count {
+                    Some(expected) => {
+                        Self::bucket_live_count(bucket_manager, bucket.bucket_id) == Some(expected)
+                    }
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+
+        {
+            let mut routing = global_filter_routing_index.write();
+            routing.import_snapshot(&routing_snapshot);
+        }
+        {
+            let mut catalog = filter_metadata_catalog.write();
+            catalog.import_snapshot(&catalog_snapshot);
+        }
+
+        let routing_stats = global_filter_routing_index.read().stats();
+        let catalog_stats = filter_metadata_catalog.read().stats();
+        info!(
+            "Manager: hydrated global metadata for '{}' (routing_ids={}, routing_values={}, catalog_buckets={})",
+            collection_name,
+            routing_stats.id_entry_count,
+            routing_stats.value_entry_count,
+            catalog_stats.bucket_count
+        );
     }
 
     fn recreate_kv_store(kv_base_path: &Path) -> std::io::Result<Arc<BitStore>> {
@@ -523,6 +667,24 @@ impl CollectionManager {
             }
         }
 
+        if Self::global_metadata_persist_enabled() {
+            Self::hydrate_global_metadata_from_manifest(
+                name,
+                &manifest,
+                &persistence,
+                &bucket_manager,
+                &filter_metadata_catalog,
+                &global_filter_routing_index,
+            )
+            .await;
+            if !persisted_deletes.is_empty() {
+                let mut routing = global_filter_routing_index.write();
+                for id in &persisted_deletes {
+                    routing.remove_id(*id);
+                }
+            }
+        }
+
         // --- RECOVERY (Step 3: Replay WAL) ---
         if !replay_data.inserts.is_empty() {
             info!(
@@ -538,6 +700,9 @@ impl CollectionManager {
             );
             for id in replay_data.deletes {
                 index.delete(id)?;
+                if Self::global_metadata_persist_enabled() {
+                    global_filter_routing_index.write().remove_id(id);
+                }
             }
         }
 

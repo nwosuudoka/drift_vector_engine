@@ -1,5 +1,8 @@
 use crate::filter_metadata_catalog::logical_type_tag;
 use crate::filter_metadata_catalog::{ExactFieldQueryClause, ExactValueMembershipKey};
+use crate::global_metadata_snapshot::{
+    BucketExactFieldCoverageSnapshot, GlobalRoutingIdEntry, GlobalRoutingSnapshot,
+};
 use drift_storage::unified_format::{UnifiedPayloadRow, UnifiedPayloadSchema, encode_exact_key};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -146,6 +149,62 @@ impl GlobalFilterRoutingIndex {
         self.id_entries.clear();
         self.value_bucket_counts.clear();
         self.complete_exact_fields_by_bucket.clear();
+    }
+
+    pub fn export_snapshot(&self) -> GlobalRoutingSnapshot {
+        let mut id_entries: Vec<GlobalRoutingIdEntry> = self
+            .id_entries
+            .iter()
+            .map(|(id, entry)| {
+                let mut value_keys: Vec<ExactValueMembershipKey> =
+                    entry.value_keys.iter().cloned().collect();
+                value_keys.sort_by(|lhs, rhs| {
+                    lhs.field_id
+                        .cmp(&rhs.field_id)
+                        .then_with(|| lhs.logical_type_tag.cmp(&rhs.logical_type_tag))
+                        .then_with(|| lhs.encoded_value.cmp(&rhs.encoded_value))
+                });
+                GlobalRoutingIdEntry {
+                    id: *id,
+                    bucket_id: entry.bucket_id,
+                    value_keys,
+                }
+            })
+            .collect();
+        id_entries.sort_by(|lhs, rhs| lhs.id.cmp(&rhs.id));
+
+        let mut complete_exact_fields_by_bucket: Vec<BucketExactFieldCoverageSnapshot> = self
+            .complete_exact_fields_by_bucket
+            .iter()
+            .map(|(bucket_id, fields)| {
+                let mut field_ids: Vec<u32> = fields.iter().copied().collect();
+                field_ids.sort_unstable();
+                BucketExactFieldCoverageSnapshot {
+                    bucket_id: *bucket_id,
+                    field_ids,
+                }
+            })
+            .collect();
+        complete_exact_fields_by_bucket.sort_by(|lhs, rhs| lhs.bucket_id.cmp(&rhs.bucket_id));
+
+        GlobalRoutingSnapshot {
+            bucket_tokens: Vec::new(),
+            id_entries,
+            complete_exact_fields_by_bucket,
+        }
+    }
+
+    pub fn import_snapshot(&mut self, snapshot: &GlobalRoutingSnapshot) {
+        self.clear();
+        for entry in &snapshot.id_entries {
+            self.upsert_id_values(entry.id, entry.bucket_id, entry.value_keys.iter().cloned());
+        }
+        for entry in &snapshot.complete_exact_fields_by_bucket {
+            self.set_bucket_complete_exact_fields(
+                entry.bucket_id,
+                entry.field_ids.iter().copied().collect(),
+            );
+        }
     }
 
     fn apply_entry_counts(&mut self, entry: &IdRoutingEntry) {
@@ -402,5 +461,23 @@ mod tests {
         let keys = extract_indexed_exact_value_keys(&schema, &row).expect("keys should encode");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].field_id, 1);
+    }
+
+    #[test]
+    fn routing_snapshot_roundtrip_preserves_entries() {
+        let mut index = GlobalFilterRoutingIndex::default();
+        let tenant_a = key(1, "tenant_a");
+        let region_us = key(2, "us");
+        index.upsert_id_values(100, 7, vec![tenant_a.clone(), region_us.clone()]);
+        index.set_bucket_complete_exact_fields(7, HashSet::from([1, 2]));
+
+        let snapshot = index.export_snapshot();
+        let mut restored = GlobalFilterRoutingIndex::default();
+        restored.import_snapshot(&snapshot);
+
+        assert_eq!(restored.value_bucket_live_count(&tenant_a, 7), 1);
+        assert_eq!(restored.value_bucket_live_count(&region_us, 7), 1);
+        assert!(restored.bucket_exact_field_complete(7, 1));
+        assert!(restored.bucket_exact_field_complete(7, 2));
     }
 }

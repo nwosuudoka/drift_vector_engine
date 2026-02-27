@@ -1,3 +1,4 @@
+use crate::global_metadata_snapshot::GlobalMetadataSnapshot;
 use drift_core::manifest::BucketPayloadIndexMeta;
 use drift_core::tombstone::TombstoneFile;
 use drift_storage::disk_manager::DiskManager;
@@ -22,6 +23,15 @@ pub struct RemoteUnifiedWriteResult {
     pub object_path: String,
     pub row_count: u64,
     pub payload_index_meta: BucketPayloadIndexMeta,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteGlobalMetadataWriteResult {
+    pub run_id: String,
+    pub object_path: String,
+    pub object_fingerprint: String,
+    pub format_version: u32,
+    pub encoded_size_bytes: usize,
 }
 
 impl PersistenceManager {
@@ -53,6 +63,10 @@ impl PersistenceManager {
 
     pub fn remote_bucket_path(&self, bucket_id: u32, run_id: &str) -> String {
         format!("bucket_{}_{}.driftu", bucket_id, run_id)
+    }
+
+    pub fn remote_global_metadata_path(&self, run_id: &str) -> String {
+        format!("global_metadata_{}.driftmeta", run_id)
     }
 
     pub async fn read_remote_bucket_path(
@@ -335,6 +349,49 @@ impl PersistenceManager {
     pub async fn object_fingerprint_for_path(&self, path: &str) -> io::Result<String> {
         let meta = self.op.stat(path).await.map_err(io::Error::other)?;
         Ok(Self::object_fingerprint(&meta))
+    }
+
+    pub async fn write_global_metadata_snapshot(
+        &self,
+        snapshot: &GlobalMetadataSnapshot,
+    ) -> io::Result<RemoteGlobalMetadataWriteResult> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let object_path = self.remote_global_metadata_path(&run_id);
+        let bytes = snapshot.encode_to_bytes()?;
+
+        self.op
+            .write(&object_path, bytes.clone())
+            .await
+            .map_err(io::Error::other)?;
+        let object_fingerprint = self.object_fingerprint_for_path(&object_path).await?;
+
+        info!(
+            "Persistence: wrote global metadata snapshot {} ({} bytes, format_version={})",
+            object_path,
+            bytes.len(),
+            snapshot.format_version
+        );
+
+        Ok(RemoteGlobalMetadataWriteResult {
+            run_id,
+            object_path,
+            object_fingerprint,
+            format_version: snapshot.format_version,
+            encoded_size_bytes: bytes.len(),
+        })
+    }
+
+    pub async fn read_global_metadata_snapshot_path(
+        &self,
+        path: &str,
+    ) -> io::Result<Option<GlobalMetadataSnapshot>> {
+        if !self.op.exists(path).await.map_err(io::Error::other)? {
+            return Ok(None);
+        }
+
+        let bytes = self.op.read(path).await.map_err(io::Error::other)?.to_vec();
+        let snapshot = GlobalMetadataSnapshot::decode_from_bytes(&bytes)?;
+        Ok(Some(snapshot))
     }
 
     pub async fn flush_tombstones(&self, ids: &[u64], run_id: &str) -> std::io::Result<String> {

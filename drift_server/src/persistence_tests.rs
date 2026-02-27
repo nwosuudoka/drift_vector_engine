@@ -179,6 +179,11 @@ mod tests {
 
 #[cfg(test)]
 mod persistence_integration_tests {
+    use crate::filter_metadata_catalog::ExactValueMembershipKey;
+    use crate::global_metadata_snapshot::{
+        FilterCatalogBucketSnapshot, GlobalMetadataSnapshot, GlobalRoutingIdEntry,
+        RoutingBucketTokenSnapshot,
+    };
     use crate::persistence::PersistenceManager;
     use drift_storage::unified_format::{
         UNIFIED_FLAG_HAS_EXACT_INDEX, UNIFIED_FLAG_HAS_PAYLOAD_COLUMNS,
@@ -418,6 +423,56 @@ mod persistence_integration_tests {
             result.payload_index_meta.payload_schema_hash,
             reader.header.payload_schema_hash
         );
+    }
+
+    #[tokio::test]
+    async fn test_persistence_writes_and_reads_global_metadata_snapshot() {
+        let dir = tempdir().unwrap();
+        let op = create_local_operator(dir.path());
+        let persistence = PersistenceManager::new(op.clone());
+
+        let mut snapshot = GlobalMetadataSnapshot::default();
+        snapshot
+            .routing
+            .bucket_tokens
+            .push(RoutingBucketTokenSnapshot {
+                bucket_id: 7,
+                bucket_path: "bucket_7_v1".to_string(),
+                bucket_live_count: 22,
+            });
+        snapshot.routing.id_entries.push(GlobalRoutingIdEntry {
+            id: 101,
+            bucket_id: 7,
+            value_keys: vec![ExactValueMembershipKey {
+                field_id: 1,
+                logical_type_tag: 6,
+                encoded_value: b"tenant_a".to_vec(),
+            }],
+        });
+        snapshot.catalog.buckets.push(FilterCatalogBucketSnapshot {
+            bucket_id: 7,
+            bucket_path: "bucket_7_v1".to_string(),
+            bucket_live_count: Some(22),
+            indexed_exact_fields: vec![1],
+            range_stats_fields: vec![],
+            exact_value_presence: vec![],
+            range_field_zone_maps: vec![],
+        });
+
+        let write = persistence
+            .write_global_metadata_snapshot(&snapshot)
+            .await
+            .expect("global metadata snapshot should write");
+        assert_eq!(write.format_version, snapshot.format_version);
+        assert!(write.object_path.ends_with(".driftmeta"));
+        assert!(!write.object_fingerprint.is_empty());
+
+        let loaded = persistence
+            .read_global_metadata_snapshot_path(&write.object_path)
+            .await
+            .expect("global metadata snapshot should read")
+            .expect("snapshot should exist");
+        assert_eq!(loaded, snapshot);
     }
 }
 

@@ -440,9 +440,46 @@ Last updated: 2026-02-27
         - no public delete RPC exists in `drift_server/proto/drift.proto`.
         - runtime direct delete usage is simulation-only (`bin/churn_sim.rs`).
         - immediate direct-delete routing-index mutation is deferred; janitor-flush reconciliation remains the chosen strategy.
+    - Started global metadata persistence migration foundation (step 1/2, no behavior change yet):
+      - added versioned global metadata snapshot contract module:
+        - `drift_server/src/global_metadata_snapshot.rs`
+        - captures both routing and catalog snapshot shapes with bincode v2 encode/decode helpers.
+      - extended manifest wire contract with global metadata pointer fields:
+        - `global_metadata_path`
+        - `global_metadata_fingerprint`
+        - `global_metadata_format_version`
+      - added `ManifestWrapper` helpers:
+        - `global_metadata_pointer()`
+        - `update_global_metadata_pointer(...)`
+        - `clear_global_metadata_pointer()`
+      - added focused tests:
+        - `manifest_tests::tests::test_global_metadata_pointer_roundtrip`
+        - `global_metadata_snapshot::tests::{snapshot_roundtrip_preserves_routing_and_catalog_data, decode_rejects_zero_format_version}`
+    - Completed global metadata persistence migration step 2/3 (default-on publish + hydrate wiring):
+      - extended snapshot contract with routing freshness tokens:
+        - per-bucket `{bucket_id, bucket_path, bucket_live_count}` in routing snapshot.
+      - added routing/catalog snapshot export/import APIs:
+        - `GlobalFilterRoutingIndex::{export_snapshot, import_snapshot}`
+        - `FilterMetadataCatalog::{export_snapshot, import_snapshot}`
+      - added persistence IO for global metadata snapshots:
+        - `PersistenceManager::write_global_metadata_snapshot(...)`
+        - `PersistenceManager::read_global_metadata_snapshot_path(...)`
+      - janitor wiring (`DRIFT_GLOBAL_METADATA_PERSIST` opt-out via `0|false|no|off`):
+        - marks metadata dirty on routing/catalog lifecycle mutations.
+        - periodic checkpoint writes snapshot object and atomically publishes manifest pointer.
+        - rotates previous snapshot object after pointer swap.
+      - manager startup wiring (`DRIFT_GLOBAL_METADATA_PERSIST` opt-out via `0|false|no|off`):
+        - hydrates routing/catalog from manifest pointer at startup.
+        - applies conservative freshness filtering against current bucket path/live-count.
+        - removes persisted/WAL replay tombstones from hydrated routing index.
+      - added focused coverage:
+        - `global_filter_routing_index::tests::routing_snapshot_roundtrip_preserves_entries`
+        - `filter_metadata_catalog::tests::catalog_snapshot_roundtrip_preserves_bucket_state`
+        - `persistence_tests::persistence_integration_tests::test_persistence_writes_and_reads_global_metadata_snapshot`
   - Remaining:
     - decide whether to prioritize data-layout-aware partitioning/catalog changes versus query-time metadata indexing.
     - decide whether adaptive field-to-bucket metadata indexing is required for planner cost control.
+    - run `bench_rw` cold-start comparisons to quantify first-query planner readiness with default-on metadata hydration.
 - [x] 27. Define adaptive metadata catalog for filter-to-bucket routing (v2).
   - Goal: avoid probing every bucket at query time while preserving filter-first correctness.
   - Scope:
