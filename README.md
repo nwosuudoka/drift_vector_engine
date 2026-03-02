@@ -157,6 +157,7 @@ For payload inserts, filters, and projection, use the gRPC API directly.
 
 - gRPC proto: `drift_server/proto/drift.proto`
 - Developer API spec: `docs/API_SPEC.md`
+- Production API usage spec: `docs/PRODUCTION_API_USAGE.md`
 - Architecture flow: `SYSTEM_VIEW.md`
 
 ### Simulations

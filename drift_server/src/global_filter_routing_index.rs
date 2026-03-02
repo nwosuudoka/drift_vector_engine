@@ -125,6 +125,69 @@ impl GlobalFilterRoutingIndex {
             .insert(bucket_id, exact_field_ids);
     }
 
+    pub fn mark_bucket_exact_field_complete(&mut self, bucket_id: u32, field_id: u32) {
+        self.complete_exact_fields_by_bucket
+            .entry(bucket_id)
+            .or_default()
+            .insert(field_id);
+    }
+
+    pub fn replace_bucket_exact_field_values(
+        &mut self,
+        bucket_id: u32,
+        field_id: u32,
+        values_by_id: HashMap<u64, HashSet<ExactValueMembershipKey>>,
+    ) {
+        let mut normalized_values_by_id: HashMap<u64, HashSet<ExactValueMembershipKey>> =
+            HashMap::new();
+        for (id, keys) in values_by_id {
+            let filtered: HashSet<ExactValueMembershipKey> = keys
+                .into_iter()
+                .filter(|key| key.field_id == field_id)
+                .collect();
+            if !filtered.is_empty() {
+                normalized_values_by_id.insert(id, filtered);
+            }
+        }
+
+        let existing_bucket_ids: HashSet<u64> = self
+            .id_entries
+            .iter()
+            .filter_map(|(id, entry)| (entry.bucket_id == bucket_id).then_some(*id))
+            .collect();
+        let mut touched_ids = existing_bucket_ids;
+        touched_ids.extend(normalized_values_by_id.keys().copied());
+
+        for id in touched_ids {
+            let previous = self.id_entries.remove(&id);
+            let mut next_keys = HashSet::new();
+            if let Some(entry) = previous {
+                self.remove_entry_counts(&entry);
+                if entry.bucket_id == bucket_id {
+                    next_keys.extend(
+                        entry
+                            .value_keys
+                            .into_iter()
+                            .filter(|key| key.field_id != field_id),
+                    );
+                }
+            }
+
+            if let Some(field_keys) = normalized_values_by_id.remove(&id) {
+                next_keys.extend(field_keys);
+            }
+
+            if !next_keys.is_empty() {
+                let next = IdRoutingEntry {
+                    bucket_id,
+                    value_keys: next_keys,
+                };
+                self.apply_entry_counts(&next);
+                self.id_entries.insert(id, next);
+            }
+        }
+    }
+
     pub fn bucket_exact_field_complete(&self, bucket_id: u32, field_id: u32) -> bool {
         self.complete_exact_fields_by_bucket
             .get(&bucket_id)
@@ -274,7 +337,7 @@ mod tests {
         UnifiedFieldSchema, UnifiedLogicalType, UnifiedPayloadRow, UnifiedPayloadSchema,
         UnifiedPayloadValue,
     };
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     fn key(field_id: u32, value: &str) -> ExactValueMembershipKey {
         ExactValueMembershipKey {
@@ -400,6 +463,50 @@ mod tests {
 
         index.set_bucket_complete_exact_fields(8, HashSet::new());
         assert!(!index.bucket_exact_field_complete(8, 1));
+    }
+
+    #[test]
+    fn mark_bucket_exact_field_complete_extends_existing_coverage() {
+        let mut index = GlobalFilterRoutingIndex::default();
+        index.set_bucket_complete_exact_fields(5, HashSet::from([1]));
+
+        index.mark_bucket_exact_field_complete(5, 2);
+
+        assert!(index.bucket_exact_field_complete(5, 1));
+        assert!(index.bucket_exact_field_complete(5, 2));
+    }
+
+    #[test]
+    fn replace_bucket_exact_field_values_replaces_only_target_field() {
+        let mut index = GlobalFilterRoutingIndex::default();
+        let tenant_a = key(1, "tenant_a");
+        let tenant_b = key(1, "tenant_b");
+        let tenant_c = key(1, "tenant_c");
+        let region_us = key(2, "us");
+
+        index.upsert_id_values(100, 7, vec![tenant_a.clone(), region_us.clone()]);
+        index.upsert_id_values(101, 7, vec![tenant_b.clone()]);
+        index.upsert_id_values(102, 8, vec![tenant_a.clone()]);
+
+        let mut replacement = HashMap::new();
+        replacement.insert(100, HashSet::from([tenant_a.clone()]));
+        replacement.insert(103, HashSet::from([tenant_c.clone()]));
+        index.replace_bucket_exact_field_values(7, 1, replacement);
+
+        assert_eq!(
+            index.buckets_for_exact_value(&tenant_a),
+            HashSet::from([7_u32, 8_u32])
+        );
+        assert_eq!(index.buckets_for_exact_value(&tenant_b), HashSet::new());
+        assert_eq!(
+            index.buckets_for_exact_value(&tenant_c),
+            HashSet::from([7_u32])
+        );
+        assert_eq!(
+            index.buckets_for_exact_value(&region_us),
+            HashSet::from([7_u32])
+        );
+        assert_eq!(index.stats().id_entry_count, 3);
     }
 
     #[test]

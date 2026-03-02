@@ -2,6 +2,7 @@
 
 This document describes the current developer-facing API behavior in this repository.
 Source of truth for message definitions is `drift_server/proto/drift.proto`.
+For production usage patterns and rollout guidance, see `docs/PRODUCTION_API_USAGE.md`.
 
 ## 1) Service endpoint and startup
 

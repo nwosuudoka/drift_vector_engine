@@ -2,15 +2,53 @@
 mod tests {
     use crate::config::{Config, FileConfig, StorageCommand};
     use crate::filter_metadata_catalog::{BucketProbeObservation, ExactValueMembershipKey};
+    use crate::manager::Collection;
     use crate::manager::CollectionManager;
+    use crate::server::DriftService;
+    use crate::{
+        drift_proto::{
+            InsertBatchRequest, PayloadRow, PayloadValue, Vector, drift_server::Drift,
+            payload_value,
+        },
+        manifest::ServerManifestManager,
+    };
+    use drift_core::manifest::ManifestWrapper;
     use drift_core::math::Metric;
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use tokio::time::sleep;
+    use tonic::Request;
 
     const DIM: usize = 128;
+    static ENV_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: Manager tests serialize env mutation with ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.prev {
+                // SAFETY: Manager tests serialize env mutation with ENV_LOCK.
+                unsafe { std::env::set_var(self.key, prev) };
+            } else {
+                // SAFETY: Manager tests serialize env mutation with ENV_LOCK.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
 
     fn test_config(root: &std::path::Path) -> Config {
         Config {
@@ -25,6 +63,37 @@ mod tests {
             ef_construction: 50,
             ef_search: 50,
         }
+    }
+
+    async fn wait_for_routing_entries(
+        collection: &Arc<Collection>,
+        timeout: Duration,
+        expected_min_ids: usize,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let stats = collection.global_filter_routing_index.read().stats();
+            if stats.id_entry_count >= expected_min_ids && stats.value_entry_count > 0 {
+                return true;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn wait_for_global_metadata_pointer(manifest_path: &std::path::Path) -> Option<String> {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(8) {
+            if let Ok(bytes) = std::fs::read(manifest_path)
+                && let Ok(wrapper) = ManifestWrapper::from_bytes(&bytes)
+                && let Some(pointer) = wrapper.global_metadata_pointer()
+                && !pointer.path.is_empty()
+            {
+                return Some(pointer.path);
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        None
     }
 
     #[tokio::test]
@@ -294,6 +363,120 @@ mod tests {
         assert_eq!(stats.id_entry_count, 0);
         assert_eq!(stats.value_entry_count, 0);
         assert_eq!(stats.value_bucket_pair_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_manager_restart_recovers_global_metadata_snapshot() {
+        let _env_guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _persist_guard = EnvVarGuard::set("DRIFT_GLOBAL_METADATA_PERSIST", "1");
+        let _checkpoint_guard =
+            EnvVarGuard::set("DRIFT_GLOBAL_METADATA_CHECKPOINT_INTERVAL_MS", "25");
+
+        let dir = tempdir().unwrap();
+        let mut config = test_config(dir.path());
+        config.max_bucket_capacity = 8;
+        let name = "global_metadata_recovery_hydrate";
+
+        {
+            let manager = Arc::new(CollectionManager::new(config.clone()));
+            let service = DriftService {
+                manager: manager.clone(),
+            };
+            let coll = manager
+                .get_or_create(name, Some(DIM), Some(8), Some(Metric::L2))
+                .await
+                .expect("collection creation should succeed");
+
+            let mut vectors = Vec::new();
+            let mut payload_rows = Vec::new();
+            for id in 0..128u64 {
+                vectors.push(Vector {
+                    id,
+                    values: vec![id as f32 / 128.0; DIM],
+                });
+                payload_rows.push(PayloadRow {
+                    fields: HashMap::from([
+                        (
+                            1u32,
+                            PayloadValue {
+                                kind: Some(payload_value::Kind::KeywordValue(format!(
+                                    "tenant_{}",
+                                    id % 8
+                                ))),
+                            },
+                        ),
+                        (
+                            2u32,
+                            PayloadValue {
+                                kind: Some(payload_value::Kind::Int64Value(id as i64)),
+                            },
+                        ),
+                    ]),
+                });
+            }
+
+            service
+                .insert_batch(Request::new(InsertBatchRequest {
+                    collection_name: name.to_string(),
+                    vectors,
+                    payload_rows,
+                }))
+                .await
+                .expect("insert_batch should succeed");
+
+            assert!(
+                wait_for_routing_entries(&coll, Duration::from_secs(8), 64).await,
+                "janitor should publish routing entries before restart"
+            );
+
+            let manifest_path = config.data_dir.join(name).join("manifest.pb");
+            let pointer_path = wait_for_global_metadata_pointer(&manifest_path)
+                .await
+                .expect("global metadata pointer should be published");
+
+            let storage_root = match &config.storage {
+                StorageCommand::File(file) => file.path.clone(),
+                _ => unreachable!("test config uses file storage"),
+            };
+            assert!(
+                storage_root.join(name).join(pointer_path).exists(),
+                "global metadata snapshot object should exist"
+            );
+
+            coll.janitor_task.abort();
+        }
+
+        let manager2 = Arc::new(CollectionManager::new(config.clone()));
+        let coll2 = manager2
+            .get_or_create(name, Some(DIM), Some(8), Some(Metric::L2))
+            .await
+            .expect("collection reopen should succeed");
+
+        let routing_stats = coll2.global_filter_routing_index.read().stats();
+        assert!(
+            routing_stats.id_entry_count > 0,
+            "routing index should hydrate from persisted global metadata"
+        );
+        assert!(
+            routing_stats.value_entry_count > 0,
+            "routing value memberships should hydrate from persisted global metadata"
+        );
+
+        // Ensure the manifest object remains parseable post-recovery.
+        let manifest = ServerManifestManager::new_with_metric(
+            config.data_dir.join(name),
+            DIM as u32,
+            Metric::L2,
+        )
+        .expect("manifest reload should succeed");
+        assert!(
+            manifest.get_state().global_metadata_pointer().is_some(),
+            "manifest should retain global metadata pointer after restart"
+        );
+        coll2.janitor_task.abort();
     }
 }
 

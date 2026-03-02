@@ -328,6 +328,7 @@ struct BenchSummary {
     batch_size: usize,
     query_count: usize,
     filtered_query_count: usize,
+    restart_before_filtered_phase: bool,
     tenant_assignment_mode: String,
     filtered_predicate_mode: String,
     filtered_range_window: usize,
@@ -442,6 +443,8 @@ struct Args {
     seed: u64,
     #[arg(long, default_value_t = 20)]
     warmup_queries: usize,
+    #[arg(long, default_value_t = false)]
+    restart_before_filtered_phase: bool,
     #[arg(long, default_value_t = 20)]
     filtered_warmup_queries: usize,
     #[arg(long, default_value_t = 200)]
@@ -511,12 +514,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ef_search: args.ef_search,
     };
 
-    let manager = Arc::new(CollectionManager::new(config));
-    let service = DriftService {
+    let mut manager = Arc::new(CollectionManager::new(config.clone()));
+    let mut service = DriftService {
         manager: manager.clone(),
     };
     let collection = "bench_rw";
-    let coll = manager
+    let mut coll = manager
         .get_or_create(
             collection,
             Some(args.dim),
@@ -524,7 +527,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Metric::L2),
         )
         .await?;
-    let _janitor_guard = JanitorAbortGuard::new(coll.clone());
+    let mut janitor_guard = Some(JanitorAbortGuard::new(coll.clone()));
 
     println!("🏁 Bench RW (v3)");
     println!(
@@ -548,6 +551,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         filter_predicate_mode_label(args.filtered_predicate_mode),
         args.filtered_projection
     );
+    if args.restart_before_filtered_phase {
+        println!("   • Recovery profile: restart before filtered phase enabled");
+    }
     if matches!(
         args.filtered_predicate_mode,
         FilterPredicateMode::PriceRange
@@ -772,6 +778,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "   • Query Latency p50/p95/p99: {:.2?} / {:.2?} / {:.2?}",
         r_p50, r_p95, r_p99
     );
+
+    if args.restart_before_filtered_phase && args.filtered_query_count > 0 {
+        println!("\n♻️  Restarting collection before filtered phase...");
+        drop(janitor_guard.take());
+        drop(coll);
+        drop(service);
+        drop(manager);
+
+        manager = Arc::new(CollectionManager::new(config.clone()));
+        service = DriftService {
+            manager: manager.clone(),
+        };
+        coll = manager
+            .get_or_create(
+                collection,
+                Some(args.dim),
+                Some(args.max_bucket_capacity),
+                None,
+            )
+            .await?;
+        janitor_guard = Some(JanitorAbortGuard::new(coll.clone()));
+    }
 
     // -------------------------------
     // FILTERED READ BENCH
@@ -1260,6 +1288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch_size: args.batch_size,
             query_count: args.query_count,
             filtered_query_count: args.filtered_query_count,
+            restart_before_filtered_phase: args.restart_before_filtered_phase,
             tenant_assignment_mode: tenant_assignment_mode_label(args.tenant_assignment_mode)
                 .to_string(),
             filtered_predicate_mode: filter_predicate_mode_label(args.filtered_predicate_mode)
@@ -1319,6 +1348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("   • Summary JSON: {}", path.display());
     }
 
+    drop(janitor_guard.take());
     println!("\n✅ Bench Complete.");
     Ok(())
 }

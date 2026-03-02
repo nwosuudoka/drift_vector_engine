@@ -1085,6 +1085,76 @@ fn extract_catalog_filter_clauses(
     }))
 }
 
+async fn collect_exact_routing_values_for_fields(
+    reader: &UnifiedReader,
+    field_ids: &HashSet<u32>,
+) -> io::Result<(
+    HashMap<u32, HashMap<u64, HashSet<ExactValueMembershipKey>>>,
+    HashSet<u32>,
+)> {
+    if field_ids.is_empty() {
+        return Ok((HashMap::new(), HashSet::new()));
+    }
+
+    let schema = reader.read_payload_schema().await?;
+    let Some(schema) = schema else {
+        return Ok((HashMap::new(), HashSet::new()));
+    };
+
+    let mut field_values: HashMap<u32, HashMap<u64, HashSet<ExactValueMembershipKey>>> =
+        HashMap::new();
+    let mut indexed_fields = HashSet::new();
+    for field in &schema.fields {
+        if !field.indexed || !field_ids.contains(&field.field_id) {
+            continue;
+        }
+        indexed_fields.insert(field.field_id);
+
+        let Some(index) = reader.read_exact_index(field.field_id).await? else {
+            continue;
+        };
+        let logical_type_tag = logical_type_tag(&index.logical_type);
+        let per_id = field_values.entry(field.field_id).or_default();
+        for (encoded_value, postings) in
+            index.dictionary.into_iter().zip(index.postings.into_iter())
+        {
+            let key = ExactValueMembershipKey {
+                field_id: field.field_id,
+                logical_type_tag,
+                encoded_value,
+            };
+            for id in postings {
+                per_id.entry(id).or_default().insert(key.clone());
+            }
+        }
+    }
+    Ok((field_values, indexed_fields))
+}
+
+async fn probe_source_with_exact_routing_hydration(
+    reader: &UnifiedReader,
+    filters: &[ParsedFilter],
+    missing_exact_fields: &HashSet<u32>,
+    routing_exact_field_values: &mut HashMap<u32, HashMap<u64, HashSet<ExactValueMembershipKey>>>,
+    routing_complete_exact_fields: &mut HashSet<u32>,
+) -> io::Result<FilterSourceProbe> {
+    let probe = source_filter_probe(reader, filters).await?;
+    if missing_exact_fields.is_empty() {
+        return Ok(probe);
+    }
+
+    let (source_field_values, indexed_fields_in_source) =
+        collect_exact_routing_values_for_fields(reader, missing_exact_fields).await?;
+    for (field_id, source_values_by_id) in source_field_values {
+        let merged_values_by_id = routing_exact_field_values.entry(field_id).or_default();
+        for (id, keys) in source_values_by_id {
+            merged_values_by_id.entry(id).or_default().extend(keys);
+        }
+    }
+    routing_complete_exact_fields.retain(|field_id| indexed_fields_in_source.contains(field_id));
+    Ok(probe)
+}
+
 fn preselect_bucket_ids_with_global_routing_index(
     routing: &GlobalFilterRoutingIndex,
     probe_bucket_ids: &[u32],
@@ -1468,8 +1538,11 @@ async fn plan_filter_aware_execution(
     } else {
         planning_bucket_ids.to_vec()
     };
+    let mut queried_exact_field_ids = HashSet::new();
     match extract_catalog_filter_clauses(filters) {
         Ok(Some(clauses)) => {
+            queried_exact_field_ids
+                .extend(clauses.exact_clauses.iter().map(|clause| clause.field_id));
             if !clauses.exact_clauses.is_empty() {
                 let global_exact_input_bucket_count = probe_bucket_ids.len();
                 let routed = preselect_probe_buckets_with_global_exact_routing(
@@ -1586,6 +1659,21 @@ async fn plan_filter_aware_execution(
         };
         let bucket_path = version.path.clone();
         let sources = payload_sources_for_class(&version.class, &version.path);
+        let missing_routing_exact_fields: HashSet<u32> = if queried_exact_field_ids.is_empty() {
+            HashSet::new()
+        } else {
+            let routing = collection.global_filter_routing_index.read();
+            queried_exact_field_ids
+                .iter()
+                .copied()
+                .filter(|field_id| !routing.bucket_exact_field_complete(bucket_id, *field_id))
+                .collect()
+        };
+        let mut routing_exact_field_values: HashMap<
+            u32,
+            HashMap<u64, HashSet<ExactValueMembershipKey>>,
+        > = HashMap::new();
+        let mut routing_complete_exact_fields = missing_routing_exact_fields.clone();
 
         let mut keep_bucket = false;
         let mut disable_candidates = false;
@@ -1609,13 +1697,31 @@ async fn plan_filter_aware_execution(
             let probe = match source {
                 PayloadSource::Local(path) => {
                     match UnifiedReader::open(local_op.clone(), &path).await {
-                        Ok(reader) => source_filter_probe(&reader, filters).await,
+                        Ok(reader) => {
+                            probe_source_with_exact_routing_hydration(
+                                &reader,
+                                filters,
+                                &missing_routing_exact_fields,
+                                &mut routing_exact_field_values,
+                                &mut routing_complete_exact_fields,
+                            )
+                            .await
+                        }
                         Err(err) => Err(err),
                     }
                 }
                 PayloadSource::Remote(path) => {
                     match UnifiedReader::open(remote_op.clone(), &path).await {
-                        Ok(reader) => source_filter_probe(&reader, filters).await,
+                        Ok(reader) => {
+                            probe_source_with_exact_routing_hydration(
+                                &reader,
+                                filters,
+                                &missing_routing_exact_fields,
+                                &mut routing_exact_field_values,
+                                &mut routing_complete_exact_fields,
+                            )
+                            .await
+                        }
                         Err(err) => Err(err),
                     }
                 }
@@ -1672,6 +1778,19 @@ async fn plan_filter_aware_execution(
                     );
                     keep_bucket = true;
                     disable_candidates = true;
+                }
+            }
+        }
+
+        if !disable_candidates && !missing_routing_exact_fields.is_empty() {
+            let mut routing = collection.global_filter_routing_index.write();
+            for field_id in &missing_routing_exact_fields {
+                let field_values = routing_exact_field_values
+                    .remove(field_id)
+                    .unwrap_or_default();
+                routing.replace_bucket_exact_field_values(bucket_id, *field_id, field_values);
+                if routing_complete_exact_fields.contains(field_id) {
+                    routing.mark_bucket_exact_field_complete(bucket_id, *field_id);
                 }
             }
         }

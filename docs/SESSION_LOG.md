@@ -1,5 +1,253 @@
 # Session Log
 
+## 2026-03-01 (release-doc track: production API usage spec)
+- Goal:
+  - Publish a release-facing production API usage spec before starting range patch-track item 28.
+- Work completed:
+  - Added a new developer guide:
+    - `docs/PRODUCTION_API_USAGE.md`
+    - covers current stable RPC surface, production bootstrap sequence, ingestion/search best practices, operational checklist, and grpcurl golden path.
+  - Added documentation cross-links:
+    - `README.md` now links to production usage spec from API reference.
+    - `docs/API_SPEC.md` now points to production usage guide for rollout patterns.
+  - Updated planning docs:
+    - `docs/NEXT.md` updated with completed release-doc item and refreshed timestamp.
+- Files changed:
+  - `docs/PRODUCTION_API_USAGE.md`
+  - `README.md`
+  - `docs/API_SPEC.md`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - No cargo tests run (docs-only change).
+- Open issues:
+  - Range-heavy filtered workloads remain the next optimization gap (item 28).
+- Next steps:
+  - Proceed to item 28: range-focused metadata indexing for planner cost control.
+
+## 2026-02-28 (item 26: query-time metadata indexing implementation)
+- Goal:
+  - Execute chosen item 26 direction: strengthen query-time metadata indexing (keep vector-first partitioning unchanged).
+- Work completed:
+  - Added planner-side on-demand global exact-routing hydration:
+    - while probing filtered query sources, planner now reads exact-index dictionaries/postings for queried exact fields and accumulates per-id value keys.
+    - planner writes accumulated snapshots into global routing index using field-scoped replacement.
+    - planner marks bucket field completeness only when queried field is indexed across all probed sources for that bucket.
+  - Extended routing index mutation surface:
+    - `mark_bucket_exact_field_complete(...)`
+    - `replace_bucket_exact_field_values(...)` (field-scoped replacement preserving other field keys).
+  - Added/updated tests:
+    - `global_filter_routing_index::tests::mark_bucket_exact_field_complete_extends_existing_coverage`
+    - `global_filter_routing_index::tests::replace_bucket_exact_field_values_replaces_only_target_field`
+  - Ran metadata-indexing smoke benchmark (`12k`, tenant-clustered):
+    - `/tmp/bench_rw_item26_qmeta_smoke.json`
+    - observed:
+      - `filtered_p95_ms=5.65`
+      - `filtered_estimated_scan_ratio=0.008`
+      - `filtered_post_prune_estimated_scan_ratio=0.190`
+      - `filtered_planner_global_exact_pruned_bucket_ratio=0.667`
+  - Ran large-tier post-change diagnostics (`60k`, diagnostics enabled, 3 samples each):
+    - exact:
+      - `/tmp/bench_rw_ci_large_qmeta_exact_s1.json`
+      - `/tmp/bench_rw_ci_large_qmeta_exact_s2.json`
+      - `/tmp/bench_rw_ci_large_qmeta_exact_s3.json`
+      - aggregate:
+        - `filtered_p95_ms=19.75`
+        - `filtered_estimated_scan_ratio=0.00780`
+        - `filtered_post_prune_estimated_scan_ratio=0.829`
+        - `filtered_planner_global_exact_pruned_bucket_ratio=0.810`
+        - `filtered_scan_accounting_fallback_query_ratio=0.0`
+    - range:
+      - `/tmp/bench_rw_ci_large_qmeta_range_s1.json`
+      - `/tmp/bench_rw_ci_large_qmeta_range_s2.json`
+      - `/tmp/bench_rw_ci_large_qmeta_range_s3.json`
+      - aggregate:
+        - `filtered_p95_ms=27.13`
+        - `filtered_estimated_scan_ratio=1.183`
+        - `filtered_post_prune_estimated_scan_ratio=1.0`
+        - `filtered_scan_accounting_fallback_query_ratio=0.913`
+  - Comparison against prior restart-boundary aggregate:
+    - exact:
+      - p95 improved (`23.89ms` -> `19.75ms`)
+      - estimated scan ratio reduced (`0.0909` -> `0.00780`)
+      - fallback ratio reduced (`0.11` -> `0.0`)
+    - range:
+      - remains scan-heavy and fallback-bound despite exact-routing hydration improvements.
+- Files changed:
+  - `drift_server/src/server.rs`
+  - `drift_server/src/global_filter_routing_index.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo test -p drift_server global_filter_routing_index::tests::replace_bucket_exact_field_values_replaces_only_target_field`
+  - `cargo test -p drift_server global_filter_routing_index::tests`
+  - `cargo test -p drift_server planner_heuristic_tests`
+  - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+  - `cargo fmt --all`
+  - `cargo test -p drift_server global_filter_routing_index::tests::mark_bucket_exact_field_complete_extends_existing_coverage`
+  - `DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 12000 --batch-size 1000 --query-count 50 --warmup-queries 10 --filtered-query-count 50 --filtered-warmup-queries 10 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --summary-json-path /tmp/bench_rw_item26_qmeta_smoke.json`
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --summary-json-path /tmp/bench_rw_ci_large_qmeta_exact_s{1,2,3}.json`
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --filtered-predicate-mode price-range --filtered-range-window 256 --summary-json-path /tmp/bench_rw_ci_large_qmeta_range_s{1,2,3}.json`
+  - `jq -s '{...}' /tmp/bench_rw_ci_large_qmeta_exact_s1.json /tmp/bench_rw_ci_large_qmeta_exact_s2.json /tmp/bench_rw_ci_large_qmeta_exact_s3.json`
+  - `jq -s '{...}' /tmp/bench_rw_ci_large_qmeta_range_s1.json /tmp/bench_rw_ci_large_qmeta_range_s2.json /tmp/bench_rw_ci_large_qmeta_range_s3.json`
+- Open issues:
+  - Range-heavy profile remains fallback-bound in large-tier diagnostics and needs dedicated range metadata improvements.
+- Next steps:
+  - Proceed with release using improved exact-filter path.
+  - Start patch-track item for range-focused metadata indexing.
+
+## 2026-02-28 (item 26: restart-boundary A/B matrix, exact + range)
+- Goal:
+  - Execute the remaining item 26 benchmark matrix: restart-boundary A/B (`DRIFT_GLOBAL_METADATA_PERSIST` on/off), 3 samples each for exact and range filtered workloads.
+- Work completed:
+  - Ran 12 large-tier restart-boundary samples (`60k`, `k=10`, `tenant-clustered`, diagnostics enabled):
+    - exact default-on: `...restart_exact_on_s{1,2,3}.json`
+    - exact explicit-off: `...restart_exact_off_s{1,2,3}.json`
+    - range default-on: `...restart_range_on_s{1,2,3}.json`
+    - range explicit-off: `...restart_range_off_s{1,2,3}.json`
+  - Aggregated key metrics:
+    - exact (default-on vs explicit-off):
+      - filtered p95: `23.89ms` vs `23.17ms`
+      - overhead ratio: `3.41x` vs `3.67x`
+      - estimated scan ratio: `0.0909` vs `0.1981`
+      - scan-accounting fallback ratio: `0.11` vs `0.257`
+    - range (default-on vs explicit-off):
+      - filtered p95: `21.60ms` vs `17.02ms`
+      - overhead ratio: `3.18x` vs `2.82x`
+      - estimated scan ratio: `~0.802` vs `~0.802`
+      - scan-accounting fallback ratio: `1.0` vs `1.0`
+  - Updated `docs/NEXT.md` item 26 progress with new artifacts and removed the remaining “run 3-sample A/B” task.
+- Files changed:
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --restart-before-filtered-phase --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --summary-json-path /tmp/bench_rw_ci_large_restart_exact_on_s{1,2,3}.json`
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 DRIFT_GLOBAL_METADATA_PERSIST=0 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --restart-before-filtered-phase --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --summary-json-path /tmp/bench_rw_ci_large_restart_exact_off_s{1,2,3}.json`
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --restart-before-filtered-phase --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --filtered-predicate-mode price-range --filtered-range-window 256 --summary-json-path /tmp/bench_rw_ci_large_restart_range_on_s{1,2,3}.json`
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 DRIFT_GLOBAL_METADATA_PERSIST=0 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --restart-before-filtered-phase --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --filtered-predicate-mode price-range --filtered-range-window 256 --summary-json-path /tmp/bench_rw_ci_large_restart_range_off_s{1,2,3}.json`
+  - `jq -s '{...}' /tmp/bench_rw_ci_large_restart_*_s*.json`
+- Open issues:
+  - Exact-mode prune ratios remained `0` in this matrix despite tenant-clustered locality, so restart persistence mode did not produce a clear pruning-telemetry shift.
+  - Range-mode remained fallback-bound (`fallback ratio = 1.0`) and scan-heavy (`~0.802`) under both modes.
+- Next steps:
+  - Decide whether to prioritize data-layout-aware partitioning/catalog changes vs additional query-time metadata indexing (remaining item 26 decisions).
+  - Add a targeted run where exact-mode restart A/B controls janitor churn tightly to isolate persistence impact from maintenance noise.
+
+## 2026-02-28 (scan-ratio sanity benchmark rerun, user request)
+- Goal:
+  - Re-run `bench_rw` and validate whether `scan_ratio=1` indicates a real pushdown failure.
+- Work completed:
+  - Ran a smoke benchmark (`4k`) with planner diagnostics enabled to verify ratio fields and accounting paths.
+  - Ran a large-tier benchmark (`60k`, tenant-exact, round-robin) matching the current item 26 workload shape.
+  - Extracted summary JSON metrics and confirmed denominator semantics:
+    - pre-filter ratio (`filtered_estimated_scan_ratio`) is low when pruning is active.
+    - post-prune ratio (`filtered_post_prune_estimated_scan_ratio`) remains `1.0` when kept buckets are scanned fully.
+  - Key large-tier results (`/tmp/bench_rw_scan_large.json`):
+    - `filtered_candidate_fanout=0.007813`
+    - `filtered_estimated_scan_ratio=0.007813`
+    - `filtered_post_prune_estimated_scan_ratio=1.0`
+    - `filtered_prefilter_routable_live_ids_avg=60000`
+- Files changed:
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 32 --total-vectors 4000 --batch-size 500 --query-count 40 --warmup-queries 10 --filtered-query-count 40 --filtered-warmup-queries 10 --filter-cardinality 32 --k 10 --summary-json-path /tmp/bench_rw_scan_smoke.json`
+  - `DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 150 --warmup-queries 25 --filtered-query-count 150 --filtered-warmup-queries 25 --filter-cardinality 128 --k 10 --summary-json-path /tmp/bench_rw_scan_large.json`
+  - `jq '{...}' /tmp/bench_rw_scan_large.json`
+  - `jq '{...}' /tmp/bench_rw_scan_smoke.json`
+- Open issues:
+  - Planner prune ratios in this round-robin profile remain limited (`global_exact_pruned=0`, `catalog_pruned=0`), so further p95 improvement still depends on data-locality and/or additional metadata completeness.
+- Next steps:
+  - Run the remaining restart-boundary A/B samples in item 26 (exact + range) before locking conclusions.
+  - Compare round-robin vs tenant-clustered under identical restart settings to quantify locality sensitivity.
+
+## 2026-02-27 (restart-boundary recovery validation: bench harness + manager test)
+- Goal:
+  - Validate global metadata recovery behavior across an explicit restart boundary in both test and benchmark paths.
+- Work completed:
+  - Extended benchmark harness:
+    - `bench_rw` now supports `--restart-before-filtered-phase`.
+    - when enabled, benchmark aborts janitor, reopens manager/collection, then runs filtered phase on recovered state.
+    - summary JSON now includes `restart_before_filtered_phase`.
+  - Added deterministic recovery test:
+    - `manager_tests::tests::test_manager_restart_recovers_global_metadata_snapshot`
+    - inserts payload-bearing data, waits for routing metadata + manifest pointer publication, restarts manager, and verifies hydrated routing index is non-empty.
+    - also verifies manifest pointer remains set after restart.
+  - Ran restart-boundary benchmark comparison (1 sample each):
+    - default-on:
+      - `/tmp/bench_rw_ci_large_globalmeta_restart_on_s1.json`
+      - filtered p95: `19.44ms`
+      - overhead ratio: `3.17x`
+    - explicit-off (`DRIFT_GLOBAL_METADATA_PERSIST=0`):
+      - `/tmp/bench_rw_ci_large_globalmeta_restart_off_s1.json`
+      - filtered p95: `30.76ms`
+      - overhead ratio: `4.24x`
+  - Interpretation:
+    - restart-boundary observability is now implemented and working end-to-end.
+    - this first restart sample favored default-on latency; prune-ratio telemetry stayed structurally similar between modes.
+- Files changed:
+  - `drift_server/src/bin/bench_rw.rs`
+  - `drift_server/src/manager_tests.rs`
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `cargo fmt --all`
+  - `cargo test -p drift_server manager_tests::tests::test_manager_restart_recovers_global_metadata_snapshot`
+  - `cargo test -p drift_server manager_tests::tests::test_manager_restart_recovery_clears_filter_metadata_catalog`
+  - `cargo test -p drift_server manager_tests::tests::test_manager_restart_recovery_clears_global_filter_routing_index`
+  - `cargo test -p drift_server janitor_tests::tests::test_janitor_flush_lifecycle`
+  - `cargo check -p drift_server --bin bench_rw`
+  - `cargo check -p drift_server`
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --restart-before-filtered-phase --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --summary-json-path /tmp/bench_rw_ci_large_globalmeta_restart_on_s1.json`
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 DRIFT_GLOBAL_METADATA_PERSIST=0 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --restart-before-filtered-phase --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --summary-json-path /tmp/bench_rw_ci_large_globalmeta_restart_off_s1.json`
+  - `jq '{...}' /tmp/bench_rw_ci_large_globalmeta_restart_on_s1.json /tmp/bench_rw_ci_large_globalmeta_restart_off_s1.json`
+- Open issues:
+  - restart-boundary A/B has only one sample per mode so far.
+- Next steps:
+  - run 3-sample restart-boundary A/B for exact filters.
+  - run 3-sample restart-boundary A/B for range-heavy filters and compare scan-accounting + planner diagnostics.
+
+## 2026-02-27 (default-on global metadata persistence: cold-profile A/B benchmark)
+- Goal:
+  - Validate impact of default-on global metadata persistence against explicit opt-out (`DRIFT_GLOBAL_METADATA_PERSIST=0`) under zero-warmup filtered benchmark profile.
+- Work completed:
+  - Ran 3 default-on samples (`warmup=0`, `filtered_warmup=0`):
+    - `/tmp/bench_rw_ci_large_globalmeta_on_s1.json`
+    - `/tmp/bench_rw_ci_large_globalmeta_on_s2.json`
+    - `/tmp/bench_rw_ci_large_globalmeta_on_s3.json`
+  - Ran 3 explicit-off samples:
+    - `/tmp/bench_rw_ci_large_globalmeta_off_s1.json`
+    - `/tmp/bench_rw_ci_large_globalmeta_off_s2.json`
+    - `/tmp/bench_rw_ci_large_globalmeta_off_s3.json`
+  - Aggregate comparison:
+    - default-on:
+      - filtered p95: `20.08ms`
+      - overhead ratio: `2.85x`
+      - candidate fanout: `0.00774`
+      - estimated scan ratio: `0.00799`
+      - global exact pruned bucket ratio: `0.819`
+    - explicit-off:
+      - filtered p95: `22.23ms`
+      - overhead ratio: `3.44x`
+      - candidate fanout: `0.00778`
+      - estimated scan ratio: `0.00778`
+      - global exact pruned bucket ratio: `0.819`
+  - Interpretation:
+    - no structural selectivity change was observed in planner pruning/fanout metrics.
+    - latency favored default-on in this sample set, but this benchmark path does not enforce a true restart boundary; startup hydration effect is therefore not isolated.
+- Files changed:
+  - `docs/NEXT.md`
+  - `docs/SESSION_LOG.md`
+- Commands/tests run:
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --summary-json-path /tmp/bench_rw_ci_large_globalmeta_on_s{1,2,3}.json`
+  - `CI=1 DRIFT_FILTER_PLANNER_DIAGNOSTICS=1 DRIFT_GLOBAL_METADATA_PERSIST=0 cargo run -p drift_server --bin bench_rw --release -- --dim 64 --total-vectors 60000 --batch-size 1500 --query-count 100 --warmup-queries 0 --filtered-query-count 100 --filtered-warmup-queries 0 --filter-cardinality 128 --tenant-assignment-mode tenant-clustered --tenant-cluster-noise 0.02 --k 10 --max-filtered-p95-ms 500 --max-filtered-overhead-ratio 100 --summary-json-path /tmp/bench_rw_ci_large_globalmeta_off_s{1,2,3}.json`
+  - `jq -s '{...}' /tmp/bench_rw_ci_large_globalmeta_on_s1.json /tmp/bench_rw_ci_large_globalmeta_on_s2.json /tmp/bench_rw_ci_large_globalmeta_on_s3.json`
+  - `jq -s '{...}' /tmp/bench_rw_ci_large_globalmeta_off_s1.json /tmp/bench_rw_ci_large_globalmeta_off_s2.json /tmp/bench_rw_ci_large_globalmeta_off_s3.json`
+- Open issues:
+  - Need a restart-aware benchmark/integration harness to isolate first-query-post-recovery benefit from persisted metadata hydration.
+- Next steps:
+  - implement restart-boundary benchmark path and compare first filtered query latency/selectivity with persistence on vs off.
+
 ## 2026-02-27 (global metadata persistence migration step 2/3: persistence IO + janitor publish + manager hydrate + default-on toggle)
 - Goal:
   - Continue the global metadata persistence migration by wiring snapshot IO, manifest pointer publication, and startup hydration.

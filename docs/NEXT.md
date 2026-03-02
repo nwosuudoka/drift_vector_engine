@@ -1,13 +1,13 @@
 # Next Steps
 
-Last updated: 2026-02-27
+Last updated: 2026-03-01
 
 ## Current Execution Phase
 - Phase D API surface is complete (payload/filter + payload schema management).
 - Phase E performance work is active (filter-aware planning and index pushdown).
 - Phase E pushdown v1 is complete at bucket + ID levels for indexed `exact` / non-null `any_of` filters.
 - Phase E pushdown guardrails are now in place (selectivity gate + benchmark fanout/scanned-ID visibility).
-- Documentation surface is now synced for current API/runtime (`README.md`, `SYSTEM_VIEW.md`, `docs/API_SPEC.md`).
+- Documentation surface is now synced for current API/runtime (`README.md`, `SYSTEM_VIEW.md`, `docs/API_SPEC.md`, `docs/PRODUCTION_API_USAGE.md`).
 
 ## Active Queue (Post-Item 15)
 - [x] 16. Finish remaining Phase D gap: payload schema management API.
@@ -169,7 +169,7 @@ Last updated: 2026-02-27
     - Synced docs:
       - `README.md`
       - `docs/DECISIONS.md`
-- [ ] 26. Evaluate pushdown effectiveness for large-tier exact filters.
+- [x] 26. Evaluate pushdown effectiveness for large-tier exact filters.
   - Goal: reduce filtered overhead by lowering scanned-ID ratio in large-tier workload.
   - Scope:
     - inspect why `filtered_candidate_fanout` and `estimated_scan_ratio` remain `1.0`
@@ -476,10 +476,158 @@ Last updated: 2026-02-27
         - `global_filter_routing_index::tests::routing_snapshot_roundtrip_preserves_entries`
         - `filter_metadata_catalog::tests::catalog_snapshot_roundtrip_preserves_bucket_state`
         - `persistence_tests::persistence_integration_tests::test_persistence_writes_and_reads_global_metadata_snapshot`
+    - Ran cold-profile A/B benchmark (default-on vs explicit-off) with `warmup=0` (3 samples each):
+      - default-on artifacts:
+        - `/tmp/bench_rw_ci_large_globalmeta_on_s1.json`
+        - `/tmp/bench_rw_ci_large_globalmeta_on_s2.json`
+        - `/tmp/bench_rw_ci_large_globalmeta_on_s3.json`
+      - explicit-off artifacts:
+        - `/tmp/bench_rw_ci_large_globalmeta_off_s1.json`
+        - `/tmp/bench_rw_ci_large_globalmeta_off_s2.json`
+        - `/tmp/bench_rw_ci_large_globalmeta_off_s3.json`
+      - aggregate (default-on):
+        - filtered p95: `20.08ms`
+        - overhead ratio: `2.85x`
+        - candidate fanout: `0.00774`
+        - estimated scan ratio: `0.00799`
+        - global exact pruned bucket ratio: `0.819`
+      - aggregate (explicit-off):
+        - filtered p95: `22.23ms`
+        - overhead ratio: `3.44x`
+        - candidate fanout: `0.00778`
+        - estimated scan ratio: `0.00778`
+        - global exact pruned bucket ratio: `0.819`
+      - interpretation:
+        - no structural planner-selectivity delta observed (prune/fanout ratios are effectively equivalent).
+        - latency moved in favor of default-on in this sample set, but this harness does not include an in-process restart boundary, so hydration benefit is not isolated yet.
+    - Added restart-boundary recovery validation harness (2026-02-27):
+      - `bench_rw` now supports `--restart-before-filtered-phase` to force manager/collection reopen between unfiltered and filtered phases.
+      - summary JSON now includes `restart_before_filtered_phase`.
+      - added manager integration test:
+        - `manager_tests::tests::test_manager_restart_recovers_global_metadata_snapshot`
+        - validates: persisted global metadata pointer exists, object exists in scoped storage, and routing index hydrates non-empty on restart.
+      - one-sample restart benchmark comparison:
+        - default-on:
+          - `/tmp/bench_rw_ci_large_globalmeta_restart_on_s1.json`
+          - filtered p95 `19.44ms`, overhead `3.17x`
+        - explicit-off:
+          - `/tmp/bench_rw_ci_large_globalmeta_restart_off_s1.json`
+          - filtered p95 `30.76ms`, overhead `4.24x`
+      - interpretation:
+        - restart-boundary path now exists and captures post-recovery filtered behavior directly.
+        - this sample favored default-on latency; planner prune ratios remained unchanged (`global_exact_pruned=0`, `catalog_pruned=0` in both).
+    - Progress (2026-02-28 benchmark sanity check):
+      - user-requested benchmark rerun with planner diagnostics enabled:
+        - smoke (`4k`, tenant-exact, round-robin):
+          - `/tmp/bench_rw_scan_smoke.json`
+          - `filtered_estimated_scan_ratio=0.03125`
+          - `filtered_post_prune_estimated_scan_ratio=1.0`
+        - large-tier (`60k`, tenant-exact, round-robin):
+          - `/tmp/bench_rw_scan_large.json`
+          - `filtered_p95_ms=50.04`
+          - `filtered_overhead_ratio=8.34x`
+          - `filtered_candidate_fanout=0.007813`
+          - `filtered_estimated_scan_ratio=0.007813`
+          - `filtered_post_prune_estimated_scan_ratio=1.0`
+          - `filtered_prefilter_routable_live_ids_avg=60000`
+          - `filtered_scan_accounting_fallback_query_ratio=0.0`
+          - `filtered_planner_global_exact_pruned_bucket_ratio=0.0`
+          - `filtered_planner_catalog_pruned_bucket_ratio=0.0`
+          - `filtered_planner_catalog_incomplete_bucket_ratio=0.687`
+      - interpretation:
+        - pre-filter scan accounting confirms pruning is active (`~0.8%` of routable live IDs scanned on average).
+        - post-prune ratio remains `1.0` because the surviving bucket set is scanned fully by design.
+    - Completed restart-boundary A/B matrix (2026-02-28, 3 samples each; exact + range):
+      - exact default-on artifacts:
+        - `/tmp/bench_rw_ci_large_restart_exact_on_s1.json`
+        - `/tmp/bench_rw_ci_large_restart_exact_on_s2.json`
+        - `/tmp/bench_rw_ci_large_restart_exact_on_s3.json`
+      - exact explicit-off artifacts:
+        - `/tmp/bench_rw_ci_large_restart_exact_off_s1.json`
+        - `/tmp/bench_rw_ci_large_restart_exact_off_s2.json`
+        - `/tmp/bench_rw_ci_large_restart_exact_off_s3.json`
+      - range default-on artifacts:
+        - `/tmp/bench_rw_ci_large_restart_range_on_s1.json`
+        - `/tmp/bench_rw_ci_large_restart_range_on_s2.json`
+        - `/tmp/bench_rw_ci_large_restart_range_on_s3.json`
+      - range explicit-off artifacts:
+        - `/tmp/bench_rw_ci_large_restart_range_off_s1.json`
+        - `/tmp/bench_rw_ci_large_restart_range_off_s2.json`
+        - `/tmp/bench_rw_ci_large_restart_range_off_s3.json`
+      - exact aggregate (default-on vs explicit-off):
+        - filtered p95: `23.89ms` vs `23.17ms`
+        - overhead ratio: `3.41x` vs `3.67x`
+        - estimated scan ratio: `0.0909` vs `0.1981`
+        - fallback ratio: `0.11` vs `0.257`
+      - range aggregate (default-on vs explicit-off):
+        - filtered p95: `21.60ms` vs `17.02ms`
+        - overhead ratio: `3.18x` vs `2.82x`
+        - estimated scan ratio: `~0.802` vs `~0.802`
+        - fallback ratio: `1.0` vs `1.0`
+      - interpretation:
+        - exact restart profile shows lower scan-accounting/fallback pressure with default-on, but p95 remains within run-to-run variance.
+        - range restart profile remains scan-heavy and fallback-bound regardless of persistence mode.
+    - Completed query-time metadata indexing step (2026-02-28):
+      - planner now opportunistically hydrates global exact routing for queried exact fields while probing bucket sources.
+      - hydration reads exact-index dictionaries/postings from `UnifiedReader` and updates routing via field-scoped replacement APIs.
+      - completeness is marked only when a queried field is indexed across all probed sources for that bucket (conservative, no false-negative pruning).
+      - added `GlobalFilterRoutingIndex` field-scoped mutation APIs:
+        - `replace_bucket_exact_field_values(...)`
+        - `mark_bucket_exact_field_complete(...)`
+      - validation:
+        - `cargo test -p drift_server global_filter_routing_index::tests`
+        - `cargo test -p drift_server planner_heuristic_tests`
+        - `cargo test -p drift_server server_integration_tests::tests::test_search_field_filters_exact_anyof_range_and_projection`
+      - smoke benchmark (`12k`, tenant-clustered, diagnostics enabled):
+        - artifact: `/tmp/bench_rw_item26_qmeta_smoke.json`
+        - observed:
+          - `filtered_p95_ms=5.65`
+          - `filtered_estimated_scan_ratio=0.008`
+          - `filtered_post_prune_estimated_scan_ratio=0.190`
+          - `filtered_planner_global_exact_pruned_bucket_ratio=0.667`
   - Remaining:
-    - decide whether to prioritize data-layout-aware partitioning/catalog changes versus query-time metadata indexing.
-    - decide whether adaptive field-to-bucket metadata indexing is required for planner cost control.
-    - run `bench_rw` cold-start comparisons to quantify first-query planner readiness with default-on metadata hydration.
+    - reran large-tier exact/range diagnostics after query-time routing hydration (2026-02-28):
+      - exact artifacts:
+        - `/tmp/bench_rw_ci_large_qmeta_exact_s1.json`
+        - `/tmp/bench_rw_ci_large_qmeta_exact_s2.json`
+        - `/tmp/bench_rw_ci_large_qmeta_exact_s3.json`
+      - exact aggregate:
+        - `filtered_p95_ms=19.75` avg
+        - `filtered_estimated_scan_ratio=0.00780` avg
+        - `filtered_post_prune_estimated_scan_ratio=0.829` avg
+        - `filtered_planner_global_exact_pruned_bucket_ratio=0.810` avg
+        - `filtered_scan_accounting_fallback_query_ratio=0.0` avg
+      - exact comparison vs prior restart-boundary aggregate (`23.89ms`, `0.0909`, fallback `0.11`):
+        - p95 improved by `~17.3%`
+        - estimated scan ratio reduced by `~91.4%`
+      - range artifacts:
+        - `/tmp/bench_rw_ci_large_qmeta_range_s1.json`
+        - `/tmp/bench_rw_ci_large_qmeta_range_s2.json`
+        - `/tmp/bench_rw_ci_large_qmeta_range_s3.json`
+      - range aggregate:
+        - `filtered_p95_ms=27.13` avg
+        - `filtered_estimated_scan_ratio=1.183` avg
+        - `filtered_post_prune_estimated_scan_ratio=1.0` avg
+        - `filtered_scan_accounting_fallback_query_ratio=0.913` avg
+      - interpretation:
+        - exact filters now show strong global exact preselection behavior and materially lower scan ratio.
+        - range filters remain the dominant gap (still scan-heavy and mostly fallback-bound).
+    - range-focused metadata indexing is deferred to next patch release (post-release optimization track).
+- [ ] 28. Patch track: range-focused metadata indexing for planner cost control.
+  - Goal: reduce range-filter scan ratio and fallback dependence in large-tier workloads.
+  - Scope:
+    - add stronger range metadata coverage so planner can prune buckets before scan.
+    - lower `filtered_scan_accounting_fallback_query_ratio` in range-heavy profiles.
+    - validate with `bench_rw` range diagnostics (`60k`, `price_range`, window `256`).
+- [x] 29. Release track: publish production API usage spec for developers.
+  - Goal: ship a release-facing integration guide before starting range patch-track work.
+  - Completed:
+    - Added `docs/PRODUCTION_API_USAGE.md` with:
+      - stable RPC contract summary
+      - production bootstrap/ingest/search patterns
+      - exact/any_of performance guidance and range-filter caveats
+      - operational checklist and grpcurl golden path
+    - Linked production usage guide from `README.md`.
 - [x] 27. Define adaptive metadata catalog for filter-to-bucket routing (v2).
   - Goal: avoid probing every bucket at query time while preserving filter-first correctness.
   - Scope:
